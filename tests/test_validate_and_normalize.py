@@ -1746,6 +1746,441 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertIn("UNKNOWN_ENVELOPE_FIELD", resp_codes)
         self.assertIn("INVALID_FUNCTION_RESPONSE_ERROR", resp_codes)
 
+    def test_streaming_array_append_splice_eval_cap_and_nested_relative_childlists(self) -> None:
+        """Array /- appends, null splices, template eval-cap fail-closed, and nested relative ChildLists are enforced."""
+        # 1a. Array append (/-) into a direct URL slot followed by safe overwrite fails closed
+        append_direct = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "app_direct",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Image", "url": {"@path": "/arr/0"}},
+                    ],
+                    "dataModel": {"arr": []},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "app_direct",
+                    "path": "/arr/-",
+                    "value": "javascript:alert(1)",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "app_direct",
+                    "path": "/arr/0",
+                    "value": "https://example.com/safe.png",
+                },
+            },
+        ]
+        res_ad = validate_payload(json.dumps(append_direct), version="1.0", strict=True)
+        self.assertFalse(res_ad["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_ad["errors"]})
+
+        # 1b. Array append (/-) into an ancestor of a ChildList followed by safe overwrite fails closed
+        append_ancestor = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "app_anc",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/outer/0/items"}},
+                        {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {"outer": []},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "app_anc",
+                    "path": "/outer/-",
+                    "value": {"items": [{"u": "javascript:alert(1)"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "app_anc",
+                    "path": "/outer",
+                    "value": [],
+                },
+            },
+        ]
+        res_aa = validate_payload(json.dumps(append_ancestor), version="1.0", strict=True)
+        self.assertFalse(res_aa["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_aa["errors"]})
+
+        # 2a. Array element splice (value: null) shifting sibling into direct URL slot fails closed
+        splice_direct = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "spl_direct",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Image", "url": {"@path": "/arr/1"}},
+                    ],
+                    "dataModel": {"arr": ["/a.png", "/b.png", "javascript:alert(1)"]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "spl_direct", "path": "/arr/0", "value": None},
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "spl_direct", "path": "/arr/1", "value": "/safe.png"},
+            },
+        ]
+        res_sd = validate_payload(json.dumps(splice_direct), version="1.0", strict=True)
+        self.assertFalse(res_sd["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_sd["errors"]})
+
+        # 2b. Array element splice (value: null) shifting descendant ChildList fails closed
+        splice_anc = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "spl_anc",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/outer/1/items"}},
+                        {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {
+                        "outer": [
+                            {"items": [{"u": "/a.png"}]},
+                            {"items": [{"u": "/b.png"}]},
+                            {"items": [{"u": "javascript:alert(1)"}]},
+                        ]
+                    },
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "spl_anc", "path": "/outer/0", "value": None},
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "spl_anc", "path": "/outer", "value": []},
+            },
+        ]
+        res_sa = validate_payload(json.dumps(splice_anc), version="1.0", strict=True)
+        self.assertFalse(res_sa["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_sa["errors"]})
+
+        # 3. Exceeding _MAX_TEMPLATE_ABS_RESCAN_EVALS fails closed with MAX_TEMPLATE_EVALS_EXCEEDED
+        items_1001 = [{"rel": "/ok.png"} for _ in range(1000)] + [{"rel": "/evil.example/x.png"}]
+        cap_msgs: list[dict] = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "cap_s",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/items"}},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "/${/a}${rel}"}},
+                        },
+                    ],
+                    "dataModel": {"a": "assets", "items": items_1001},
+                },
+            }
+        ]
+        for idx in range(10):
+            cap_msgs.append(
+                {
+                    "version": "1.0",
+                    "updateDataModel": {"surfaceId": "cap_s", "path": "/a", "value": f"p{idx}"},
+                }
+            )
+        cap_msgs.append({"version": "1.0", "updateDataModel": {"surfaceId": "cap_s", "path": "/a", "value": ""}})
+        cap_msgs.append({"version": "1.0", "updateDataModel": {"surfaceId": "cap_s", "path": "/a", "value": "assets"}})
+        res_cap = validate_payload(json.dumps(cap_msgs), version="1.0", strict=True)
+        self.assertFalse(res_cap["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_cap["errors"]})
+
+        # 4a. Nested relative ChildList.path in static createSurface catches unsafe URL
+        nested_static = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "nest_s",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "List", "children": {"componentId": "grp", "path": "/groups"}},
+                    {"id": "grp", "component": "List", "children": {"componentId": "row_img", "path": "items"}},
+                    {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                ],
+                "dataModel": {"groups": [{"items": [{"u": "javascript:alert(1)"}]}]},
+            },
+        }
+        res_ns = validate_payload(json.dumps(nested_static), version="1.0", strict=True)
+        self.assertFalse(res_ns["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_ns["errors"]})
+
+        # 4b. Nested relative ChildList.path updated via streaming updateDataModel (/- and item mutation) fails closed
+        nested_stream = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "nest_stream",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "grp_col", "path": "/groups"}},
+                        {"id": "grp_col", "component": "Column", "children": ["inner_list"]},
+                        {"id": "inner_list", "component": "List", "children": {"componentId": "row_btn", "path": "items"}},
+                        {
+                            "id": "row_btn",
+                            "component": "Button",
+                            "child": "row_lbl",
+                            "action": {"functionCall": {"@call": "openUrl", "args": {"url": {"@path": "href"}}}},
+                        },
+                        {"id": "row_lbl", "component": "Text", "text": "Open"},
+                    ],
+                    "dataModel": {"groups": [{"items": [{"href": "https://example.com/ok"}]}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "nest_stream",
+                    "path": "/groups/0/items/0/href",
+                    "value": "javascript:alert(1)",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "nest_stream",
+                    "path": "/groups/0/items/0/href",
+                    "value": "https://example.com/safe",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "nest_stream",
+                    "path": "/groups/-",
+                    "value": {"items": [{"href": "https://user@evil.example/"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "nest_stream", "path": "/groups", "value": []},
+            },
+        ]
+        res_nst = validate_payload(json.dumps(nested_stream), version="1.0", strict=True)
+        self.assertFalse(res_nst["ok"])
+        open_errs = [e for e in res_nst["errors"] if e["code"] == "UNSAFE_OPEN_URL"]
+        self.assertEqual(len(open_errs), 2)
+
+        # 4c. Valid nested relative ChildList.path passes strict validation cleanly
+        nested_ok = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "nest_ok",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "List", "children": {"componentId": "grp", "path": "/groups"}},
+                    {"id": "grp", "component": "List", "children": {"componentId": "row_img", "path": "items"}},
+                    {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                ],
+                "dataModel": {"groups": [{"items": [{"u": "https://example.com/a.png"}]}]},
+            },
+        }
+        res_nok = validate_payload(json.dumps(nested_ok), version="1.0", strict=True)
+        self.assertTrue(res_nok["ok"], res_nok["errors"])
+
+    def test_component_replacement_data_slot_reuse_and_outgoing_url_checks(self) -> None:
+        """Replaced URL components do not falsely fail when their old data pointer is reused for text."""
+        # 1. Image -> Text replacement reusing /slot for plain text passes strict validation
+        img_to_txt = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "rep_img",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Image", "url": {"@path": "/slot"}}],
+                    "dataModel": {"slot": "https://example.com/ok.png"},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "rep_img",
+                    "components": [{"id": "root", "component": "Text", "text": {"@path": "/slot"}}],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "rep_img", "path": "/slot", "value": "Plain text heading"},
+            },
+        ]
+        res_it = validate_payload(json.dumps(img_to_txt), version="1.0", strict=True)
+        self.assertTrue(res_it["ok"], res_it["errors"])
+
+        # 2. Button(openUrl) -> Button(event) replacement reusing /slot passes strict validation
+        btn_to_ev = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "rep_btn",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Button",
+                            "child": "lbl",
+                            "action": {"functionCall": {"@call": "openUrl", "args": {"url": {"@path": "/slot"}}}},
+                        },
+                        {"id": "lbl", "component": "Text", "text": "Go"},
+                    ],
+                    "dataModel": {"slot": "https://example.com/docs"},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "rep_btn",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Button",
+                            "child": "lbl",
+                            "action": {"event": {"name": "submit", "context": {"tag": {"@path": "/slot"}}}},
+                        }
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "rep_btn", "path": "/slot", "value": "not_a_url"},
+            },
+        ]
+        res_be = validate_payload(json.dumps(btn_to_ev), version="1.0", strict=True)
+        self.assertTrue(res_be["ok"], res_be["errors"])
+
+        # 3. Outgoing unresolved prefix-less formatString URL on a replaced component still fails closed
+        rep_prefixless = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "rep_pfx",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${/never_set}"}},
+                        }
+                    ],
+                    "dataModel": {},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "rep_pfx",
+                    "components": [{"id": "root", "component": "Text", "text": "Replaced"}],
+                },
+            },
+        ]
+        res_rp = validate_payload(json.dumps(rep_prefixless), version="1.0", strict=True)
+        self.assertFalse(res_rp["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_rp["errors"]})
+
+        # 4. Superseded component with static javascript: literal still fails closed
+        rep_static_bad = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "rep_static",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Image", "url": "javascript:alert(1)"}],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "rep_static",
+                    "components": [{"id": "root", "component": "Text", "text": "Clean"}],
+                },
+            },
+        ]
+        res_rs = validate_payload(json.dumps(rep_static_bad), version="1.0", strict=True)
+        self.assertFalse(res_rs["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_rs["errors"]})
+
+    def test_icon_svgpath_malformed_dicts_and_create_surface_catalog_id_types(self) -> None:
+        """Malformed Icon.name.svgPath dicts and non-string/empty createSurface.catalogId fail closed."""
+        # 1. Malformed Icon.name.svgPath dicts emit INVALID_ICON_NAME
+        for bad_svg in (
+            {"path": 123},
+            {"call": 123},
+            {"path": "/p", "extra": 1},
+            {"@path": "/p", "extra": 1},
+        ):
+            payload = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "svg_m",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Icon", "name": {"svgPath": bad_svg}}],
+                },
+            }
+            res = validate_payload(json.dumps(payload), version="1.0", strict=True)
+            self.assertFalse(res["ok"], f"Expected INVALID_ICON_NAME for svgPath={bad_svg!r}")
+            self.assertIn("INVALID_ICON_NAME", {e["code"] for e in res["errors"]})
+
+        # Direct Icon.name with non-string path also emits INVALID_ICON_NAME
+        bad_direct_icon = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "ico_m",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [{"id": "root", "component": "Icon", "name": {"path": 123}}],
+            },
+        }
+        res_di = validate_payload(json.dumps(bad_direct_icon), version="1.0", strict=True)
+        self.assertFalse(res_di["ok"])
+        self.assertIn("INVALID_ICON_NAME", {e["code"] for e in res_di["errors"]})
+
+        # 2. Invalid createSurface.catalogId types emit INVALID_CATALOG_ID at $[0].createSurface.catalogId
+        for bad_cat in (123, "", "   ", None, [], {}):
+            cs_bad = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "cs_cat_bad",
+                    "catalogId": bad_cat,
+                    "components": [{"id": "root", "component": "Text", "text": "Hi"}],
+                },
+            }
+            res_cs = validate_payload(json.dumps(cs_bad), version="1.0", strict=True)
+            self.assertFalse(res_cs["ok"], f"Expected INVALID_CATALOG_ID for catalogId={bad_cat!r}")
+            cat_errs = [e for e in res_cs["errors"] if e["code"] == "INVALID_CATALOG_ID"]
+            self.assertEqual(len(cat_errs), 1)
+            self.assertEqual(cat_errs[0]["path"], "$[0].createSurface.catalogId")
+
+        # Omitting catalogId on v1.0 createSurface remains valid
+        cs_omit = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "cs_cat_omit",
+                "components": [{"id": "root", "component": "Text", "text": "Hi"}],
+            },
+        }
+        res_omit = validate_payload(json.dumps(cs_omit), version="1.0", strict=True)
+        self.assertTrue(res_omit["ok"], res_omit["errors"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -130,55 +130,67 @@ def _parse_rfc6901_array_index(seg: str) -> int | None:
     return int(seg)
 
 
-def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> None:
-    """Apply an RFC 6901 JSON Pointer mutation across nested dicts and lists (None deletes)."""
+def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> tuple[str, bool]:
+    """Apply an RFC 6901 JSON Pointer mutation across nested dicts and lists (None deletes).
+
+    Returns (effective_pointer, is_list_pop) where trailing '/-' appends resolve to their
+    concrete numeric index and list element deletions map to the parent list pointer.
+    """
     if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
-        return
-    parts = [p.replace("~1", "/").replace("~0", "~") for p in pointer[1:].split("/")]
+        return (pointer if isinstance(pointer, str) else "/", False)
+    raw_parts = pointer[1:].split("/")
+    parts = [p.replace("~1", "/").replace("~0", "~") for p in raw_parts]
     if not parts:
-        return
+        return (pointer, False)
     cur: Any = root
     for seg in parts[:-1]:
         if isinstance(cur, dict):
             nxt = cur.get(seg)
             if not isinstance(nxt, (dict, list)):
                 if value is None:
-                    return
+                    return (pointer, False)
                 nxt = {}
                 cur[seg] = nxt
             cur = nxt
         elif isinstance(cur, list):
             idx = _parse_rfc6901_array_index(seg)
             if idx is None or idx >= len(cur):
-                return
+                return (pointer, False)
             nxt = cur[idx]
             if not isinstance(nxt, (dict, list)):
                 if value is None:
-                    return
+                    return (pointer, False)
                 nxt = {}
                 cur[idx] = nxt
             cur = nxt
         else:
-            return
+            return (pointer, False)
     last = parts[-1]
+    parent_ptr = "" if len(raw_parts) == 1 else "/" + "/".join(raw_parts[:-1])
     if isinstance(cur, dict):
         if value is None:
             cur.pop(last, None)
         else:
             cur[last] = value
-    elif isinstance(cur, list):
+        return (pointer, False)
+    if isinstance(cur, list):
         idx = _parse_rfc6901_array_index(last)
         if idx is not None:
             if value is None:
                 if idx < len(cur):
                     cur.pop(idx)
+                    return (parent_ptr or "/", True)
             else:
                 if idx < len(cur):
                     cur[idx] = value
                 elif idx == len(cur):
                     cur.append(value)
-        elif last == "-" and value is not None:
+            return (pointer, False)
+        if last == "-" and value is not None:
+            new_idx = len(cur)
             cur.append(value)
+            return (f"{parent_ptr}/{new_idx}", False)
+    return (pointer, False)
 
 
 def _convert_v08_typed_value(entry: dict[str, Any]) -> Any:
@@ -352,6 +364,7 @@ def _validate_url_function_call(
     data_model: dict[str, Any],
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
+    is_superseded: bool = False,
 ) -> None:
     fn_name = fn_obj.get("@call") if "@call" in fn_obj else fn_obj.get("call")
     args = fn_obj.get("args") if isinstance(fn_obj.get("args"), dict) else {}
@@ -482,6 +495,8 @@ def _validate_url_function_call(
         if not ok_tpl:
             _add_issue(errors, code, block_index, path, reason_tpl or f"Unsafe {kind} URL template in formatString.")
             return
+        if is_superseded:
+            return
         ok_res, reason_res = validator_fn(resolved_str)
         if not ok_res:
             _add_issue(errors, code, block_index, path, reason_res or f"Unsafe resolved {kind} URL.")
@@ -568,6 +583,8 @@ def _validate_dynamic_value(
     effective_catalog_id: str | None = None,
     allow_user_activation: bool = False,
     item_ctx: Any = None,
+    is_historical_snapshot: bool = False,
+    is_superseded: bool = False,
 ) -> None:
     """Validate DynamicValue, DataBinding (@path), FunctionCall (@call), arrays, and single-@ escape."""
     if isinstance(val, list):
@@ -587,6 +604,8 @@ def _validate_dynamic_value(
                 effective_catalog_id=effective_catalog_id,
                 allow_user_activation=False,
                 item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot,
+                is_superseded=is_superseded,
             )
         return
 
@@ -722,6 +741,8 @@ def _validate_dynamic_value(
                     strict=strict,
                     warnings=warnings,
                     item_ctx=item_ctx,
+                    is_historical_snapshot=is_historical_snapshot,
+                    is_superseded=is_superseded,
                 )
             for ak, av in args.items():
                 _validate_dynamic_value(
@@ -739,6 +760,8 @@ def _validate_dynamic_value(
                     effective_catalog_id=effective_catalog_id,
                     allow_user_activation=False,
                     item_ctx=item_ctx,
+                    is_historical_snapshot=is_historical_snapshot,
+                    is_superseded=is_superseded,
                 )
 
     # v1.0 canonical FunctionCall
@@ -810,6 +833,8 @@ def _validate_dynamic_value(
             effective_catalog_id=effective_catalog_id,
             allow_user_activation=False,
             item_ctx=item_ctx,
+            is_historical_snapshot=is_historical_snapshot,
+            is_superseded=is_superseded,
         )
 
 
@@ -824,6 +849,7 @@ def _validate_open_url_arg(
     warnings: list[dict[str, Any]] | None = None,
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
+    is_superseded: bool = False,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = raw_url_val
@@ -840,6 +866,7 @@ def _validate_open_url_arg(
                 data_model=data_model,
                 item_ctx=item_ctx,
                 is_historical_snapshot=is_historical_snapshot,
+                is_superseded=is_superseded,
             )
             return
         ptr = raw_url_val.get("@path") if "@path" in raw_url_val else raw_url_val.get("path")
@@ -868,6 +895,7 @@ def _validate_media_prop(
     warnings: list[dict[str, Any]] | None = None,
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
+    is_superseded: bool = False,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = val
@@ -886,6 +914,7 @@ def _validate_media_prop(
                 data_model=data_model,
                 item_ctx=item_ctx,
                 is_historical_snapshot=is_historical_snapshot,
+                is_superseded=is_superseded,
             )
             return
         else:
@@ -951,6 +980,8 @@ def _validate_action(
     catalog_id: str | None = None,
     effective_catalog_id: str | None = None,
     item_ctx: Any = None,
+    is_historical_snapshot: bool = False,
+    is_superseded: bool = False,
 ) -> None:
     if not isinstance(action, dict):
         _add_issue(errors, "INVALID_ACTION", block_index, path, "Button action must be an object.")
@@ -1003,6 +1034,8 @@ def _validate_action(
                 effective_catalog_id=effective_catalog_id,
                 allow_user_activation=False,
                 item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot,
+                is_superseded=is_superseded,
             )
         if "context" in ev:
             if not isinstance(ev["context"], dict):
@@ -1024,6 +1057,8 @@ def _validate_action(
                         effective_catalog_id=effective_catalog_id,
                         allow_user_activation=False,
                         item_ctx=item_ctx,
+                        is_historical_snapshot=is_historical_snapshot,
+                        is_superseded=is_superseded,
                     )
     else:
         fn_call = action["functionCall"]
@@ -1048,6 +1083,8 @@ def _validate_action(
             effective_catalog_id=effective_catalog_id,
             allow_user_activation=True,
             item_ctx=item_ctx,
+            is_historical_snapshot=is_historical_snapshot,
+            is_superseded=is_superseded,
         )
 
 
@@ -1178,6 +1215,29 @@ def _validate_surface_components(
     historical_adj: dict[str, list[str]] = {}
     historical_parents: dict[str, list[str]] = {}
 
+    # Pre-compute the winning (b_idx, idx) per cid across component_batches (last-write-wins)
+    winning_loc: dict[str, tuple[int, int]] = {}
+    for wb_idx, wbatch in enumerate(component_batches):
+        wbatch_seen: set[str] = set()
+        for widx, wcomp in enumerate(wbatch):
+            if not isinstance(wcomp, dict):
+                continue
+            wcid = wcomp.get("id")
+            if not isinstance(wcid, str) or not wcid or wcid in wbatch_seen:
+                continue
+            wbatch_seen.add(wcid)
+            if version == "0.8":
+                wctype, _wprops = _extract_v08_component(wcomp)
+                if not wctype:
+                    continue
+            else:
+                wctype = wcomp.get("component")
+                if not isinstance(wctype, str) or not wctype:
+                    continue
+            if wctype == "Surface":
+                continue
+            winning_loc[wcid] = (wb_idx, widx)
+
     for b_idx, batch in enumerate(component_batches):
         batch_seen_ids: set[str] = set()
         for idx, comp in enumerate(batch):
@@ -1245,6 +1305,9 @@ def _validate_surface_components(
 
             # Last-write-wins replacement across incremental updateComponents batches
             comp_map[cid] = (comp_type, props, cpath)
+            is_superseded = winning_loc.get(cid) != (b_idx, idx)
+            comp_dm = {} if is_superseded else data_model
+            comp_hist = is_superseded
             adj.setdefault(cid, [])
             hist_edges = historical_adj.setdefault(cid, [])
             for _ref_prop, ref_id in _extract_child_refs(comp_type, props, version):
@@ -1454,10 +1517,16 @@ def _validate_surface_components(
                             is_valid_svg_dyn = isinstance(svg_val, str) or (
                                 isinstance(svg_val, dict)
                                 and (
-                                    "@path" in svg_val
-                                    or "path" in svg_val
+                                    set(svg_val.keys()) == {"@path"}
+                                    or (
+                                        set(svg_val.keys()) == {"path"}
+                                        and isinstance(svg_val.get("path"), str)
+                                    )
                                     or "@call" in svg_val
-                                    or "call" in svg_val
+                                    or (
+                                        "call" in svg_val
+                                        and isinstance(svg_val.get("call"), str)
+                                    )
                                 )
                             )
                             if not is_valid_svg_dyn:
@@ -1468,7 +1537,10 @@ def _validate_surface_components(
                                     f"{cpath}.name.svgPath",
                                     "Icon.name.svgPath must be a string, DataBinding, or FunctionCall.",
                                 )
-                        elif not (set(iname.keys()) == {"@path"} or set(iname.keys()) == {"path"}):
+                        elif not (
+                            set(iname.keys()) == {"@path"}
+                            or (set(iname.keys()) == {"path"} and isinstance(iname.get("path"), str))
+                        ):
                             _add_issue(
                                 errors,
                                 "INVALID_ICON_NAME",
@@ -1527,11 +1599,13 @@ def _validate_surface_components(
                                 errors=errors,
                                 warnings=warnings,
                                 catalog_functions=catalog_functions,
-                                data_model=data_model,
+                                data_model=comp_dm,
                                 catalog_function_specs=catalog_function_specs,
                                 catalog_id=canonical_catalog_id,
                                 effective_catalog_id=effective_comp_catalog,
                                 allow_user_activation=False,
+                                is_historical_snapshot=comp_hist,
+                                is_superseded=is_superseded,
                             )
                     if "live" in acc_val:
                         live_val = acc_val["live"]
@@ -1556,11 +1630,13 @@ def _validate_surface_components(
                             errors=errors,
                             warnings=warnings,
                             catalog_functions=catalog_functions,
-                            data_model=data_model,
+                            data_model=comp_dm,
                             catalog_function_specs=catalog_function_specs,
                             catalog_id=canonical_catalog_id,
                             effective_catalog_id=effective_comp_catalog,
                             allow_user_activation=False,
+                            is_historical_snapshot=comp_hist,
+                            is_superseded=is_superseded,
                         )
 
             if comp_type == "ChoicePicker" and isinstance(props.get("options"), list):
@@ -1575,11 +1651,13 @@ def _validate_surface_components(
                             errors=errors,
                             warnings=warnings,
                             catalog_functions=catalog_functions,
-                            data_model=data_model,
+                            data_model=comp_dm,
                             catalog_function_specs=catalog_function_specs,
                             catalog_id=canonical_catalog_id,
                             effective_catalog_id=effective_comp_catalog,
                             allow_user_activation=False,
+                            is_historical_snapshot=comp_hist,
+                            is_superseded=is_superseded,
                         )
 
             if comp_type == "Icon" and "name" in props:
@@ -1594,11 +1672,13 @@ def _validate_surface_components(
                         errors=errors,
                         warnings=warnings,
                         catalog_functions=catalog_functions,
-                        data_model=data_model,
+                        data_model=comp_dm,
                         catalog_function_specs=catalog_function_specs,
                         catalog_id=canonical_catalog_id,
                         effective_catalog_id=effective_comp_catalog,
                         allow_user_activation=False,
+                        is_historical_snapshot=comp_hist,
+                        is_superseded=is_superseded,
                     )
                 elif isinstance(iname, dict):
                     _validate_dynamic_value(
@@ -1610,11 +1690,13 @@ def _validate_surface_components(
                         errors=errors,
                         warnings=warnings,
                         catalog_functions=catalog_functions,
-                        data_model=data_model,
+                        data_model=comp_dm,
                         catalog_function_specs=catalog_function_specs,
                         catalog_id=canonical_catalog_id,
                         effective_catalog_id=effective_comp_catalog,
                         allow_user_activation=False,
+                        is_historical_snapshot=comp_hist,
+                        is_superseded=is_superseded,
                     )
 
             checks_val = props.get("@checks") if "@checks" in props else props.get("checks")
@@ -1664,10 +1746,12 @@ def _validate_surface_components(
                                 errors=errors,
                                 warnings=warnings,
                                 catalog_functions=catalog_functions,
-                                data_model=data_model,
+                                data_model=comp_dm,
                                 catalog_function_specs=catalog_function_specs,
                                 catalog_id=canonical_catalog_id,
                                 effective_catalog_id=effective_comp_catalog,
+                                is_historical_snapshot=comp_hist,
+                                is_superseded=is_superseded,
                             )
 
             for prop_name, pval in props.items():
@@ -1681,10 +1765,12 @@ def _validate_surface_components(
                         errors=errors,
                         warnings=warnings,
                         catalog_functions=catalog_functions,
-                        data_model=data_model,
+                        data_model=comp_dm,
                         catalog_function_specs=catalog_function_specs,
                         catalog_id=canonical_catalog_id,
                         effective_catalog_id=effective_comp_catalog,
+                        is_historical_snapshot=comp_hist,
+                        is_superseded=is_superseded,
                     )
 
             if "action" in props and (comp_type == "Button" or isinstance(props["action"], dict)):
@@ -1697,10 +1783,12 @@ def _validate_surface_components(
                     errors=errors,
                     warnings=warnings,
                     catalog_functions=catalog_functions,
-                    data_model=data_model,
+                    data_model=comp_dm,
                     catalog_function_specs=catalog_function_specs,
                     catalog_id=canonical_catalog_id,
                     effective_catalog_id=effective_comp_catalog,
+                    is_historical_snapshot=comp_hist,
+                    is_superseded=is_superseded,
                 )
 
             if comp_type in _MEDIA_URL_PROPS:
@@ -1711,9 +1799,11 @@ def _validate_surface_components(
                             block_index,
                             f"{cpath}.{media_prop}",
                             errors,
-                            data_model,
+                            comp_dm,
                             strict=strict,
                             warnings=warnings,
+                            is_historical_snapshot=comp_hist,
+                            is_superseded=is_superseded,
                         )
             elif is_custom_catalog:
                 for media_prop in ("url", "posterUrl"):
@@ -1723,9 +1813,11 @@ def _validate_surface_components(
                             block_index,
                             f"{cpath}.{media_prop}",
                             errors,
-                            data_model,
+                            comp_dm,
                             strict=strict,
                             warnings=warnings,
+                            is_historical_snapshot=comp_hist,
+                            is_superseded=is_superseded,
                         )
 
     # Check root presence
@@ -1975,15 +2067,21 @@ def validate_payload(
             surface_ptr_index_dirty.discard(sid_idx)
             return res_idx
 
-        def _collect_template_nodes_and_slots(
+        def _collect_template_scope(
             sid_tpl: str, tpl_root_id: str
-        ) -> tuple[list[str], list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]]:
+        ) -> tuple[
+            list[str],
+            list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+            list[tuple[str, str]],
+        ]:
+            """Collect nodes, relative URL slots, and nested relative ChildLists sharing tpl_root_id's item_ctx."""
             comp_map = surface_active_comp_map.get(sid_tpl, {})
             if tpl_root_id not in comp_map:
-                return [], []
+                return [], [], []
             adj_map = surface_active_adj.get(sid_tpl, {})
             slots_by_cid = surface_url_slots.get(sid_tpl, {})
-            tpl_nodes: list[str] = []
+            tpl_map = surface_childlist_templates.get(sid_tpl, {})
+            direct_nodes: list[str] = []
             seen_tpl: set[str] = set()
             t_queue = [tpl_root_id]
             while t_queue:
@@ -1991,14 +2089,180 @@ def validate_payload(
                 if cur_id in seen_tpl or cur_id not in comp_map:
                     continue
                 seen_tpl.add(cur_id)
-                tpl_nodes.append(cur_id)
+                direct_nodes.append(cur_id)
                 t_queue.extend(adj_map.get(cur_id, []))
-            rel_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
-            for tcid in tpl_nodes:
+            direct_rel_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
+            nested_rel_children: list[tuple[str, str]] = []
+            for tcid in direct_nodes:
                 for slot in slots_by_cid.get(tcid, ()):
                     if slot[4]:  # has relative pointers that depend on item_ctx
-                        rel_slots.append(slot)
-            return tpl_nodes, rel_slots
+                        direct_rel_slots.append(slot)
+                child_tpl = tpl_map.get(tcid)
+                if child_tpl is not None:
+                    inner_tpl_id, inner_list_ptr = child_tpl
+                    if isinstance(inner_list_ptr, str) and inner_list_ptr and not inner_list_ptr.startswith("/"):
+                        nested_rel_children.append((inner_tpl_id, inner_list_ptr))
+            return direct_nodes, direct_rel_slots, nested_rel_children
+
+        def _collect_template_tree_summary(
+            sid_tpl: str, tpl_root_id: str
+        ) -> tuple[
+            set[str],
+            list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+            bool,
+        ]:
+            """Collect all reachable nodes and relative URL slots across tpl_root_id and nested relative ChildLists."""
+            all_nodes: set[str] = set()
+            all_rel_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
+            seen_roots: set[str] = set()
+            has_nested_rel = False
+            stack = [tpl_root_id]
+            while stack:
+                cur_root = stack.pop()
+                if cur_root in seen_roots:
+                    continue
+                seen_roots.add(cur_root)
+                d_nodes, d_rel_slots, nested_rel = _collect_template_scope(sid_tpl, cur_root)
+                all_nodes.update(d_nodes)
+                all_rel_slots.extend(d_rel_slots)
+                if nested_rel:
+                    has_nested_rel = True
+                    for inner_tpl_id, _inner_ptr in nested_rel:
+                        if inner_tpl_id not in seen_roots:
+                            stack.append(inner_tpl_id)
+            return all_nodes, all_rel_slots, has_nested_rel
+
+        def _validate_template_item_urls(
+            sid_tpl: str,
+            tpl_root_id: str,
+            dm: dict[str, Any],
+            item_ctx: Any,
+            item_idx: int,
+            tmp_errors: list[dict[str, Any]],
+            tmp_warnings: list[dict[str, Any]],
+            *,
+            is_historical_snapshot: bool = True,
+            only_prefixless: bool = False,
+            abs_overlap_ptr: str | None = None,
+            visited_tpls: frozenset[str] = frozenset(),
+            eval_budget: list[int] | None = None,
+            scope_cache: dict[
+                str,
+                tuple[
+                    list[str],
+                    list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+                    list[tuple[str, str]],
+                ],
+            ]
+            | None = None,
+            tree_has_slots_cache: dict[str, bool] | None = None,
+        ) -> bool:
+            """Validate one ChildList template item and any nested relative ChildList templates.
+
+            Returns True if _MAX_TEMPLATE_ABS_RESCAN_EVALS was exceeded (fail-closed).
+            """
+            if tpl_root_id in visited_tpls:
+                return False
+            next_visited = visited_tpls | {tpl_root_id}
+            if scope_cache is None:
+                scope_cache = {}
+            if tree_has_slots_cache is None:
+                tree_has_slots_cache = {}
+            scope = scope_cache.get(tpl_root_id)
+            if scope is None:
+                scope = _collect_template_scope(sid_tpl, tpl_root_id)
+                scope_cache[tpl_root_id] = scope
+            _direct_nodes, direct_rel_slots, nested_rel_children = scope
+
+            for slot in direct_rel_slots:
+                if only_prefixless and not _is_prefixless_format_string_url(slot[2]):
+                    continue
+                if abs_overlap_ptr is not None and not any(
+                    _pointers_overlap(ap, abs_overlap_ptr) for ap in slot[3]
+                ):
+                    continue
+                if eval_budget is not None:
+                    if eval_budget[0] >= _MAX_TEMPLATE_ABS_RESCAN_EVALS:
+                        _add_issue(
+                            tmp_errors,
+                            "MAX_TEMPLATE_EVALS_EXCEEDED",
+                            bidx,
+                            f"surface:{sid_tpl}",
+                            f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_ABS_RESCAN_EVALS}).",
+                        )
+                        return True
+                    eval_budget[0] += 1
+                _validate_single_url_slot(
+                    slot,
+                    dm,
+                    tmp_errors,
+                    tmp_warnings,
+                    item_ctx=item_ctx,
+                    item_idx=item_idx,
+                    is_historical_snapshot=is_historical_snapshot,
+                )
+
+            if nested_rel_children:
+                local_budget = eval_budget
+                owns_budget = False
+                if local_budget is None:
+                    local_budget = [surface_tpl_abs_eval_count.get(sid_tpl, 0)]
+                    owns_budget = True
+                try:
+                    for inner_tpl_id, inner_list_ptr in nested_rel_children:
+                        if inner_tpl_id in next_visited:
+                            continue
+                        has_inner_slots = tree_has_slots_cache.get(inner_tpl_id)
+                        if has_inner_slots is None:
+                            _inodes, irel, _inest = _collect_template_tree_summary(sid_tpl, inner_tpl_id)
+                            if only_prefixless:
+                                has_inner_slots = any(_is_prefixless_format_string_url(s[2]) for s in irel)
+                            elif abs_overlap_ptr is not None:
+                                has_inner_slots = any(
+                                    any(_pointers_overlap(ap, abs_overlap_ptr) for ap in s[3]) for s in irel
+                                )
+                            else:
+                                has_inner_slots = bool(irel)
+                            tree_has_slots_cache[inner_tpl_id] = has_inner_slots
+                        if not has_inner_slots:
+                            continue
+                        found_inner, inner_items = _resolve_pointer_with_context(dm, inner_list_ptr, item_ctx)
+                        if not found_inner or not isinstance(inner_items, list):
+                            continue
+                        for inner_idx, inner_item in enumerate(inner_items):
+                            if local_budget[0] >= _MAX_TEMPLATE_ABS_RESCAN_EVALS:
+                                _add_issue(
+                                    tmp_errors,
+                                    "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                    bidx,
+                                    f"surface:{sid_tpl}",
+                                    f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_ABS_RESCAN_EVALS}).",
+                                )
+                                return True
+                            before = local_budget[0]
+                            if _validate_template_item_urls(
+                                sid_tpl,
+                                inner_tpl_id,
+                                dm,
+                                inner_item,
+                                inner_idx,
+                                tmp_errors,
+                                tmp_warnings,
+                                is_historical_snapshot=is_historical_snapshot,
+                                only_prefixless=only_prefixless,
+                                abs_overlap_ptr=abs_overlap_ptr,
+                                visited_tpls=next_visited,
+                                eval_budget=local_budget,
+                                scope_cache=scope_cache,
+                                tree_has_slots_cache=tree_has_slots_cache,
+                            ):
+                                return True
+                            if local_budget[0] == before:
+                                local_budget[0] += 1
+                finally:
+                    if owns_budget:
+                        surface_tpl_abs_eval_count[sid_tpl] = local_budget[0]
+            return False
 
         def _ingest_component_batch(sid_ing: str, b_idx: int, comps: list[dict[str, Any]]) -> None:
             total_seen = surface_total_comp_entries.get(sid_ing, 0) + len(comps)
@@ -2012,6 +2276,9 @@ def validate_payload(
             adj_map = surface_active_adj.setdefault(sid_ing, {})
             slots_by_cid = surface_url_slots.setdefault(sid_ing, {})
             tpl_map = surface_childlist_templates.setdefault(sid_ing, {})
+            dm = surface_data_models.get(sid_ing, {})
+            tmp_errors: list[dict[str, Any]] = []
+            tmp_warnings: list[dict[str, Any]] = []
 
             batch_seen_ids: set[str] = set()
             updated_cids: set[str] = set()
@@ -2039,8 +2306,74 @@ def validate_payload(
                 if c_type == "Surface":
                     continue
 
+                # Before overwriting an existing cid, run final non-historical check on outgoing prefix-less formatString URL slots
+                if cid in comp_map:
+                    outgoing_slots = slots_by_cid.get(cid, ())
+                    outgoing_prefixless = [s for s in outgoing_slots if _is_prefixless_format_string_url(s[2])]
+                    if outgoing_prefixless:
+                        for out_slot in outgoing_prefixless:
+                            if not out_slot[4]:
+                                _validate_single_url_slot(
+                                    out_slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=False
+                                )
+                        if any(s[4] for s in outgoing_prefixless):
+                            for _o_cid, (o_tpl_root, o_list_ptr) in tpl_map.items():
+                                if not isinstance(o_list_ptr, str) or not o_list_ptr.startswith("/"):
+                                    continue
+                                o_nodes, _o_rel, _o_nest = _collect_template_tree_summary(sid_ing, o_tpl_root)
+                                if cid not in o_nodes:
+                                    continue
+                                found_l, l_items = _resolve_json_pointer(dm, o_list_ptr)
+                                if not found_l or not isinstance(l_items, list):
+                                    continue
+                                out_sc: dict[str, Any] = {}
+                                out_tc: dict[str, bool] = {}
+                                for li_idx, li_item in enumerate(l_items):
+                                    if _validate_template_item_urls(
+                                        sid_ing,
+                                        o_tpl_root,
+                                        dm,
+                                        li_item,
+                                        li_idx,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        is_historical_snapshot=False,
+                                        only_prefixless=True,
+                                        scope_cache=out_sc,
+                                        tree_has_slots_cache=out_tc,
+                                    ):
+                                        break
+                    if cid in tpl_map:
+                        old_tpl_root, old_list_ptr = tpl_map[cid]
+                        if isinstance(old_list_ptr, str) and old_list_ptr.startswith("/"):
+                            _old_n, old_rel, _old_nest = _collect_template_tree_summary(sid_ing, old_tpl_root)
+                            if any(_is_prefixless_format_string_url(s[2]) for s in old_rel):
+                                found_ol, ol_items = _resolve_json_pointer(dm, old_list_ptr)
+                                if found_ol and isinstance(ol_items, list):
+                                    ol_sc: dict[str, Any] = {}
+                                    ol_tc: dict[str, bool] = {}
+                                    for oli_idx, oli_item in enumerate(ol_items):
+                                        if _validate_template_item_urls(
+                                            sid_ing,
+                                            old_tpl_root,
+                                            dm,
+                                            oli_item,
+                                            oli_idx,
+                                            tmp_errors,
+                                            tmp_warnings,
+                                            is_historical_snapshot=False,
+                                            only_prefixless=True,
+                                            scope_cache=ol_sc,
+                                            tree_has_slots_cache=ol_tc,
+                                        ):
+                                            break
+
                 comp_map[cid] = (c_type, c_props, cpath)
-                adj_map[cid] = [ref_id for _rp, ref_id in _extract_child_refs(c_type, c_props, sver)]
+                adj_map[cid] = [
+                    ref_id
+                    for rp, ref_id in _extract_child_refs(c_type, c_props, sver)
+                    if rp not in {"children.componentId", "children.template.componentId"}
+                ]
                 updated_cids.add(cid)
 
                 raw_c_cat = c_props.get("@catalogId")
@@ -2084,11 +2417,8 @@ def validate_payload(
 
             surface_ptr_index_dirty.add(sid_ing)
             if not updated_cids:
+                _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
-
-            dm = surface_data_models.get(sid_ing, {})
-            tmp_errors: list[dict[str, Any]] = []
-            tmp_warnings: list[dict[str, Any]] = []
 
             # Eagerly validate newly added/updated direct component URL slots against current dataModel
             for cid in updated_cids:
@@ -2097,9 +2427,11 @@ def validate_payload(
                         slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
                     )
 
-            # Eagerly validate any affected ChildList template against current dataModel items
+            # Eagerly validate any affected absolute ChildList template (including nested relative ChildLists)
             for owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
-                tpl_nodes, rel_slots = _collect_template_nodes_and_slots(sid_ing, tpl_root_id)
+                if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
+                    continue
+                tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_ing, tpl_root_id)
                 if not rel_slots:
                     continue
                 if owner_cid not in updated_cids and not any(n in updated_cids for n in tpl_nodes):
@@ -2107,21 +2439,41 @@ def validate_payload(
                 found_list, items_val = _resolve_json_pointer(dm, list_ptr)
                 if not found_list or not isinstance(items_val, list):
                     continue
-                for item_idx, item in enumerate(items_val):
-                    for slot in rel_slots:
-                        _validate_single_url_slot(
-                            slot,
+                if not has_nested_rel:
+                    for item_idx, item in enumerate(items_val):
+                        for slot in rel_slots:
+                            _validate_single_url_slot(
+                                slot,
+                                dm,
+                                tmp_errors,
+                                tmp_warnings,
+                                item_ctx=item,
+                                item_idx=item_idx,
+                                is_historical_snapshot=True,
+                            )
+                else:
+                    sc_ing: dict[str, Any] = {}
+                    tc_ing: dict[str, bool] = {}
+                    for item_idx, item in enumerate(items_val):
+                        if _validate_template_item_urls(
+                            sid_ing,
+                            tpl_root_id,
                             dm,
+                            item,
+                            item_idx,
                             tmp_errors,
                             tmp_warnings,
-                            item_ctx=item,
-                            item_idx=item_idx,
                             is_historical_snapshot=True,
-                        )
+                            scope_cache=sc_ing,
+                            tree_has_slots_cache=tc_ing,
+                        ):
+                            break
 
             _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
 
-        def _validate_streaming_data_update(sid_upd: str, ptr: str) -> None:
+        def _validate_streaming_data_update(
+            sid_upd: str, ptr: str, *, is_list_pop: bool = False
+        ) -> None:
             comp_map = surface_active_comp_map.get(sid_upd)
             if not comp_map:
                 return
@@ -2137,16 +2489,12 @@ def validate_payload(
                 else:
                     affected_slots = []
                     seen_slot_ids: set[int] = set()
-                    for slot in exact_map.get("/", ()):
-                        sid_obj = id(slot)
-                        if sid_obj not in seen_slot_ids:
-                            seen_slot_ids.add(sid_obj)
-                            affected_slots.append(slot)
-                    for slot in prefix_map.get(ptr, ()):
-                        sid_obj = id(slot)
-                        if sid_obj not in seen_slot_ids:
-                            seen_slot_ids.add(sid_obj)
-                            affected_slots.append(slot)
+                    for bucket in (exact_map.get("/", ()), exact_map.get(ptr, ()), prefix_map.get(ptr, ())):
+                        for slot in bucket:
+                            sid_obj = id(slot)
+                            if sid_obj not in seen_slot_ids:
+                                seen_slot_ids.add(sid_obj)
+                                affected_slots.append(slot)
                     for anc in _pointer_ancestors(ptr):
                         if anc == ptr:
                             continue
@@ -2160,11 +2508,13 @@ def validate_payload(
                         slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
                     )
 
-            # 2. Re-validate affected ChildList templates (O(1) for single-element mutations)
+            # 2. Re-validate affected absolute ChildList templates (and nested relative ChildLists)
             tpl_map = surface_childlist_templates.get(sid_upd)
             if tpl_map:
                 for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
-                    _tpl_nodes, rel_slots = _collect_template_nodes_and_slots(sid_upd, tpl_root_id)
+                    if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
+                        continue
+                    _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_upd, tpl_root_id)
                     if not rel_slots:
                         continue
                     list_prefix = "/" if list_ptr in {"", "/"} else f"{list_ptr}/"
@@ -2190,31 +2540,65 @@ def validate_payload(
                             )
                         if target_idx is not None:
                             item = items_val[target_idx]
-                            for slot in rel_slots:
-                                _validate_single_url_slot(
-                                    slot,
+                            if not has_nested_rel:
+                                for slot in rel_slots:
+                                    _validate_single_url_slot(
+                                        slot,
+                                        dm,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        item_ctx=item,
+                                        item_idx=target_idx,
+                                        is_historical_snapshot=True,
+                                    )
+                            else:
+                                _validate_template_item_urls(
+                                    sid_upd,
+                                    tpl_root_id,
                                     dm,
+                                    item,
+                                    target_idx,
                                     tmp_errors,
                                     tmp_warnings,
-                                    item_ctx=item,
-                                    item_idx=target_idx,
                                     is_historical_snapshot=True,
                                 )
-                    elif ptr in {"", "/"} or list_ptr == ptr or list_ptr.startswith(ptr + "/"):
+                    elif (
+                        ptr in {"", "/"}
+                        or (not is_list_pop and list_ptr == ptr)
+                        or list_ptr.startswith(ptr + "/")
+                    ):
                         found_list, items_val = _resolve_json_pointer(dm, list_ptr)
                         if not found_list or not isinstance(items_val, list):
                             continue
-                        for item_idx, item in enumerate(items_val):
-                            for slot in rel_slots:
-                                _validate_single_url_slot(
-                                    slot,
+                        if not has_nested_rel:
+                            for item_idx, item in enumerate(items_val):
+                                for slot in rel_slots:
+                                    _validate_single_url_slot(
+                                        slot,
+                                        dm,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        item_ctx=item,
+                                        item_idx=item_idx,
+                                        is_historical_snapshot=True,
+                                    )
+                        else:
+                            sc_full: dict[str, Any] = {}
+                            tc_full: dict[str, bool] = {}
+                            for item_idx, item in enumerate(items_val):
+                                if _validate_template_item_urls(
+                                    sid_upd,
+                                    tpl_root_id,
                                     dm,
+                                    item,
+                                    item_idx,
                                     tmp_errors,
                                     tmp_warnings,
-                                    item_ctx=item,
-                                    item_idx=item_idx,
                                     is_historical_snapshot=True,
-                                )
+                                    scope_cache=sc_full,
+                                    tree_has_slots_cache=tc_full,
+                                ):
+                                    break
                     else:
                         abs_overlap_slots = [
                             slot
@@ -2235,22 +2619,54 @@ def validate_payload(
                                     item_ctx=None,
                                     is_historical_snapshot=True,
                                 )
-                            evals = surface_tpl_abs_eval_count.get(sid_upd, 0)
-                            for item_idx, item in enumerate(items_val):
-                                if evals >= _MAX_TEMPLATE_ABS_RESCAN_EVALS:
-                                    break
-                                for slot in abs_overlap_slots:
-                                    _validate_single_url_slot(
-                                        slot,
+                            budget = [surface_tpl_abs_eval_count.get(sid_upd, 0)]
+                            if not has_nested_rel:
+                                cap_hit = False
+                                for item_idx, item in enumerate(items_val):
+                                    for slot in abs_overlap_slots:
+                                        if budget[0] >= _MAX_TEMPLATE_ABS_RESCAN_EVALS:
+                                            cap_hit = True
+                                            break
+                                        _validate_single_url_slot(
+                                            slot,
+                                            dm,
+                                            tmp_errors,
+                                            tmp_warnings,
+                                            item_ctx=item,
+                                            item_idx=item_idx,
+                                            is_historical_snapshot=True,
+                                        )
+                                        budget[0] += 1
+                                    if cap_hit:
+                                        break
+                                if cap_hit:
+                                    _add_issue(
+                                        tmp_errors,
+                                        "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                        bidx,
+                                        f"surface:{sid_upd}",
+                                        f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_ABS_RESCAN_EVALS}).",
+                                    )
+                            else:
+                                sc_abs: dict[str, Any] = {}
+                                tc_abs: dict[str, bool] = {}
+                                for item_idx, item in enumerate(items_val):
+                                    if _validate_template_item_urls(
+                                        sid_upd,
+                                        tpl_root_id,
                                         dm,
+                                        item,
+                                        item_idx,
                                         tmp_errors,
                                         tmp_warnings,
-                                        item_ctx=item,
-                                        item_idx=item_idx,
                                         is_historical_snapshot=True,
-                                    )
-                                    evals += 1
-                            surface_tpl_abs_eval_count[sid_upd] = evals
+                                        abs_overlap_ptr=ptr,
+                                        eval_budget=budget,
+                                        scope_cache=sc_abs,
+                                        tree_has_slots_cache=tc_abs,
+                                    ):
+                                        break
+                            surface_tpl_abs_eval_count[sid_upd] = budget[0]
 
             _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
 
@@ -2268,24 +2684,45 @@ def validate_payload(
             final_tpl_errors: list[dict[str, Any]] = []
             final_tpl_warnings: list[dict[str, Any]] = []
             for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
-                _tpl_nodes, rel_slots = _collect_template_nodes_and_slots(sid_to_flush, tpl_root_id)
+                if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
+                    continue
+                _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_to_flush, tpl_root_id)
                 prefixless_slots = [s for s in rel_slots if _is_prefixless_format_string_url(s[2])]
                 if not prefixless_slots:
                     continue
                 found_list, items_val = _resolve_json_pointer(dm, list_ptr)
                 if not found_list or not isinstance(items_val, list):
                     continue
-                for item_idx, item in enumerate(items_val):
-                    for slot in prefixless_slots:
-                        _validate_single_url_slot(
-                            slot,
+                if not has_nested_rel:
+                    for item_idx, item in enumerate(items_val):
+                        for slot in prefixless_slots:
+                            _validate_single_url_slot(
+                                slot,
+                                dm,
+                                final_tpl_errors,
+                                final_tpl_warnings,
+                                item_ctx=item,
+                                item_idx=item_idx,
+                                is_historical_snapshot=False,
+                            )
+                else:
+                    sc_fl: dict[str, Any] = {}
+                    tc_fl: dict[str, bool] = {}
+                    for item_idx, item in enumerate(items_val):
+                        if _validate_template_item_urls(
+                            sid_to_flush,
+                            tpl_root_id,
                             dm,
+                            item,
+                            item_idx,
                             final_tpl_errors,
                             final_tpl_warnings,
-                            item_ctx=item,
-                            item_idx=item_idx,
                             is_historical_snapshot=False,
-                        )
+                            only_prefixless=True,
+                            scope_cache=sc_fl,
+                            tree_has_slots_cache=tc_fl,
+                        ):
+                            break
             _emit_surface_issues(sid_to_flush, final_tpl_errors, final_tpl_warnings)
 
             sver = surface_versions.get(sid_to_flush, "1.0")
@@ -2390,23 +2827,36 @@ def validate_payload(
                     surface_ids.append(sid)
 
                 cat_id = body.get("catalogId")
-                surface_catalog_ids[sid] = cat_id if isinstance(cat_id, str) else None
-                if cat_id == BROKEN_V09_CATALOG_ID:
-                    _add_issue(
-                        warnings,
-                        "BROKEN_CATALOG_URI",
-                        bidx,
-                        f"{mpath}.createSurface.catalogId",
-                        f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
-                    )
-                if msg_ver in {"0.9", "0.9.1"} and not cat_id:
-                    _add_issue(
-                        errors,
-                        "MISSING_CATALOG_ID",
-                        bidx,
-                        f"{mpath}.createSurface.catalogId",
-                        "v0.9/v0.9.1 createSurface requires 'catalogId'.",
-                    )
+                if "catalogId" in body:
+                    if not isinstance(cat_id, str) or not cat_id.strip():
+                        _add_issue(
+                            errors,
+                            "INVALID_CATALOG_ID",
+                            bidx,
+                            f"{mpath}.createSurface.catalogId",
+                            "createSurface.catalogId must be a non-empty string when provided.",
+                        )
+                        surface_catalog_ids[sid] = None
+                    else:
+                        surface_catalog_ids[sid] = cat_id
+                        if cat_id == BROKEN_V09_CATALOG_ID:
+                            _add_issue(
+                                warnings,
+                                "BROKEN_CATALOG_URI",
+                                bidx,
+                                f"{mpath}.createSurface.catalogId",
+                                f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+                            )
+                else:
+                    surface_catalog_ids[sid] = None
+                    if msg_ver in {"0.9", "0.9.1"}:
+                        _add_issue(
+                            errors,
+                            "MISSING_CATALOG_ID",
+                            bidx,
+                            f"{mpath}.createSurface.catalogId",
+                            "v0.9/v0.9.1 createSurface requires 'catalogId'.",
+                        )
 
                 if msg_ver == "1.0":
                     if "theme" in body:
@@ -2540,6 +2990,8 @@ def validate_payload(
                         "A2UI v1.0 updateDataModel requires explicit 'value' (use null to delete).",
                     )
                 ptr = body.get("path", "/")
+                effective_ptr = ptr if isinstance(ptr, str) else "/"
+                is_list_pop = False
                 mutated = False
                 if ptr in {"", "/"}:
                     if body.get("value") is None:
@@ -2550,10 +3002,10 @@ def validate_payload(
                         mutated = True
                 elif isinstance(ptr, str) and ptr.startswith("/") and "value" in body:
                     dm = surface_data_models.setdefault(sid, {})
-                    _mutate_json_pointer(dm, ptr, body["value"])
+                    effective_ptr, is_list_pop = _mutate_json_pointer(dm, ptr, body["value"])
                     mutated = True
-                if mutated and isinstance(ptr, str):
-                    _validate_streaming_data_update(sid, ptr)
+                if mutated and isinstance(effective_ptr, str):
+                    _validate_streaming_data_update(sid, effective_ptr, is_list_pop=is_list_pop)
 
             elif env_key in {"callRendererFunction", "callAgentFunction"}:
                 extra_fn_keys = set(body.keys()) - {"surfaceId", "functionCallId", "callFunction"}
@@ -2726,6 +3178,8 @@ def validate_payload(
                     _add_issue(errors, "MISSING_SURFACE_ID", bidx, f"{mpath}.dataModelUpdate.surfaceId", "dataModelUpdate requires 'surfaceId'.")
                 else:
                     ptr = body.get("path", "/")
+                    effective_ptr = ptr if isinstance(ptr, str) else "/"
+                    is_list_pop = False
                     contents = body.get("contents")
                     mutated = False
                     if isinstance(contents, list):
@@ -2736,7 +3190,7 @@ def validate_payload(
                             mutated = True
                         elif isinstance(ptr, str) and ptr.startswith("/"):
                             dm = surface_data_models.setdefault(sid, {})
-                            _mutate_json_pointer(dm, ptr, conv_val)
+                            effective_ptr, is_list_pop = _mutate_json_pointer(dm, ptr, conv_val)
                             mutated = True
                     elif "value" in body:
                         if ptr in {"", "/"}:
@@ -2748,10 +3202,10 @@ def validate_payload(
                                 mutated = True
                         elif isinstance(ptr, str) and ptr.startswith("/"):
                             dm = surface_data_models.setdefault(sid, {})
-                            _mutate_json_pointer(dm, ptr, body["value"])
+                            effective_ptr, is_list_pop = _mutate_json_pointer(dm, ptr, body["value"])
                             mutated = True
-                    if mutated and isinstance(ptr, str):
-                        _validate_streaming_data_update(sid, ptr)
+                    if mutated and isinstance(effective_ptr, str):
+                        _validate_streaming_data_update(sid, effective_ptr, is_list_pop=is_list_pop)
 
             elif env_key == "deleteSurface":
                 sid = body.get("surfaceId")
