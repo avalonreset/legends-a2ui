@@ -1,0 +1,15 @@
+Vendored A2UI Specification Snapshot
+====================================
+
+Source repository: https://github.com/a2ui-project/a2ui
+Pinned commit: 92c0ed6eccb499fe22fba49cb8185b058442c56a
+License: Apache License, Version 2.0 (see LICENSE in this directory)
+Copyright: Google LLC and the A2UI Contributors
+
+This directory contains an unmodified snapshot of official A2UI protocol
+JSON schemas, Basic Catalog definitions, and specification documentation
+used for offline validation, normalization, catalog queries, and docs lookup
+in legends-a2ui. legends-a2ui is an independent open-source module and is
+not affiliated with or endorsed by Google LLC or the A2UI project.
+
+Every file hash is verified offline against manifest.json.

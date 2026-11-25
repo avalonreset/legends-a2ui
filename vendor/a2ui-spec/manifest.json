@@ -1,0 +1,261 @@
+{
+  "schema": "legends.vendor-manifest/v1",
+  "repo": "a2ui-project/a2ui",
+  "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+  "license": "Apache-2.0",
+  "fileCount": 28,
+  "files": [
+    {
+      "localPath": "LICENSE",
+      "upstreamPath": "LICENSE",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/LICENSE",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 12730,
+      "sha256": "8c8b5b632d56c4c1658296963c693db5396772a33caaddb9a22593c4155c437a",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "versions.json",
+      "upstreamPath": "specification/versions.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/versions.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 794,
+      "sha256": "63897fe18965642d9f056093d65e44fc3c0f8fa862103b929670315514e88842",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/json/agent_to_renderer.json",
+      "upstreamPath": "specification/v1_0/json/agent_to_renderer.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/json/agent_to_renderer.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 8968,
+      "sha256": "2f575f783fdda0e4d175fe5d331661655e4a4901613262322792dae7e823761d",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/json/renderer_to_agent.json",
+      "upstreamPath": "specification/v1_0/json/renderer_to_agent.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/json/renderer_to_agent.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 5653,
+      "sha256": "58ecde02101f0f37566b5e238dc6ef6af628c3ff312fce0e17ab7670b7215465",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/json/common_types.json",
+      "upstreamPath": "specification/v1_0/json/common_types.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/json/common_types.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 13111,
+      "sha256": "c4e78305be1de73eecb37f8179ba169730250611703683af291b18135a6430dc",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/json/catalog_definition.json",
+      "upstreamPath": "specification/v1_0/json/catalog_definition.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/json/catalog_definition.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 9997,
+      "sha256": "836a48b2deb7ae76c3b68cb4e79c2faa24cba36d4d5396474894796797364d44",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/json/agent_capabilities.json",
+      "upstreamPath": "specification/v1_0/json/agent_capabilities.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/json/agent_capabilities.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 1260,
+      "sha256": "6a4282dfb26af95a73d960572a31b91c5d5c89d1f9e54cbb8d24c599afcbc3a2",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/json/renderer_capabilities.json",
+      "upstreamPath": "specification/v1_0/json/renderer_capabilities.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/json/renderer_capabilities.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 1349,
+      "sha256": "3ebd2889764d892df16d034643ecd9e3a3fc02f298fa05577b95d9e287e703de",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "catalogs/basic/v1/catalog.json",
+      "upstreamPath": "catalogs/basic/v1/catalog.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/catalogs/basic/v1/catalog.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 41967,
+      "sha256": "d4ce11f8fff2da8d5fd0b2793db524f6aa7eef541eefb6fe2b71f0efc17cbfa9",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/docs/a2ui_protocol.md",
+      "upstreamPath": "specification/v1_0/docs/a2ui_protocol.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/docs/a2ui_protocol.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 107848,
+      "sha256": "50ce0de21a807456500aeda94532e85254954b0ab2f8ebafac92ef81266d6bd6",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/docs/evolution_guide.md",
+      "upstreamPath": "specification/v1_0/docs/evolution_guide.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/docs/evolution_guide.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 28877,
+      "sha256": "fb8ad5be1846578a234be189e37b5a22f5fdef0e284a83c3b6f858fec1e40fe2",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/docs/a2ui_custom_functions.md",
+      "upstreamPath": "specification/v1_0/docs/a2ui_custom_functions.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/docs/a2ui_custom_functions.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 4454,
+      "sha256": "bf5f5dbbdc4f103cfc3e52fa37610ca4218276d70d1258b3d83c0b9bb4594347",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/docs/sdks_spec.md",
+      "upstreamPath": "specification/v1_0/docs/sdks_spec.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/docs/sdks_spec.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 4318,
+      "sha256": "0026e8bffe623e4af6e7dedc292f361a3b6ad866516e115512a53f38650b5898",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v1_0/extensions/a2a/docs/a2ui_extension_specification.md",
+      "upstreamPath": "specification/v1_0/extensions/a2a/docs/a2ui_extension_specification.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v1_0/extensions/a2a/docs/a2ui_extension_specification.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 10026,
+      "sha256": "20edcde54f549942d673e988a2c4843f1965df974c1e2ee4db02b036c8fcd13c",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "catalogs/basic/v1/basic_catalog_implementation_guide.md",
+      "upstreamPath": "catalogs/basic/v1/basic_catalog_implementation_guide.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/catalogs/basic/v1/basic_catalog_implementation_guide.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 26383,
+      "sha256": "2666a30839401e0f72ad34e675f781b79b6911db789c15e7124b6190933b2ddf",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9_1/json/server_to_client.json",
+      "upstreamPath": "specification/v0_9_1/json/server_to_client.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9_1/json/server_to_client.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 5907,
+      "sha256": "8af507228344f5737ae8a7027bc557f7acabfba85be9728e2b0196c35b0fc47d",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9_1/json/client_to_server.json",
+      "upstreamPath": "specification/v0_9_1/json/client_to_server.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9_1/json/client_to_server.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 3222,
+      "sha256": "f7150348ba69d6c7e3d5903b9bec770c2e2c5668d4cbb887d20f455b13f270e6",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9_1/json/common_types.json",
+      "upstreamPath": "specification/v0_9_1/json/common_types.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9_1/json/common_types.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 9086,
+      "sha256": "a13897d7dbe14c37512c5cbc9b8561782fc3b01e3a6ff114c1f12c82275b5884",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9_1/docs/evolution_guide.md",
+      "upstreamPath": "specification/v0_9_1/docs/evolution_guide.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9_1/docs/evolution_guide.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 2751,
+      "sha256": "4219c7688250571cbf10a5695f60c9fca954f62eaa1f593691f39413e7b30cba",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "catalogs/basic/v0_9_1/catalog.json",
+      "upstreamPath": "catalogs/basic/v0_9_1/catalog.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/catalogs/basic/v0_9_1/catalog.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 46328,
+      "sha256": "8cc94d0a482e67048f9fc989964ca5da56fe42f531d919315a508989fb22e13e",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9/json/server_to_client.json",
+      "upstreamPath": "specification/v0_9/json/server_to_client.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9/json/server_to_client.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 5861,
+      "sha256": "f5ae741d7cfc1f710d8854b75f178356e04823dcd579bb948d635d8c5232aff1",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9/json/client_to_server.json",
+      "upstreamPath": "specification/v0_9/json/client_to_server.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9/json/client_to_server.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 3209,
+      "sha256": "6a45a7850dee0c53253744628d93a6c04b0da92b63b40a1b7e1a9e545261a995",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9/json/common_types.json",
+      "upstreamPath": "specification/v0_9/json/common_types.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9/json/common_types.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 9086,
+      "sha256": "a13897d7dbe14c37512c5cbc9b8561782fc3b01e3a6ff114c1f12c82275b5884",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_9/docs/evolution_guide.md",
+      "upstreamPath": "specification/v0_9/docs/evolution_guide.md",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_9/docs/evolution_guide.md",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 15254,
+      "sha256": "9e57a5f1737c3cc866f0243aecc9b599ff5a8a02cc6abda4736370763185be49",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "catalogs/basic/v0_9/catalog.json",
+      "upstreamPath": "catalogs/basic/v0_9/catalog.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/catalogs/basic/v0_9/catalog.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 46542,
+      "sha256": "fe7539ad92f8fb3393c19f09a59ed77b7954fa182b19e3ce9c76a67179812d7c",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_8/json/server_to_client.json",
+      "upstreamPath": "specification/v0_8/json/server_to_client.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_8/json/server_to_client.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 5990,
+      "sha256": "77babf290fcbf0a1ba1574dca2a3d17effc5f67ab78a7c68d7690cf0c7f1d43e",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_8/json/client_to_server.json",
+      "upstreamPath": "specification/v0_8/json/client_to_server.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_8/json/client_to_server.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 1547,
+      "sha256": "9414d308b52942738b95720cd6b311db0860f0493f34e5c764c5902fbbe64df2",
+      "license": "Apache-2.0"
+    },
+    {
+      "localPath": "v0_8/json/standard_catalog_definition.json",
+      "upstreamPath": "specification/v0_8/json/standard_catalog_definition.json",
+      "rawUrl": "https://raw.githubusercontent.com/a2ui-project/a2ui/92c0ed6eccb499fe22fba49cb8185b058442c56a/specification/v0_8/json/standard_catalog_definition.json",
+      "commit": "92c0ed6eccb499fe22fba49cb8185b058442c56a",
+      "bytes": 23293,
+      "sha256": "1639716885e588f9e0d54f4b34304989dd4e6be01e18d8374741f1d2e6a08a2e",
+      "license": "Apache-2.0"
+    }
+  ]
+}

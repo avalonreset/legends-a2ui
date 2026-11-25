@@ -1,0 +1,84 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Release hygiene check
+        run: python scripts/check_release.py --root .
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2" build setuptools
+          python -m build
+      - name: Clean install outside checkout
+        shell: bash
+        run: python -m pip install dist/*.whl
+      - name: Packaged CLI smoke outside checkout
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -e
+          legends-a2ui --version
+          legends-a2ui doctor --json
+          legends-a2ui knowledge-pack --check --json
+          legends-a2ui resources > resources.json
+          python "$GITHUB_WORKSPACE/scripts/smoke_installed_resources.py" resources.json
+
+  empire-attachment:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Build and install legends-a2ui wheel
+        shell: bash
+        run: |
+          set -e
+          python -m pip install --upgrade "pip>=26.2.2" build setuptools
+          python -m build --wheel
+          python -m pip install dist/*.whl
+      - name: Check out pinned Empire engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: avalonreset/legends-empire
+          ref: 9cede43a11554c94b552a98410e7b63513af3df0
+          path: .integration/empire
+      - name: Attach packaged knowledge on the native OS
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -e
+          legends-a2ui resources > resources.json
+          python "$GITHUB_WORKSPACE/scripts/smoke_installed_resources.py" resources.json
+          PACK_PATH=$(python -c 'import json; print(json.load(open("resources.json"))["pack_manifest"])')
+          python "$GITHUB_WORKSPACE/scripts/verify_knowledge_attachment.py" --empire-source "$GITHUB_WORKSPACE/.integration/empire" --pack "$PACK_PATH"

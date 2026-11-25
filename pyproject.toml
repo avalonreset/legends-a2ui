@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legends-a2ui"
+version = "0.1.0"
+description = "Offline-first A2UI v1.0, v0.9.1, v0.9, and v0.8 validation, deterministic normalization, operator surface composition, generic JSON-to-A2UI projection, static HTML previewing, host renderer scaffolding, pinned spec lookup, and Empire knowledge pack."
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Benjamin Samar / Avalon Reset"}]
+dependencies = []
+readme = "README.md"
+
+[project.scripts]
+legends-a2ui = "legends_a2ui.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/avalonreset/legends-a2ui"
+Documentation = "https://github.com/avalonreset/legends-a2ui"
+Repository = "https://github.com/avalonreset/legends-a2ui"
+Issues = "https://github.com/avalonreset/legends-a2ui/issues"
+
+[tool.setuptools.packages.find]
+include = ["legends_a2ui*"]

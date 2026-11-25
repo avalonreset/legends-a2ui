@@ -1,0 +1,17 @@
+legends-a2ui
+Copyright (c) 2026 Benjamin Samar / Avalon Reset
+
+Independent open-source tooling for A2UI v1.0, v0.9.1, v0.9, and v0.8 validation,
+deterministic normalization, surface composition, zero-daemon static HTML previewing,
+host renderer scaffolding, and curated documentation lookup.
+
+A2UI names, schemas, and specifications belong to Google LLC and the A2UI Contributors.
+This project is an independent open-source module and is not affiliated with or endorsed
+by Google LLC or the A2UI project.
+
+Vendored A2UI specification schemas and documentation in vendor/a2ui-spec/ are
+redistributed under the Apache License, Version 2.0 (see vendor/a2ui-spec/LICENSE
+and vendor/a2ui-spec/NOTICE).
+
+The central cto-legends router recipe is redistributed under the MIT license,
+copyright Benjamin Samar. See THIRD_PARTY_NOTICES.md for source links and details.

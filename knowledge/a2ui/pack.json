@@ -1,0 +1,18 @@
+{
+  "schema": "legends.knowledge-pack/v1",
+  "id": "a2ui",
+  "module": "legends-a2ui",
+  "version": "0.1.0",
+  "entrypoint": "index.md",
+  "files": [
+    {
+      "path": "index.md",
+      "sha256": "d3e03905974184b33b3144784f37450dd409c2b3336973ffa975699a894ca917"
+    }
+  ],
+  "ontology": {
+    "suggested_home": "wiki/library/legends-a2ui/a2ui",
+    "purpose": "Offline A2UI v1.0, v0.9.1, v0.9, and v0.8 validation, normalization, composition, projection, static preview, and host renderer integration runbooks.",
+    "kind": "library"
+  }
+}
