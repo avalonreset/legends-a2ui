@@ -32,7 +32,14 @@ REQUIRED = [
     "pyproject.toml",
     "setup.py",
     "wiki/index.md",
+    "wiki/wire-format-and-drift.md",
+    "wiki/basic-catalog-reference.md",
+    "wiki/react-and-lit-integration.md",
+    "wiki/security-and-validation.md",
+    "wiki/streaming-and-actions.md",
+    "wiki/ecosystem-projection-and-preview.md",
     "references/sources.md",
+    "templates/surface-receipt.md",
     "docs/AGENT-RECIPE.md",
     "docs/EMPIRE.md",
     "docs/RELEASE-READINESS.md",
@@ -41,6 +48,19 @@ REQUIRED = [
     "skills/cto-legends/SKILL.md",
     "knowledge/a2ui/pack.json",
     "vendor/a2ui-spec/manifest.json",
+    "assets/manifest.json",
+    "assets/banner.png",
+    "assets/banner.webp",
+    "assets/preview.png",
+    "assets/social-preview.png",
+    "assets/cards/r1/slot-1-agent-handoff.svg",
+    "assets/cards/r1/slot-2-three-pillars.svg",
+    "assets/cards/r1/slot-3-plain-english-chains.svg",
+    "assets/cards/r1/slot-4-a2ui-architecture.svg",
+    "assets/cards/r1/slot-5-unverified-vs-a2ui.svg",
+    "assets/cards/r1/slot-7-message-avalon-reset.svg",
+    "assets/cards/r1/slot-collection-star-shrine.svg",
+    "scripts/render_cards.py",
     "scripts/smoke_installed_resources.py",
     "scripts/verify_knowledge_attachment.py",
     ".github/workflows/checks.yml",
@@ -161,21 +181,43 @@ def check(root: Path = ROOT) -> list[str]:
     manifest = root / "assets" / "manifest.json"
     if manifest.is_file():
         try:
-            entries = json.loads(manifest.read_text(encoding="utf-8-sig"))["files"]
+            mdata = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            entries = mdata["files"]
+            if mdata.get("font_redistributed") is not False:
+                errors.append("assets/manifest.json must set font_redistributed: false.")
         except (ValueError, KeyError):
             errors.append("assets/manifest.json is not a manifest with files.")
             entries = []
+        manifest_names: set[str] = set()
         for entry in entries:
-            target = root / "assets" / entry.get("name", "")
+            ename = entry.get("name", "")
+            manifest_names.add(ename)
+            target = root / "assets" / ename
             try:
                 raw = target.read_bytes()
             except OSError:
-                errors.append(f"Manifest asset missing: {entry.get('name')}")
+                errors.append(f"Manifest asset missing: {ename}")
                 continue
             if len(raw) != entry.get("bytes"):
-                errors.append(f"Manifest byte mismatch: {entry.get('name')}")
+                errors.append(f"Manifest byte mismatch: {ename}")
             if hashlib.sha256(raw).hexdigest() != entry.get("sha256"):
-                errors.append(f"Manifest hash mismatch: {entry.get('name')}")
+                errors.append(f"Manifest hash mismatch: {ename}")
+        expected_assets = {
+            "banner.png",
+            "banner.webp",
+            "preview.png",
+            "social-preview.png",
+            "cards/r1/slot-1-agent-handoff.svg",
+            "cards/r1/slot-2-three-pillars.svg",
+            "cards/r1/slot-3-plain-english-chains.svg",
+            "cards/r1/slot-4-a2ui-architecture.svg",
+            "cards/r1/slot-5-unverified-vs-a2ui.svg",
+            "cards/r1/slot-7-message-avalon-reset.svg",
+            "cards/r1/slot-collection-star-shrine.svg",
+        }
+        missing_in_manifest = sorted(expected_assets - manifest_names)
+        if missing_in_manifest:
+            errors.append(f"assets/manifest.json missing expected assets: {missing_in_manifest}")
 
     prov_path = root / "docs" / "router-provenance.json"
     skill_path = root / "skills" / "cto-legends" / "SKILL.md"

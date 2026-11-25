@@ -6,13 +6,45 @@
   "entrypoint": "index.md",
   "files": [
     {
+      "path": "basic-catalog-reference.md",
+      "sha256": "9d22c38572a2ebc385a5f8dced04fa9e5e498b30e4504d1c83328d936671fe32"
+    },
+    {
+      "path": "ecosystem-projection-and-preview.md",
+      "sha256": "007be35fb549f85044bd314cc3263a2c52d52d92e05ea534ddecc9fcc6d8cd25"
+    },
+    {
       "path": "index.md",
-      "sha256": "d3e03905974184b33b3144784f37450dd409c2b3336973ffa975699a894ca917"
+      "sha256": "0b6fffb4304d854b1b4ca31f74fdf0644443fdb7e1269d8258405364f31de4ee"
+    },
+    {
+      "path": "react-and-lit-integration.md",
+      "sha256": "2e1320a6cf306bfdd88fcf0231a830e6fd02af2413f3ec660fe946e30bda1601"
+    },
+    {
+      "path": "security-and-validation.md",
+      "sha256": "8e9dc55f915488b1018785bb2e093a6ea9385f89ae8e66fe40187c38d1a92773"
+    },
+    {
+      "path": "sources.md",
+      "sha256": "6f843b1f557f31b238be4d47b278751799f3cb7121da85c001fd89792f99f15b"
+    },
+    {
+      "path": "streaming-and-actions.md",
+      "sha256": "59e3e91ea0f84c1d222fbe16b21505ce2576d41e907f721b8604b628a370b875"
+    },
+    {
+      "path": "templates/surface-receipt.md",
+      "sha256": "315b8b3182e7784bce09d52b29a6fe6e9643fa34223b3ebb097522b83b3f70ac"
+    },
+    {
+      "path": "wire-format-and-drift.md",
+      "sha256": "10f7ce2ea72ec14702047d3ec2c58adb1fbe6cada58e3644cbedca019bf2e589"
     }
   ],
   "ontology": {
     "suggested_home": "wiki/library/legends-a2ui/a2ui",
-    "purpose": "Offline A2UI v1.0, v0.9.1, v0.9, and v0.8 validation, normalization, composition, projection, static preview, and host renderer integration runbooks.",
+    "purpose": "Offline A2UI v1.0, v0.9.1, v0.9, and v0.8 validation, normalization, composition, zero-coupling projection, zero-daemon static preview, and host renderer integration runbooks.",
     "kind": "library"
   }
 }

@@ -1,0 +1,66 @@
+{
+  "product": "legends-a2ui",
+  "banner_template": "legends-type-v1",
+  "social_template": "legends-social-v1",
+  "subtitle": "a2ui v1 validation, normalization, offline previews, and host renderer kits for coding agents",
+  "font": "Legends Regular",
+  "font_sha256": "3769f0f76477a7d9e2e6cb40422dedacb56c9ab1a6f7beee89b2b9ba6b8091ee",
+  "font_redistributed": false,
+  "files": [
+    {
+      "name": "banner.png",
+      "bytes": 72464,
+      "sha256": "eb6fd9ac710db440fda76554c3bb20250155c34237c098931e6b7162cb6c5601"
+    },
+    {
+      "name": "banner.webp",
+      "bytes": 28862,
+      "sha256": "f46cec29f75d96a9f11ac1694123887f9176d80193c90c53a46e34d12a4a64dc"
+    },
+    {
+      "name": "preview.png",
+      "bytes": 26100,
+      "sha256": "9cdcb144c661633de4fcafa5b1449efb8740c8da7fef84f48009a3d0d3dcd71c"
+    },
+    {
+      "name": "social-preview.png",
+      "bytes": 23658,
+      "sha256": "c090cfe09dfdfe3bd4e33772df554674c735edc402fbff024a33217e5f47262a"
+    },
+    {
+      "name": "cards/r1/slot-1-agent-handoff.svg",
+      "bytes": 12250,
+      "sha256": "c787a91121951c6f93f5f746295da26a926bad7132c6cdf6947252b58e425dd3"
+    },
+    {
+      "name": "cards/r1/slot-2-three-pillars.svg",
+      "bytes": 50838,
+      "sha256": "0cba7a9f1ad43f0d5c2b1ff8c76711d586f7324a61d2921a4ab583356321f476"
+    },
+    {
+      "name": "cards/r1/slot-3-plain-english-chains.svg",
+      "bytes": 33849,
+      "sha256": "d5a763c83a006bff3b483c5f1e2380cd578f914f631e56b18bfba5489379b5e5"
+    },
+    {
+      "name": "cards/r1/slot-4-a2ui-architecture.svg",
+      "bytes": 50714,
+      "sha256": "e2e823bbceac9465a4d5fb7964b87329a434e12b38a5725543e8e15f531f5eeb"
+    },
+    {
+      "name": "cards/r1/slot-5-unverified-vs-a2ui.svg",
+      "bytes": 40438,
+      "sha256": "347b68e350d4658075fa90f106aabfb85e725d22545f4a7661fdcbeaa5c2c78f"
+    },
+    {
+      "name": "cards/r1/slot-7-message-avalon-reset.svg",
+      "bytes": 18916,
+      "sha256": "3ff481e4ab3d423869858a34a4f160cca38a34a9a5cbda6877c05a319c433a9c"
+    },
+    {
+      "name": "cards/r1/slot-collection-star-shrine.svg",
+      "bytes": 24769,
+      "sha256": "9c84ab99923b7339ac7f34058c1aaf00857d17410dc9132c5a3f87fb4ae5aecc"
+    }
+  ]
+}

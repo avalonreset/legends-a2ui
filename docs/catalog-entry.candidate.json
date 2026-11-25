@@ -1,6 +1,6 @@
 {
-  "purpose": "Offline-first A2UI v1.0, v0.9.1, v0.9, and v0.8 toolkit: strict schema and graph validation, deterministic v0.8/v0.9-to-v1.0 normalization, curated interactive surface composition, zero-coupling JSON-to-A2UI projection, zero-daemon static HTML previewing, Precision Noir React/WebCore/Lit renderer scaffolding, pinned google/A2UI spec lookup, and an attachable Empire knowledge pack.",
-  "scope": "Python 3.11+ standard-library CLI (zero mandatory pip dependencies) for validating JSON/JSONL/Markdown A2UI payloads against vendored a2ui-project/a2ui (google/A2UI) schemas, upgrading legacy v0.8/v0.9 surfaces to canonical v1.0 (@path, @call, @accessibility, @checks, UAX #31 IDs), composing 8 validated operator surface templates, projecting arbitrary structured JSON into strict A2UI v1.0 surfaces, generating offline self-contained file:// HTML previews with live dataModel bindings and action inspection, preview-first scaffolding of React/WebCore/Lit Precision Noir integration kits, checking project @a2ui/* drift, offline catalog/docs lookup, and attaching the a2ui Empire knowledge pack.",
+  "purpose": "Offline-first A2UI v1.0, v0.9.1, v0.9, and v0.8 toolkit: strict schema and graph validation, deterministic v0.8/v0.9-to-v1.0 normalization, curated interactive surface composition, zero-coupling JSON-to-A2UI projection (project), zero-daemon static HTML previewing, Precision Noir React/WebCore/Lit renderer scaffolding, pinned a2ui-project/a2ui spec lookup, and an attachable Empire knowledge pack.",
+  "scope": "Python 3.11+ standard-library CLI (zero mandatory pip dependencies) for validating JSON/JSONL/Markdown A2UI payloads against vendored a2ui-project/a2ui (google/A2UI) schemas, upgrading legacy v0.8/v0.9 surfaces to canonical v1.0 (@path, @call, @accessibility, @checks, UAX #31 IDs while keeping ChildList.path and updateDataModel.path unprefixed), composing 8 validated operator surface templates, projecting arbitrary structured JSON into strict A2UI v1.0 surfaces via project (auto, plan-approval, health-deck, data-briefing), generating offline self-contained file:// HTML previews with live dataModel bindings and action inspection, preview-first scaffolding of React/WebCore/Lit Precision Noir integration kits, checking project @a2ui/* drift, offline catalog/docs lookup, and attaching the a2ui Empire knowledge pack.",
   "recipe": {
     "probe": [
       {
@@ -24,7 +24,8 @@
           "references/sources.md",
           "docs/AGENT-RECIPE.md",
           "knowledge/a2ui/pack.json",
-          "vendor/a2ui-spec/manifest.json"
+          "vendor/a2ui-spec/manifest.json",
+          "assets/manifest.json"
         ]
       }
     ],
@@ -54,6 +55,7 @@
     "web-core",
     "precision-noir",
     "interactive-cards",
+    "json-projection",
     "streaming-jsonl",
     "validation",
     "html-preview"
@@ -72,6 +74,8 @@
       "normalize a2ui",
       "upgrade a2ui v0.8",
       "upgrade a2ui v0.9",
+      "project json to a2ui",
+      "a2ui project",
       "a2ui basic catalog",
       "a2ui surface",
       "a2ui card",
@@ -87,8 +91,8 @@
       "Validate all ```a2ui blocks in this Markdown file against A2UI v1.0 strict rules",
       "Upgrade this legacy A2UI v0.8 or v0.9 payload to canonical v1.0 with @path and UAX #31 IDs",
       "Compose an A2UI v1.0 ship-call approval card or multi-field intake form",
-      "Project a CLI preview JSON or doctor health JSON into an interactive A2UI v1.0 surface",
-      "Render this A2UI JSON into an offline interactive HTML preview file",
+      "Project a CLI planSha256 preview JSON or doctor health JSON into an interactive A2UI v1.0 surface with legends-a2ui project",
+      "Render this A2UI JSON into an offline interactive file:// HTML preview",
       "Scaffold a Precision Noir @a2ui/react and @a2ui/web_core renderer kit into my web app",
       "Check my project's @a2ui/* packages for version drift against upstream a2ui-project/a2ui",
       "Attach the A2UI v1.0 knowledge pack to my Empire vault"
