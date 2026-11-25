@@ -142,6 +142,9 @@ class TestComposeProjectPreviewScaffold(unittest.TestCase):
         self.assertIn("function toFiniteNumber(", doc)
         self.assertIn("Array.isArray(rawVal) ? rawVal.length", doc)
         self.assertIn("function setByPointer(root, pointer, value, itemCtx)", doc)
+        self.assertIn("RFC6901_ARRAY_INDEX_RE", doc)
+        self.assertIn('lastKey === "-"', doc)
+        self.assertIn("else if (idx === cur.length)", doc)
         self.assertIn("pass < 8", doc)
         # All 18 Basic Catalog component handlers exist in runtime JS
         for comp_name in (
@@ -241,6 +244,33 @@ class TestComposeProjectPreviewScaffold(unittest.TestCase):
         self.assertFalse(too_big["ok"])
         too_deep = project_json_to_surface("[" * 40 + "]" * 40, max_depth=16)
         self.assertFalse(too_deep["ok"])
+
+    def test_preview_html_guards_sparse_arrays_and_supports_rfc6901_append(self) -> None:
+        payload = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "arr_s",
+                    "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_t", "path": "/items"}},
+                        {"id": "row_t", "component": "Text", "text": {"@path": "name"}},
+                    ],
+                    "dataModel": {"items": [{"name": "first"}]},
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "arr_s", "path": "/items/5", "value": {"name": "gap"}}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "arr_s", "path": "/items/10000000", "value": {"name": "huge"}}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "arr_s", "path": "/items/00", "value": {"name": "lz"}}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "arr_s", "path": "/items/1", "value": {"name": "second"}}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "arr_s", "path": "/items/-", "value": {"name": "third"}}},
+        ]
+        res = render_preview_html(json.dumps(payload), theme="precision-noir")
+        self.assertTrue(res["ok"], res.get("validation"))
+        doc = res["html"]
+        self.assertIn("/^(?:0|[1-9]\\d{0,6})$/", doc)
+        self.assertIn('if (lastKey === "-")', doc)
+        self.assertIn("else if (idx === cur.length)", doc)
 
 
 if __name__ == "__main__":

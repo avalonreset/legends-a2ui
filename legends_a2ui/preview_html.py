@@ -560,6 +560,8 @@ _PREVIEW_JS = r"""
     return out.join("");
   }
 
+  const RFC6901_ARRAY_INDEX_RE = /^(?:0|[1-9]\d{0,6})$/;
+
   function getByPointer(root, pointer, itemCtx) {
     if (typeof pointer !== "string" || !pointer) return undefined;
     if (!pointer.startsWith("/")) {
@@ -568,8 +570,16 @@ _PREVIEW_JS = r"""
       let cur = itemCtx;
       for (const part of relParts) {
         if (FORBIDDEN_KEYS.has(part)) return undefined;
-        if (cur && typeof cur === "object" && hasOwn(cur, part)) cur = cur[part];
-        else return undefined;
+        if (Array.isArray(cur)) {
+          if (!RFC6901_ARRAY_INDEX_RE.test(part)) return undefined;
+          const idx = Number(part);
+          if (idx >= cur.length) return undefined;
+          cur = cur[idx];
+        } else if (cur && typeof cur === "object" && hasOwn(cur, part)) {
+          cur = cur[part];
+        } else {
+          return undefined;
+        }
       }
       return cur;
     }
@@ -578,8 +588,16 @@ _PREVIEW_JS = r"""
     let cur = root;
     for (const part of parts) {
       if (FORBIDDEN_KEYS.has(part)) return undefined;
-      if (cur && typeof cur === "object" && hasOwn(cur, part)) cur = cur[part];
-      else return undefined;
+      if (Array.isArray(cur)) {
+        if (!RFC6901_ARRAY_INDEX_RE.test(part)) return undefined;
+        const idx = Number(part);
+        if (idx >= cur.length) return undefined;
+        cur = cur[idx];
+      } else if (cur && typeof cur === "object" && hasOwn(cur, part)) {
+        cur = cur[part];
+      } else {
+        return undefined;
+      }
     }
     return cur;
   }
@@ -601,7 +619,7 @@ _PREVIEW_JS = r"""
     for (let i = 0; i < parts.length - 1; i += 1) {
       const key = parts[i];
       if (Array.isArray(cur)) {
-        if (!/^\d+$/.test(key)) return;
+        if (!RFC6901_ARRAY_INDEX_RE.test(key)) return;
         const idx = Number(key);
         if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return;
         if (!cur[idx] || typeof cur[idx] !== "object") {
@@ -619,13 +637,19 @@ _PREVIEW_JS = r"""
     }
     const lastKey = parts[parts.length - 1];
     if (Array.isArray(cur)) {
-      if (!/^\d+$/.test(lastKey)) return;
+      if (lastKey === "-") {
+        if (value !== null) cur.push(sanitizePlainValue(value));
+        return;
+      }
+      if (!RFC6901_ARRAY_INDEX_RE.test(lastKey)) return;
       const idx = Number(lastKey);
       if (!Number.isInteger(idx) || idx < 0) return;
       if (value === null) {
         if (idx < cur.length) cur.splice(idx, 1);
-      } else {
+      } else if (idx < cur.length) {
         cur[idx] = sanitizePlainValue(value);
+      } else if (idx === cur.length) {
+        cur.push(sanitizePlainValue(value));
       }
     } else if (cur && typeof cur === "object") {
       if (value === null) {

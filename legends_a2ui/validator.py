@@ -120,11 +120,22 @@ def _is_custom_catalog_id(cat_id: Any, canonical_catalog_id: str) -> bool:
     return True
 
 
+_RFC6901_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]{0,6})$")
+_SIMPLE_FORMAT_PTR_RE = re.compile(r"^[^${}()\s]+$")
+
+
+def _parse_rfc6901_array_index(seg: str) -> int | None:
+    """Parse a bounded RFC 6901 ASCII array index ('0' or [1-9][0-9]{0,6})."""
+    if not isinstance(seg, str) or not _RFC6901_INDEX_RE.fullmatch(seg):
+        return None
+    return int(seg)
+
+
 def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> None:
     """Apply an RFC 6901 JSON Pointer mutation across nested dicts and lists (None deletes)."""
     if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
         return
-    parts = [p.replace("~1", "/").replace("~0", "~") for p in pointer.lstrip("/").split("/")]
+    parts = [p.replace("~1", "/").replace("~0", "~") for p in pointer[1:].split("/")]
     if not parts:
         return
     cur: Any = root
@@ -138,10 +149,8 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> None
                 cur[seg] = nxt
             cur = nxt
         elif isinstance(cur, list):
-            if not seg.isdigit():
-                return
-            idx = int(seg)
-            if idx < 0 or idx >= len(cur):
+            idx = _parse_rfc6901_array_index(seg)
+            if idx is None or idx >= len(cur):
                 return
             nxt = cur[idx]
             if not isinstance(nxt, (dict, list)):
@@ -159,13 +168,13 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> None
         else:
             cur[last] = copy.deepcopy(value)
     elif isinstance(cur, list):
-        if last.isdigit():
-            idx = int(last)
+        idx = _parse_rfc6901_array_index(last)
+        if idx is not None:
             if value is None:
-                if 0 <= idx < len(cur):
+                if idx < len(cur):
                     cur.pop(idx)
             else:
-                if 0 <= idx < len(cur):
+                if idx < len(cur):
                     cur[idx] = copy.deepcopy(value)
                 elif idx == len(cur):
                     cur.append(copy.deepcopy(value))
@@ -199,16 +208,15 @@ def _resolve_json_pointer(data: Any, pointer: str) -> tuple[bool, Any]:
     if not pointer.startswith("/"):
         return False, None
     cur = data
-    for raw_seg in pointer.lstrip("/").split("/"):
+    for raw_seg in pointer[1:].split("/"):
         seg = raw_seg.replace("~1", "/").replace("~0", "~")
         if isinstance(cur, dict) and seg in cur:
             cur = cur[seg]
         elif isinstance(cur, list):
-            try:
-                idx = int(seg)
-                cur = cur[idx]
-            except (ValueError, IndexError):
+            idx = _parse_rfc6901_array_index(seg)
+            if idx is None or idx >= len(cur):
                 return False, None
+            cur = cur[idx]
         else:
             return False, None
     return True, cur
@@ -230,11 +238,10 @@ def _resolve_pointer_with_context(
         if isinstance(cur, dict) and seg in cur:
             cur = cur[seg]
         elif isinstance(cur, list):
-            try:
-                idx = int(seg)
-                cur = cur[idx]
-            except (ValueError, IndexError):
+            idx = _parse_rfc6901_array_index(seg)
+            if idx is None or idx >= len(cur):
                 return False, None
+            cur = cur[idx]
         else:
             return False, None
     return True, cur
@@ -254,6 +261,7 @@ def _validate_url_function_call(
     warnings: list[dict[str, Any]],
     data_model: dict[str, Any],
     item_ctx: Any = None,
+    is_historical_snapshot: bool = False,
 ) -> None:
     fn_name = fn_obj.get("@call") if "@call" in fn_obj else fn_obj.get("call")
     args = fn_obj.get("args") if isinstance(fn_obj.get("args"), dict) else {}
@@ -286,14 +294,54 @@ def _validate_url_function_call(
                 _add_issue(errors, code, block_index, path, reason or f"Unsafe {kind} URL in formatString.")
             return
 
+        if r"\${" in tpl:
+            _add_issue(
+                errors,
+                code,
+                block_index,
+                path,
+                f"formatString {kind} URL template must not contain escaped '\\${{' sequences.",
+            )
+            return
+
+        # Require every ${...} placeholder to be a closed simple JSON Pointer (no nesting, calls, or whitespace)
+        pos = 0
+        while True:
+            start = tpl.find("${", pos)
+            if start == -1:
+                break
+            end = tpl.find("}", start + 2)
+            if end == -1:
+                _add_issue(
+                    errors,
+                    code,
+                    block_index,
+                    path,
+                    f"formatString {kind} URL template contains an unclosed '${{' expression.",
+                )
+                return
+            inner = tpl[start + 2 : end]
+            if not _SIMPLE_FORMAT_PTR_RE.fullmatch(inner):
+                _add_issue(
+                    errors,
+                    code,
+                    block_index,
+                    path,
+                    f"formatString {kind} URL placeholder '${{{inner}}}' must be a simple JSON Pointer path.",
+                )
+                return
+            pos = end + 1
+
         # Interpolate resolvable placeholders and validate both static prefix and substituted URL.
         all_resolved = True
+        any_resolved = False
 
         def _subst_resolved(match: re.Match[str]) -> str:
-            nonlocal all_resolved
-            expr = match.group(1).strip()
+            nonlocal all_resolved, any_resolved
+            expr = match.group(1)
             found, val = _resolve_pointer_with_context(data_model, expr, item_ctx)
             if found and val is not None:
+                any_resolved = True
                 return str(val)
             all_resolved = False
             return "placeholder"
@@ -305,6 +353,11 @@ def _validate_url_function_call(
                 ok, reason = validator_fn(resolved_str)
                 if not ok:
                     _add_issue(errors, code, block_index, path, reason or f"Unsafe resolved {kind} URL.")
+            elif is_historical_snapshot:
+                if any_resolved:
+                    ok, reason = validator_fn(resolved_str)
+                    if not ok:
+                        _add_issue(errors, code, block_index, path, reason or f"Unsafe resolved {kind} URL.")
             else:
                 _add_issue(
                     errors,
@@ -458,6 +511,14 @@ def _validate_dynamic_value(
             )
             return
         raw_fn_cat = call_val.get("catalogId")
+        if raw_fn_cat == BROKEN_V09_CATALOG_ID:
+            _add_issue(
+                warnings,
+                "BROKEN_CATALOG_URI",
+                block_index,
+                f"{path}.catalogId",
+                f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+            )
         effective_fn_cat = (
             raw_fn_cat
             if isinstance(raw_fn_cat, str) and raw_fn_cat.strip()
@@ -633,6 +694,7 @@ def _validate_open_url_arg(
     strict: bool = True,
     warnings: list[dict[str, Any]] | None = None,
     item_ctx: Any = None,
+    is_historical_snapshot: bool = False,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = raw_url_val
@@ -648,6 +710,7 @@ def _validate_open_url_arg(
                 warnings=warn_bucket,
                 data_model=data_model,
                 item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot,
             )
             return
         ptr = raw_url_val.get("@path") if "@path" in raw_url_val else raw_url_val.get("path")
@@ -675,6 +738,7 @@ def _validate_media_prop(
     strict: bool = True,
     warnings: list[dict[str, Any]] | None = None,
     item_ctx: Any = None,
+    is_historical_snapshot: bool = False,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = val
@@ -692,6 +756,7 @@ def _validate_media_prop(
                 warnings=warn_bucket,
                 data_model=data_model,
                 item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot,
             )
             return
         else:
@@ -708,6 +773,38 @@ def _validate_media_prop(
     ok, reason = validate_media_url(candidate)
     if not ok:
         _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason or "Unsafe media URL.")
+
+
+def _iter_open_url_slots(obj: Any, base_path: str) -> list[tuple[str, Any]]:
+    """Collect (path, url_arg) pairs for every openUrl FunctionCall inside a component."""
+    found: list[tuple[str, Any]] = []
+    stack: list[tuple[Any, str]] = [(obj, base_path)]
+    while stack:
+        cur, cur_path = stack.pop()
+        if isinstance(cur, dict):
+            fn_name = cur.get("@call") if "@call" in cur else cur.get("call")
+            if fn_name == "openUrl" and isinstance(cur.get("args"), dict) and "url" in cur["args"]:
+                found.append((f"{cur_path}.args.url", cur["args"]["url"]))
+            for k, v in cur.items():
+                if isinstance(v, (dict, list)):
+                    stack.append((v, f"{cur_path}.{k}"))
+        elif isinstance(cur, list):
+            for idx, item in enumerate(cur):
+                if isinstance(item, (dict, list)):
+                    stack.append((item, f"{cur_path}[{idx}]"))
+    return found
+
+
+def _append_unique_issues(
+    target: list[dict[str, Any]],
+    new_issues: list[dict[str, Any]],
+    seen: set[tuple[str, int, str, str]],
+) -> None:
+    for issue in new_issues:
+        key = (issue["code"], issue["blockIndex"], issue["path"], issue["message"])
+        if key not in seen:
+            seen.add(key)
+            target.append(issue)
 
 
 def _validate_action(
@@ -928,6 +1025,7 @@ def _validate_surface_components(
     warnings: list[dict[str, Any]],
     data_model: dict[str, Any],
     surface_catalog_id: str | None = None,
+    data_model_history: list[tuple[int, dict[str, Any]]] | None = None,
 ) -> int:
     catalog = load_catalog_spec(version)
     catalog_components = catalog["components"]
@@ -1042,6 +1140,22 @@ def _validate_surface_components(
 
             # Basic Catalog schema validation when using default catalog (inherits createSurface.catalogId)
             raw_comp_cat = comp.get("@catalogId")
+            if raw_comp_cat == BROKEN_V09_CATALOG_ID:
+                _add_issue(
+                    warnings,
+                    "BROKEN_CATALOG_URI",
+                    block_index,
+                    f"{cpath}.@catalogId",
+                    f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+                )
+            elif comp.get("catalogId") == BROKEN_V09_CATALOG_ID:
+                _add_issue(
+                    warnings,
+                    "BROKEN_CATALOG_URI",
+                    block_index,
+                    f"{cpath}.catalogId",
+                    f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+                )
             effective_comp_catalog = (
                 raw_comp_cat
                 if isinstance(raw_comp_cat, str) and raw_comp_cat.strip()
@@ -1190,7 +1304,7 @@ def _validate_surface_components(
                                     f"{cpath}.name",
                                     f"Icon.name with 'svgPath' must not contain extra properties: {sorted(extra_icon)}.",
                                 )
-                        elif not any(k in iname for k in ("@path", "path", "@call", "call")):
+                        elif not (set(iname.keys()) == {"@path"} or set(iname.keys()) == {"path"}):
                             _add_issue(
                                 errors,
                                 "INVALID_ICON_NAME",
@@ -1522,81 +1636,186 @@ def _validate_surface_components(
             f"Cyclic component reference detected: {' -> '.join(cycle)}.",
         )
 
-    # Validate ChildList dynamic template bindings against inline dataModel array items
-    template_bindings: list[tuple[str, str]] = []
-    for _cid, (_ctype, props, _cpath) in comp_map.items():
-        ch = props.get("children")
-        if isinstance(ch, dict):
-            if version == "0.8" and isinstance(ch.get("template"), dict):
-                tpl = ch["template"]
-                if isinstance(tpl.get("componentId"), str) and isinstance(tpl.get("dataBinding"), str):
-                    template_bindings.append((tpl["componentId"], tpl["dataBinding"]))
-            elif isinstance(ch.get("componentId"), str) and isinstance(ch.get("path"), str):
-                template_bindings.append((ch["componentId"], ch["path"]))
+    # Validate media URLs, openUrl calls, and ChildList templates across every historical
+    # dataModel snapshot where each component was active (so later overwrites cannot mask unsafe URLs).
+    snapshots: list[tuple[int, dict[str, Any]]] = []
+    if data_model_history:
+        for snap_bc, snap_dm in data_model_history:
+            if snap_bc > 0:
+                snapshots.append((snap_bc, snap_dm))
+    if not snapshots:
+        snapshots.append((len(component_batches), data_model))
+    elif snapshots[-1][0] != len(component_batches) or snapshots[-1][1] != data_model:
+        snapshots.append((len(component_batches), data_model))
 
-    for tpl_root_id, list_ptr in template_bindings:
-        found_list, items_val = _resolve_json_pointer(data_model, list_ptr)
-        if not found_list or not isinstance(items_val, list):
-            continue
-        if tpl_root_id not in comp_map:
-            continue
-        tpl_nodes: list[str] = []
-        seen_tpl: set[str] = set()
-        t_queue = [tpl_root_id]
-        while t_queue:
-            cur_id = t_queue.pop()
-            if cur_id in seen_tpl or cur_id not in comp_map:
-                continue
-            seen_tpl.add(cur_id)
-            tpl_nodes.append(cur_id)
-            t_queue.extend(adj.get(cur_id, []))
-        for item_idx, item in enumerate(items_val):
-            for tcid in tpl_nodes:
-                t_type, t_props, t_cpath = comp_map[tcid]
-                raw_t_cat = t_props.get("@catalogId")
-                t_effective_cat = (
-                    raw_t_cat
-                    if isinstance(raw_t_cat, str) and raw_t_cat.strip()
+    seen_errors: set[tuple[str, int, str, str]] = {
+        (e["code"], e["blockIndex"], e["path"], e["message"]) for e in errors
+    }
+    seen_warnings: set[tuple[str, int, str, str]] = {
+        (w["code"], w["blockIndex"], w["path"], w["message"]) for w in warnings
+    }
+
+    batch_state_cache: dict[int, tuple[dict[str, tuple[str, dict[str, Any], str]], dict[str, list[str]]]] = {}
+
+    def _active_state_at_batch(
+        bc: int,
+    ) -> tuple[dict[str, tuple[str, dict[str, Any], str]], dict[str, list[str]]]:
+        if bc == len(component_batches):
+            return comp_map, adj
+        cached = batch_state_cache.get(bc)
+        if cached is not None:
+            return cached
+        s_comp_map: dict[str, tuple[str, dict[str, Any], str]] = {}
+        for b_i in range(min(bc, len(component_batches))):
+            b_seen: set[str] = set()
+            for idx_i, c_obj in enumerate(component_batches[b_i]):
+                if not isinstance(c_obj, dict):
+                    continue
+                c_id = c_obj.get("id")
+                if not isinstance(c_id, str) or not c_id or c_id in b_seen:
+                    continue
+                b_seen.add(c_id)
+                c_path = (
+                    f"surface:{surface_id}.batch[{b_i}].components[{idx_i}]"
+                    if multi_batch
+                    else f"surface:{surface_id}.components[{idx_i}]"
+                )
+                if version == "0.8":
+                    c_type, c_props = _extract_v08_component(c_obj)
+                    if not c_type:
+                        continue
+                else:
+                    c_type = c_obj.get("component")
+                    c_props = c_obj
+                    if not isinstance(c_type, str) or not c_type:
+                        continue
+                if c_type == "Surface":
+                    continue
+                s_comp_map[c_id] = (c_type, c_props, c_path)
+        s_adj: dict[str, list[str]] = {cid_k: [] for cid_k in s_comp_map}
+        for cid_k, (c_type, c_props, _c_path) in s_comp_map.items():
+            for _rp, ref_id in _extract_child_refs(c_type, c_props, version):
+                if ref_id in s_comp_map:
+                    s_adj[cid_k].append(ref_id)
+        batch_state_cache[bc] = (s_comp_map, s_adj)
+        return s_comp_map, s_adj
+
+    for snap_idx, (snap_bc, snap_dm) in enumerate(snapshots):
+        is_final_snap = snap_idx == len(snapshots) - 1 and snap_bc == len(component_batches) and snap_dm == data_model
+        s_comp_map, s_adj = _active_state_at_batch(snap_bc)
+        tmp_errors: list[dict[str, Any]] = []
+        tmp_warnings: list[dict[str, Any]] = []
+
+        # Re-check active component media URL & openUrl bindings against historical snapshots
+        if not is_final_snap:
+            for _cid, (c_type, c_props, c_path) in s_comp_map.items():
+                raw_c_cat = c_props.get("@catalogId")
+                c_effective_cat = (
+                    raw_c_cat
+                    if isinstance(raw_c_cat, str) and raw_c_cat.strip()
                     else surface_catalog_id
                 )
-                t_is_custom = _is_custom_catalog_id(t_effective_cat, canonical_catalog_id)
-                media_props = _MEDIA_URL_PROPS.get(t_type, ("url", "posterUrl") if t_is_custom else ())
+                c_is_custom = _is_custom_catalog_id(c_effective_cat, canonical_catalog_id)
+                media_props = _MEDIA_URL_PROPS.get(c_type, ("url", "posterUrl") if c_is_custom else ())
                 for media_prop in media_props:
-                    if media_prop in t_props and isinstance(t_props[media_prop], dict):
-                        val_obj = t_props[media_prop]
-                        ptr = val_obj.get("@path") if "@path" in val_obj else val_obj.get("path")
-                        has_call = "@call" in val_obj or "call" in val_obj
-                        if (isinstance(ptr, str) and not ptr.startswith("/")) or has_call:
-                            _validate_media_prop(
-                                val_obj,
-                                block_index,
-                                f"{t_cpath}[item:{item_idx}].{media_prop}",
-                                errors,
-                                data_model,
-                                strict=strict,
-                                warnings=warnings,
-                                item_ctx=item,
-                            )
-                if "action" in t_props and isinstance(t_props["action"], dict):
-                    fn_call = t_props["action"].get("functionCall")
-                    if isinstance(fn_call, dict):
-                        fn_name = fn_call.get("@call") or fn_call.get("call")
-                        fn_args = fn_call.get("args")
-                        if fn_name == "openUrl" and isinstance(fn_args, dict) and isinstance(fn_args.get("url"), dict):
-                            url_obj = fn_args["url"]
-                            ptr = url_obj.get("@path") if "@path" in url_obj else url_obj.get("path")
-                            has_call = "@call" in url_obj or "call" in url_obj
+                    if media_prop in c_props:
+                        _validate_media_prop(
+                            c_props[media_prop],
+                            block_index,
+                            f"{c_path}.{media_prop}",
+                            tmp_errors,
+                            snap_dm,
+                            strict=strict,
+                            warnings=tmp_warnings,
+                            is_historical_snapshot=True,
+                        )
+                for url_path, url_val in _iter_open_url_slots(c_props, c_path):
+                    _validate_open_url_arg(
+                        url_val,
+                        block_index,
+                        url_path,
+                        tmp_errors,
+                        snap_dm,
+                        strict=strict,
+                        warnings=tmp_warnings,
+                        is_historical_snapshot=True,
+                    )
+
+        # Validate ChildList dynamic template bindings against this snapshot's dataModel array items
+        template_bindings: list[tuple[str, str]] = []
+        for _cid, (_ctype, props, _cpath) in s_comp_map.items():
+            ch = props.get("children")
+            if isinstance(ch, dict):
+                if version == "0.8" and isinstance(ch.get("template"), dict):
+                    tpl = ch["template"]
+                    if isinstance(tpl.get("componentId"), str) and isinstance(tpl.get("dataBinding"), str):
+                        template_bindings.append((tpl["componentId"], tpl["dataBinding"]))
+                elif isinstance(ch.get("componentId"), str) and isinstance(ch.get("path"), str):
+                    template_bindings.append((ch["componentId"], ch["path"]))
+
+        for tpl_root_id, list_ptr in template_bindings:
+            found_list, items_val = _resolve_json_pointer(snap_dm, list_ptr)
+            if not found_list or not isinstance(items_val, list):
+                continue
+            if tpl_root_id not in s_comp_map:
+                continue
+            tpl_nodes: list[str] = []
+            seen_tpl: set[str] = set()
+            t_queue = [tpl_root_id]
+            while t_queue:
+                cur_id = t_queue.pop()
+                if cur_id in seen_tpl or cur_id not in s_comp_map:
+                    continue
+                seen_tpl.add(cur_id)
+                tpl_nodes.append(cur_id)
+                t_queue.extend(s_adj.get(cur_id, []))
+            for item_idx, item in enumerate(items_val):
+                for tcid in tpl_nodes:
+                    t_type, t_props, t_cpath = s_comp_map[tcid]
+                    raw_t_cat = t_props.get("@catalogId")
+                    t_effective_cat = (
+                        raw_t_cat
+                        if isinstance(raw_t_cat, str) and raw_t_cat.strip()
+                        else surface_catalog_id
+                    )
+                    t_is_custom = _is_custom_catalog_id(t_effective_cat, canonical_catalog_id)
+                    media_props = _MEDIA_URL_PROPS.get(t_type, ("url", "posterUrl") if t_is_custom else ())
+                    for media_prop in media_props:
+                        if media_prop in t_props and isinstance(t_props[media_prop], dict):
+                            val_obj = t_props[media_prop]
+                            ptr = val_obj.get("@path") if "@path" in val_obj else val_obj.get("path")
+                            has_call = "@call" in val_obj or "call" in val_obj
+                            if (isinstance(ptr, str) and not ptr.startswith("/")) or has_call:
+                                _validate_media_prop(
+                                    val_obj,
+                                    block_index,
+                                    f"{t_cpath}[item:{item_idx}].{media_prop}",
+                                    tmp_errors,
+                                    snap_dm,
+                                    strict=strict,
+                                    warnings=tmp_warnings,
+                                    item_ctx=item,
+                                    is_historical_snapshot=not is_final_snap,
+                                )
+                    for url_path, url_val in _iter_open_url_slots(t_props, f"{t_cpath}[item:{item_idx}]"):
+                        if isinstance(url_val, dict):
+                            ptr = url_val.get("@path") if "@path" in url_val else url_val.get("path")
+                            has_call = "@call" in url_val or "call" in url_val
                             if (isinstance(ptr, str) and not ptr.startswith("/")) or has_call:
                                 _validate_open_url_arg(
-                                    url_obj,
+                                    url_val,
                                     block_index,
-                                    f"{t_cpath}[item:{item_idx}].action.functionCall.args.url",
-                                    errors,
-                                    data_model,
+                                    url_path,
+                                    tmp_errors,
+                                    snap_dm,
                                     strict=strict,
-                                    warnings=warnings,
+                                    warnings=tmp_warnings,
                                     item_ctx=item,
+                                    is_historical_snapshot=not is_final_snap,
                                 )
+
+        _append_unique_issues(errors, tmp_errors, seen_errors)
+        _append_unique_issues(warnings, tmp_warnings, seen_warnings)
 
     # Reachability / orphan detection (ignore placeholders superseded by incremental updates)
     if root_id in comp_map:
@@ -1656,12 +1875,21 @@ def validate_payload(
         surface_catalog_ids: dict[str, str | None] = {}
         surface_component_batches: dict[str, list[list[dict[str, Any]]]] = {}
         surface_data_models: dict[str, dict[str, Any]] = {}
+        surface_data_model_history: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         surface_roots: dict[str, str] = {}
+
+        def _record_surface_snapshot(sid_snap: str) -> None:
+            bc = len(surface_component_batches.get(sid_snap, []))
+            dm_copy = copy.deepcopy(surface_data_models.get(sid_snap, {}))
+            hist = surface_data_model_history.setdefault(sid_snap, [])
+            if not hist or hist[-1][0] != bc or hist[-1][1] != dm_copy:
+                hist.append((bc, dm_copy))
 
         def _flush_surface(sid_to_flush: str) -> None:
             nonlocal total_components
             batches = surface_component_batches.pop(sid_to_flush, None)
             dm = surface_data_models.pop(sid_to_flush, {})
+            history = surface_data_model_history.pop(sid_to_flush, [])
             scat = surface_catalog_ids.pop(sid_to_flush, None)
             if batches is None:
                 return
@@ -1679,6 +1907,7 @@ def validate_payload(
                 warnings=warnings,
                 data_model=dm,
                 surface_catalog_id=scat,
+                data_model_history=history,
             )
 
         for midx, msg in enumerate(messages):
@@ -1751,6 +1980,7 @@ def validate_payload(
                     deleted_surfaces.discard(sid)
                     surface_component_batches.pop(sid, None)
                     surface_data_models.pop(sid, None)
+                    surface_data_model_history.pop(sid, None)
                     surface_catalog_ids.pop(sid, None)
                     surface_roots[sid] = "root"
                 active_surfaces.add(sid)
@@ -1820,6 +2050,7 @@ def validate_payload(
                                 f"{mpath}.createSurface.components",
                                 "createSurface.components must be a non-empty list when provided.",
                             )
+                _record_surface_snapshot(sid)
 
             elif env_key == "beginRendering":
                 sid = body.get("surfaceId")
@@ -1870,6 +2101,7 @@ def validate_payload(
                     _add_issue(errors, "EMPTY_COMPONENTS", bidx, f"{mpath}.{env_key}.components", "components must be a non-empty list.")
                 else:
                     surface_component_batches.setdefault(sid, []).append(comps)
+                    _record_surface_snapshot(sid)
 
             elif env_key == "updateDataModel":
                 sid = body.get("surfaceId")
@@ -1910,6 +2142,7 @@ def validate_payload(
                 elif isinstance(ptr, str) and ptr.startswith("/") and "value" in body:
                     dm = surface_data_models.setdefault(sid, {})
                     _mutate_json_pointer(dm, ptr, body["value"])
+                _record_surface_snapshot(sid)
 
             elif env_key in {"callRendererFunction", "callAgentFunction"}:
                 extra_fn_keys = set(body.keys()) - {"surfaceId", "functionCallId", "callFunction"}
@@ -1931,7 +2164,16 @@ def validate_payload(
                         f"{env_key} requires non-empty string 'functionCallId'.",
                     )
                 sid_opt = body.get("surfaceId")
-                if "surfaceId" in body and (not isinstance(sid_opt, str) or not sid_opt.strip()):
+                if env_key == "callAgentFunction":
+                    if not isinstance(sid_opt, str) or not sid_opt.strip():
+                        _add_issue(
+                            errors,
+                            "MISSING_SURFACE_ID",
+                            bidx,
+                            f"{mpath}.{env_key}.surfaceId",
+                            "callAgentFunction requires non-empty string 'surfaceId'.",
+                        )
+                elif "surfaceId" in body and (not isinstance(sid_opt, str) or not sid_opt.strip()):
                     _add_issue(
                         errors,
                         "INVALID_SURFACE_ID",
@@ -1958,13 +2200,22 @@ def validate_payload(
                             f"{env_key}.callFunction requires '@call'.",
                         )
                     fn_cat = call_fn.get("catalogId")
-                    if not isinstance(fn_cat, str) or not fn_cat.strip():
+                    if env_key == "callRendererFunction":
+                        if not isinstance(fn_cat, str) or not fn_cat.strip():
+                            _add_issue(
+                                errors,
+                                "MISSING_CATALOG_ID",
+                                bidx,
+                                f"{mpath}.{env_key}.callFunction.catalogId",
+                                "callRendererFunction.callFunction requires non-empty string 'catalogId'.",
+                            )
+                    elif "catalogId" in call_fn and (not isinstance(fn_cat, str) or not fn_cat.strip()):
                         _add_issue(
                             errors,
-                            "MISSING_CATALOG_ID",
+                            "INVALID_CATALOG_ID",
                             bidx,
                             f"{mpath}.{env_key}.callFunction.catalogId",
-                            f"{env_key}.callFunction requires non-empty string 'catalogId'.",
+                            "callAgentFunction.callFunction.catalogId must be a non-empty string when provided.",
                         )
                     cat_spec = load_catalog_spec(msg_ver)
                     fn_dm = surface_data_models.get(sid_opt, {}) if isinstance(sid_opt, str) else {}

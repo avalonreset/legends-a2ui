@@ -811,7 +811,6 @@ class TestValidateAndNormalize(unittest.TestCase):
                     "functionCallId": "call_1",
                     "callFunction": {
                         "@call": "openUrl",
-                        "catalogId": CANONICAL_V1_CATALOG_ID,
                         "args": {"url": "javascript:alert(1)"},
                     },
                 },
@@ -834,6 +833,7 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertIn("UNSAFE_OPEN_URL", codes_rpc)
         self.assertIn("MISSING_FUNCTION_CALL_ID", codes_rpc)
         self.assertIn("MISSING_CATALOG_ID", codes_rpc)
+        self.assertIn("MISSING_SURFACE_ID", codes_rpc)
         self.assertIn("UNSAFE_REGEX", codes_rpc)
 
         # Valid callRendererFunction passes strict validation
@@ -1067,6 +1067,298 @@ class TestValidateAndNormalize(unittest.TestCase):
             re_comps["code_1_2"]["@checks"][0]["condition"]["args"]["value"],
             {"@path": "/code_1_2"},
         )
+
+    def test_rfc6901_pointers_historical_url_snapshots_nested_format_and_schema_edges(self) -> None:
+        """RFC 6901 array indices, empty-key pointers, historical URL snapshots, nested formatString, callAgentFunction, broken catalog URI, and Icon.name."""
+        # 1. Non-RFC-6901 array indices (\u00b2, 4500-digit string, \u0660, "00") do not crash or desync
+        non_rfc_indices = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "idx_guard",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Image", "url": {"@path": "/items/0/url"}},
+                    ],
+                    "dataModel": {"items": [{"url": "javascript:alert(1)"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "idx_guard",
+                    "path": "/items/\u00b2/url",
+                    "value": "https://example.com/safe.png",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "idx_guard",
+                    "path": "/items/" + ("9" * 4500) + "/url",
+                    "value": "https://example.com/safe.png",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "idx_guard",
+                    "path": "/items/\u0660/url",
+                    "value": "https://example.com/safe.png",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "idx_guard",
+                    "path": "/items/00/url",
+                    "value": "https://example.com/safe.png",
+                },
+            },
+        ]
+        res_idx = validate_payload(json.dumps(non_rfc_indices), version="1.0", strict=True)
+        self.assertFalse(res_idx["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_idx["errors"]})
+
+        # 2. Empty-key RFC 6901 JSON Pointer ("//url") resolves dataModel[""]["url"] identically to runtimes
+        empty_key_ptr = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "empty_key_s",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["img", "btn"]},
+                    {"id": "img", "component": "Image", "url": {"@path": "//url"}},
+                    {
+                        "id": "btn",
+                        "component": "Button",
+                        "child": "btn_lbl",
+                        "action": {"functionCall": {"@call": "openUrl", "args": {"url": {"@path": "//url"}}}},
+                    },
+                    {"id": "btn_lbl", "component": "Text", "text": "Open"},
+                ],
+                "dataModel": {"": {"url": "javascript:alert(1)"}},
+            },
+        }
+        res_ek = validate_payload(json.dumps(empty_key_ptr), version="1.0", strict=True)
+        self.assertFalse(res_ek["ok"])
+        codes_ek = {e["code"] for e in res_ek["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", codes_ek)
+        self.assertIn("UNSAFE_OPEN_URL", codes_ek)
+
+        # 3. Post-render updateDataModel overwrite cannot mask earlier unsafe URLs (direct + ChildList + formatString)
+        overwrite_mask = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "hist_s",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["hero", "go_btn", "cards"]},
+                        {"id": "hero", "component": "Image", "url": {"@path": "/url"}},
+                        {
+                            "id": "go_btn",
+                            "component": "Button",
+                            "child": "go_lbl",
+                            "action": {
+                                "functionCall": {
+                                    "@call": "openUrl",
+                                    "args": {
+                                        "url": {
+                                            "@call": "formatString",
+                                            "args": {"value": "https://${/creds}example.com/"},
+                                        }
+                                    },
+                                }
+                            },
+                        },
+                        {"id": "go_lbl", "component": "Text", "text": "Go"},
+                        {"id": "cards", "component": "List", "children": {"componentId": "card_img", "path": "/items"}},
+                        {"id": "card_img", "component": "Image", "url": {"@path": "pic"}},
+                    ],
+                    "dataModel": {
+                        "url": "javascript:alert(1)",
+                        "creds": "a2ui.org@",
+                        "items": [{"pic": "javascript:alert(2)"}],
+                    },
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "hist_s",
+                    "path": "/url",
+                    "value": "https://example.com/safe.png",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "hist_s",
+                    "path": "/creds",
+                    "value": "docs.",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "hist_s",
+                    "path": "/items/0/pic",
+                    "value": "https://example.com/item.png",
+                },
+            },
+        ]
+        res_hist = validate_payload(json.dumps(overwrite_mask), version="1.0", strict=True)
+        self.assertFalse(res_hist["ok"])
+        media_hist = [e for e in res_hist["errors"] if e["code"] == "UNSAFE_MEDIA_URL"]
+        open_hist = [e for e in res_hist["errors"] if e["code"] == "UNSAFE_OPEN_URL"]
+        self.assertEqual(len(media_hist), 2)
+        self.assertEqual(len(open_hist), 1)
+
+        # 4. Nested ${formatString(...)}, function calls, escaped \${, and unclosed ${ in URL formatString fail closed
+        for bad_tpl in (
+            "https://${formatString(value:${/creds})}evil.example/",
+            "/${formatString(value:${/evil})}",
+            "https://example.com/${foo(bar)}",
+            r"https://example.com/\${/safe}",
+            "https://example.com/${/unclosed",
+            "https://example.com/${}",
+        ):
+            bad_fmt = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fmt_s",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Button",
+                            "child": "lbl",
+                            "action": {
+                                "functionCall": {
+                                    "@call": "openUrl",
+                                    "args": {"url": {"@call": "formatString", "args": {"value": bad_tpl}}},
+                                }
+                            },
+                        },
+                        {"id": "lbl", "component": "Text", "text": "Open"},
+                    ],
+                    "dataModel": {"creds": "a2ui.org@", "evil": "/attacker.example/x.png", "safe": "ok"},
+                },
+            }
+            res_fmt = validate_payload(json.dumps(bad_fmt), version="1.0", strict=True)
+            self.assertFalse(res_fmt["ok"], f"Expected rejection for URL formatString template: {bad_tpl!r}")
+            self.assertIn("UNSAFE_OPEN_URL", {e["code"] for e in res_fmt["errors"]})
+
+        # 5. callAgentFunction requires surfaceId and treats callFunction.catalogId as optional (inheriting surface catalogId)
+        agent_fn_basic_ok = {
+            "version": "1.0",
+            "callAgentFunction": {
+                "surfaceId": "main",
+                "functionCallId": "fc_basic",
+                "callFunction": {"@call": "formatString", "args": {"value": "ok"}},
+            },
+        }
+        self.assertTrue(validate_payload(json.dumps(agent_fn_basic_ok), version="1.0", strict=True)["ok"])
+
+        agent_fn_custom_inherit = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "ops",
+                    "catalogId": "https://acme.example/catalogs/ops/v1/catalog.json",
+                    "components": [{"id": "root", "component": "OpsPanel"}],
+                },
+            },
+            {
+                "version": "1.0",
+                "callAgentFunction": {
+                    "surfaceId": "ops",
+                    "functionCallId": "fc_ops_1",
+                    "callFunction": {"@call": "fetchMetrics", "args": {"window": "5m"}},
+                },
+            },
+        ]
+        res_agent_inherit = validate_payload(json.dumps(agent_fn_custom_inherit), version="1.0", strict=True)
+        self.assertTrue(res_agent_inherit["ok"], res_agent_inherit["errors"])
+
+        agent_fn_missing_sid = {
+            "version": "1.0",
+            "callAgentFunction": {
+                "functionCallId": "fc_no_sid",
+                "callFunction": {
+                    "@call": "formatString",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "args": {"value": "hi"},
+                },
+            },
+        }
+        res_no_sid = validate_payload(json.dumps(agent_fn_missing_sid), version="1.0", strict=True)
+        self.assertFalse(res_no_sid["ok"])
+        self.assertIn("MISSING_SURFACE_ID", {e["code"] for e in res_no_sid["errors"]})
+
+        # 6. BROKEN_CATALOG_URI warning emitted on component @catalogId and FunctionCall.catalogId
+        broken_cat_payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "broken_cat",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "Text",
+                        "@catalogId": "https://a2ui.org/specification/v0_9/basic_catalog.json",
+                        "text": {
+                            "@call": "formatString",
+                            "catalogId": "https://a2ui.org/specification/v0_9/basic_catalog.json",
+                            "args": {"value": "hello"},
+                        },
+                    }
+                ],
+            },
+        }
+        res_bcat = validate_payload(json.dumps(broken_cat_payload), version="1.0", strict=False)
+        broken_warns = [w for w in res_bcat["warnings"] if w["code"] == "BROKEN_CATALOG_URI"]
+        self.assertEqual(len(broken_warns), 2)
+
+        # 7. Icon.name rejects direct FunctionCall (@call / call) while allowing DataBinding and svgPath DynamicString
+        icon_call_bad = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "icon_bad",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "Icon",
+                        "name": {"@call": "formatString", "args": {"value": "check"}},
+                    }
+                ],
+            },
+        }
+        res_icon_bad = validate_payload(json.dumps(icon_call_bad), version="1.0", strict=True)
+        self.assertFalse(res_icon_bad["ok"])
+        self.assertIn("INVALID_ICON_NAME", {e["code"] for e in res_icon_bad["errors"]})
+
+        icon_ok = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "icon_ok",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Row", "children": ["ico_path", "ico_svg"]},
+                    {"id": "ico_path", "component": "Icon", "name": {"@path": "/iconName"}},
+                    {
+                        "id": "ico_svg",
+                        "component": "Icon",
+                        "name": {"svgPath": {"@call": "formatString", "args": {"value": "M0 0 L10 10"}}},
+                    },
+                ],
+                "dataModel": {"iconName": "check"},
+            },
+        }
+        res_icon_ok = validate_payload(json.dumps(icon_ok), version="1.0", strict=True)
+        self.assertTrue(res_icon_ok["ok"], res_icon_ok["errors"])
 
 
 if __name__ == "__main__":

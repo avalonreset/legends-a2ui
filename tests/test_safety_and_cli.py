@@ -6,6 +6,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -562,6 +564,40 @@ class TestSafetyAndCli(unittest.TestCase):
                 any(re.search(pat, probe) for pat in mod.INTERNAL_MARKERS),
                 f"INTERNAL_MARKERS failed to match extended marker pattern: {probe!r}",
             )
+
+    def test_cli_validate_stdin_handles_unicode_and_oversized_array_indices_without_crash(self) -> None:
+        for bad_seg in ("\u00b2", "9" * 4500):
+            payload = [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "sc",
+                        "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json",
+                        "components": [{"id": "root", "component": "Text", "text": "hi"}],
+                        "dataModel": {"items": ["a"]},
+                    },
+                },
+                {
+                    "version": "1.0",
+                    "updateDataModel": {
+                        "surfaceId": "sc",
+                        "path": f"/items/{bad_seg}",
+                        "value": "x",
+                    },
+                },
+            ]
+            proc = subprocess.run(
+                [sys.executable, "-m", "legends_a2ui", "validate", "--input", "-", "--strict", "--json"],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            parsed = json.loads(proc.stdout)
+            self.assertTrue(parsed["ok"])
 
 
 if __name__ == "__main__":
