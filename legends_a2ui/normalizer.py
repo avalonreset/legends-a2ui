@@ -75,6 +75,16 @@ def _convert_v08_contents(contents: list[Any]) -> dict[str, Any]:
     return out
 
 
+def _upgrade_catalog_id(cat_id: Any, changes: list[str], context: str) -> Any:
+    """Replace non-empty legacy Basic/Standard Catalog URIs or aliases with canonical v1.0 URI."""
+    if isinstance(cat_id, str):
+        cleaned = cat_id.strip()
+        if cleaned and cleaned in _LEGACY_CATALOG_ALIASES:
+            changes.append(f"upgraded legacy {context} catalogId -> canonical v1.0 Basic Catalog")
+            return CANONICAL_V1_CATALOG_ID
+    return cat_id
+
+
 def _upgrade_dynamic_value(val: Any, changes: list[str]) -> Any:
     """Upgrade DynamicValue / DataBinding / FunctionCall strictly in dynamic positions."""
     if not isinstance(val, dict):
@@ -106,7 +116,7 @@ def _upgrade_dynamic_value(val: Any, changes: list[str]) -> Any:
             upgraded["@call"] = val["call"]
             changes.append("upgraded FunctionCall call -> @call")
         if "catalogId" in val:
-            upgraded["catalogId"] = val["catalogId"]
+            upgraded["catalogId"] = _upgrade_catalog_id(val["catalogId"], changes, "FunctionCall")
         if isinstance(val.get("args"), dict):
             upgraded["args"] = {
                 k: _upgrade_dynamic_value(v, changes) for k, v in val["args"].items()
@@ -212,6 +222,9 @@ def _normalize_component(raw_comp: dict[str, Any], changes: list[str]) -> dict[s
         if bare in comp and prefixed not in comp:
             comp[prefixed] = comp.pop(bare)
             changes.append(f"upgraded component mixin {bare} -> {prefixed}")
+
+    if "@catalogId" in comp:
+        comp["@catalogId"] = _upgrade_catalog_id(comp["@catalogId"], changes, "component")
 
     if "@accessibility" in comp and isinstance(comp["@accessibility"], dict):
         acc = dict(comp["@accessibility"])
@@ -584,6 +597,13 @@ def normalize_payload(
                 udm["value"] = None
                 changes.append("added explicit null value to updateDataModel")
             mcopy["updateDataModel"] = udm
+
+        for rpc_key in ("callRendererFunction", "callAgentFunction"):
+            if rpc_key in mcopy and isinstance(mcopy[rpc_key], dict):
+                rpc = dict(mcopy[rpc_key])
+                if isinstance(rpc.get("callFunction"), dict):
+                    rpc["callFunction"] = _upgrade_dynamic_value(rpc["callFunction"], changes)
+                mcopy[rpc_key] = rpc
 
         upgraded_msgs.append(mcopy)
 

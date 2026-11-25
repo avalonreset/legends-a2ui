@@ -1,7 +1,6 @@
 """Offline A2UI protocol, Basic Catalog, graph, URL safety, and secret validator."""
 from __future__ import annotations
 
-import copy
 import re
 from typing import Any
 
@@ -166,7 +165,7 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> None
         if value is None:
             cur.pop(last, None)
         else:
-            cur[last] = copy.deepcopy(value)
+            cur[last] = value
     elif isinstance(cur, list):
         idx = _parse_rfc6901_array_index(last)
         if idx is not None:
@@ -175,11 +174,102 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> None
                     cur.pop(idx)
             else:
                 if idx < len(cur):
-                    cur[idx] = copy.deepcopy(value)
+                    cur[idx] = value
                 elif idx == len(cur):
-                    cur.append(copy.deepcopy(value))
+                    cur.append(value)
         elif last == "-" and value is not None:
-            cur.append(copy.deepcopy(value))
+            cur.append(value)
+
+
+def _convert_v08_typed_value(entry: dict[str, Any]) -> Any:
+    if "valueString" in entry:
+        return entry["valueString"]
+    if "valueNumber" in entry:
+        return entry["valueNumber"]
+    if "valueBoolean" in entry:
+        return entry["valueBoolean"]
+    if "valueMap" in entry and isinstance(entry["valueMap"], list):
+        return _convert_v08_contents(entry["valueMap"])
+    if "valueArray" in entry and isinstance(entry["valueArray"], list):
+        return [
+            _convert_v08_typed_value(item) if isinstance(item, dict) else item
+            for item in entry["valueArray"]
+        ]
+    return None
+
+
+def _convert_v08_contents(contents: list[Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for item in contents:
+        if isinstance(item, dict) and isinstance(item.get("key"), str):
+            out[item["key"]] = _convert_v08_typed_value(item)
+    return out
+
+
+def _pointer_ancestors(pointer: str) -> list[str]:
+    """Return all non-root ancestor prefixes of an RFC 6901 pointer, including itself."""
+    if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
+        return []
+    parts = pointer[1:].split("/")
+    ancestors: list[str] = []
+    cur = ""
+    for seg in parts:
+        cur = f"{cur}/{seg}"
+        if cur != "/":
+            ancestors.append(cur)
+    return ancestors
+
+
+def _pointers_overlap(p1: str, p2: str) -> bool:
+    """Return True when two RFC 6901 JSON Pointers are identical or ancestor/descendant."""
+    if p1 in {"", "/"} or p2 in {"", "/"}:
+        return True
+    return p1 == p2 or p1.startswith(p2 + "/") or p2.startswith(p1 + "/")
+
+
+def _extract_url_slot_pointers(val: Any) -> tuple[frozenset[str], frozenset[str]]:
+    """Extract (absolute_pointers, relative_pointers) referenced by a URL slot value."""
+    if not isinstance(val, dict):
+        return frozenset(), frozenset()
+    abs_ptrs: set[str] = set()
+    rel_ptrs: set[str] = set()
+    if "@call" in val or "call" in val:
+        fn_name = val.get("@call") if "@call" in val else val.get("call")
+        args = val.get("args")
+        if fn_name == "formatString" and isinstance(args, dict) and isinstance(args.get("value"), str):
+            for match in _FORMAT_EXPR_RE.finditer(args["value"]):
+                expr = match.group(1)
+                if expr.startswith("/"):
+                    abs_ptrs.add(expr)
+                elif expr:
+                    rel_ptrs.add(expr)
+    else:
+        ptr = val.get("@path") if "@path" in val else val.get("path")
+        if isinstance(ptr, str) and ptr:
+            if ptr.startswith("/"):
+                abs_ptrs.add(ptr)
+            else:
+                rel_ptrs.add(ptr)
+    return frozenset(abs_ptrs), frozenset(rel_ptrs)
+
+
+def _is_prefixless_format_string_url(val: Any) -> bool:
+    """Return True when val is a formatString URL call starting immediately with '${'."""
+    if not isinstance(val, dict):
+        return False
+    fn_name = val.get("@call") if "@call" in val else val.get("call")
+    if fn_name != "formatString":
+        return False
+    args = val.get("args")
+    if not isinstance(args, dict):
+        return False
+    tpl = args.get("value")
+    if not isinstance(tpl, str) or "${" not in tpl:
+        return False
+    return not tpl.split("${", 1)[0].strip()
+
+
+_MAX_TEMPLATE_ABS_RESCAN_EVALS = 10_000
 
 
 def _detect_message_version(msg: dict[str, Any]) -> str:
@@ -332,7 +422,7 @@ def _validate_url_function_call(
                 return
             pos = end + 1
 
-        # Interpolate resolvable placeholders and validate both static prefix and substituted URL.
+        # Interpolate resolvable placeholders and validate placeholder, resolved, and empty-unresolved forms.
         all_resolved = True
         any_resolved = False
 
@@ -340,13 +430,21 @@ def _validate_url_function_call(
             nonlocal all_resolved, any_resolved
             expr = match.group(1)
             found, val = _resolve_pointer_with_context(data_model, expr, item_ctx)
-            if found and val is not None:
+            if found:
                 any_resolved = True
-                return str(val)
+                return "" if val is None else str(val)
             all_resolved = False
             return "placeholder"
 
+        def _subst_empty_unresolved(match: re.Match[str]) -> str:
+            expr = match.group(1)
+            found, val = _resolve_pointer_with_context(data_model, expr, item_ctx)
+            if found and val is not None:
+                return str(val)
+            return ""
+
         resolved_str = _FORMAT_EXPR_RE.sub(_subst_resolved, tpl)
+        empty_unresolved_str = _FORMAT_EXPR_RE.sub(_subst_empty_unresolved, tpl)
         prefix = tpl.split("${", 1)[0].strip()
         if not prefix:
             if all_resolved:
@@ -358,6 +456,16 @@ def _validate_url_function_call(
                     ok, reason = validator_fn(resolved_str)
                     if not ok:
                         _add_issue(errors, code, block_index, path, reason or f"Unsafe resolved {kind} URL.")
+                    elif empty_unresolved_str != resolved_str:
+                        ok_emp, reason_emp = validator_fn(empty_unresolved_str)
+                        if not ok_emp:
+                            _add_issue(
+                                errors,
+                                code,
+                                block_index,
+                                path,
+                                reason_emp or f"Unsafe {kind} URL when unresolved placeholders evaluate empty.",
+                            )
             else:
                 _add_issue(
                     errors,
@@ -368,7 +476,7 @@ def _validate_url_function_call(
                 )
             return
 
-        # Validate the static-prefix + placeholder form as well as the resolved form unconditionally
+        # Validate placeholder, resolved, and empty-unresolved candidate strings unconditionally
         placeholder_str = _FORMAT_EXPR_RE.sub("placeholder", tpl)
         ok_tpl, reason_tpl = validator_fn(placeholder_str)
         if not ok_tpl:
@@ -377,6 +485,17 @@ def _validate_url_function_call(
         ok_res, reason_res = validator_fn(resolved_str)
         if not ok_res:
             _add_issue(errors, code, block_index, path, reason_res or f"Unsafe resolved {kind} URL.")
+            return
+        if empty_unresolved_str != resolved_str:
+            ok_emp, reason_emp = validator_fn(empty_unresolved_str)
+            if not ok_emp:
+                _add_issue(
+                    errors,
+                    code,
+                    block_index,
+                    path,
+                    reason_emp or f"Unsafe {kind} URL when unresolved placeholders evaluate empty.",
+                )
         return
 
     _add_issue(
@@ -510,15 +629,25 @@ def _validate_dynamic_value(
                 errors, "INVALID_FUNCTION_CALL", block_index, path, "FunctionCall name must be a non-empty string."
             )
             return
-        raw_fn_cat = call_val.get("catalogId")
-        if raw_fn_cat == BROKEN_V09_CATALOG_ID:
-            _add_issue(
-                warnings,
-                "BROKEN_CATALOG_URI",
-                block_index,
-                f"{path}.catalogId",
-                f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
-            )
+        raw_fn_cat: Any = None
+        if "catalogId" in call_val:
+            raw_fn_cat = call_val.get("catalogId")
+            if not isinstance(raw_fn_cat, str) or not raw_fn_cat.strip():
+                _add_issue(
+                    errors,
+                    "INVALID_CATALOG_ID",
+                    block_index,
+                    f"{path}.catalogId",
+                    "FunctionCall.catalogId must be a non-empty string when provided.",
+                )
+            elif raw_fn_cat == BROKEN_V09_CATALOG_ID:
+                _add_issue(
+                    warnings,
+                    "BROKEN_CATALOG_URI",
+                    block_index,
+                    f"{path}.catalogId",
+                    f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+                )
         effective_fn_cat = (
             raw_fn_cat
             if isinstance(raw_fn_cat, str) and raw_fn_cat.strip()
@@ -1025,7 +1154,6 @@ def _validate_surface_components(
     warnings: list[dict[str, Any]],
     data_model: dict[str, Any],
     surface_catalog_id: str | None = None,
-    data_model_history: list[tuple[int, dict[str, Any]]] | None = None,
 ) -> int:
     catalog = load_catalog_spec(version)
     catalog_components = catalog["components"]
@@ -1050,14 +1178,13 @@ def _validate_surface_components(
     historical_adj: dict[str, list[str]] = {}
     historical_parents: dict[str, list[str]] = {}
 
-    multi_batch = len(component_batches) > 1
     for b_idx, batch in enumerate(component_batches):
         batch_seen_ids: set[str] = set()
         for idx, comp in enumerate(batch):
             cpath = (
-                f"surface:{surface_id}.batch[{b_idx}].components[{idx}]"
-                if multi_batch
-                else f"surface:{surface_id}.components[{idx}]"
+                f"surface:{surface_id}.components[{idx}]"
+                if b_idx == 0
+                else f"surface:{surface_id}.batch[{b_idx}].components[{idx}]"
             )
             if not isinstance(comp, dict):
                 _add_issue(errors, "INVALID_COMPONENT", block_index, cpath, "Component must be an object.")
@@ -1140,22 +1267,41 @@ def _validate_surface_components(
 
             # Basic Catalog schema validation when using default catalog (inherits createSurface.catalogId)
             raw_comp_cat = comp.get("@catalogId")
-            if raw_comp_cat == BROKEN_V09_CATALOG_ID:
-                _add_issue(
-                    warnings,
-                    "BROKEN_CATALOG_URI",
-                    block_index,
-                    f"{cpath}.@catalogId",
-                    f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
-                )
-            elif comp.get("catalogId") == BROKEN_V09_CATALOG_ID:
-                _add_issue(
-                    warnings,
-                    "BROKEN_CATALOG_URI",
-                    block_index,
-                    f"{cpath}.catalogId",
-                    f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
-                )
+            if "@catalogId" in comp:
+                if not isinstance(raw_comp_cat, str) or not raw_comp_cat.strip():
+                    _add_issue(
+                        errors,
+                        "INVALID_CATALOG_ID",
+                        block_index,
+                        f"{cpath}.@catalogId",
+                        "Component '@catalogId' must be a non-empty string when provided.",
+                    )
+                elif raw_comp_cat == BROKEN_V09_CATALOG_ID:
+                    _add_issue(
+                        warnings,
+                        "BROKEN_CATALOG_URI",
+                        block_index,
+                        f"{cpath}.@catalogId",
+                        f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+                    )
+            if "catalogId" in comp:
+                raw_bare_cat = comp.get("catalogId")
+                if not isinstance(raw_bare_cat, str) or not raw_bare_cat.strip():
+                    _add_issue(
+                        errors,
+                        "INVALID_CATALOG_ID",
+                        block_index,
+                        f"{cpath}.catalogId",
+                        "Component 'catalogId' must be a non-empty string when provided.",
+                    )
+                elif raw_bare_cat == BROKEN_V09_CATALOG_ID:
+                    _add_issue(
+                        warnings,
+                        "BROKEN_CATALOG_URI",
+                        block_index,
+                        f"{cpath}.catalogId",
+                        f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+                    )
             effective_comp_catalog = (
                 raw_comp_cat
                 if isinstance(raw_comp_cat, str) and raw_comp_cat.strip()
@@ -1303,6 +1449,24 @@ def _validate_surface_components(
                                     block_index,
                                     f"{cpath}.name",
                                     f"Icon.name with 'svgPath' must not contain extra properties: {sorted(extra_icon)}.",
+                                )
+                            svg_val = iname["svgPath"]
+                            is_valid_svg_dyn = isinstance(svg_val, str) or (
+                                isinstance(svg_val, dict)
+                                and (
+                                    "@path" in svg_val
+                                    or "path" in svg_val
+                                    or "@call" in svg_val
+                                    or "call" in svg_val
+                                )
+                            )
+                            if not is_valid_svg_dyn:
+                                _add_issue(
+                                    errors,
+                                    "INVALID_ICON_NAME",
+                                    block_index,
+                                    f"{cpath}.name.svgPath",
+                                    "Icon.name.svgPath must be a string, DataBinding, or FunctionCall.",
                                 )
                         elif not (set(iname.keys()) == {"@path"} or set(iname.keys()) == {"path"}):
                             _add_issue(
@@ -1636,187 +1800,6 @@ def _validate_surface_components(
             f"Cyclic component reference detected: {' -> '.join(cycle)}.",
         )
 
-    # Validate media URLs, openUrl calls, and ChildList templates across every historical
-    # dataModel snapshot where each component was active (so later overwrites cannot mask unsafe URLs).
-    snapshots: list[tuple[int, dict[str, Any]]] = []
-    if data_model_history:
-        for snap_bc, snap_dm in data_model_history:
-            if snap_bc > 0:
-                snapshots.append((snap_bc, snap_dm))
-    if not snapshots:
-        snapshots.append((len(component_batches), data_model))
-    elif snapshots[-1][0] != len(component_batches) or snapshots[-1][1] != data_model:
-        snapshots.append((len(component_batches), data_model))
-
-    seen_errors: set[tuple[str, int, str, str]] = {
-        (e["code"], e["blockIndex"], e["path"], e["message"]) for e in errors
-    }
-    seen_warnings: set[tuple[str, int, str, str]] = {
-        (w["code"], w["blockIndex"], w["path"], w["message"]) for w in warnings
-    }
-
-    batch_state_cache: dict[int, tuple[dict[str, tuple[str, dict[str, Any], str]], dict[str, list[str]]]] = {}
-
-    def _active_state_at_batch(
-        bc: int,
-    ) -> tuple[dict[str, tuple[str, dict[str, Any], str]], dict[str, list[str]]]:
-        if bc == len(component_batches):
-            return comp_map, adj
-        cached = batch_state_cache.get(bc)
-        if cached is not None:
-            return cached
-        s_comp_map: dict[str, tuple[str, dict[str, Any], str]] = {}
-        for b_i in range(min(bc, len(component_batches))):
-            b_seen: set[str] = set()
-            for idx_i, c_obj in enumerate(component_batches[b_i]):
-                if not isinstance(c_obj, dict):
-                    continue
-                c_id = c_obj.get("id")
-                if not isinstance(c_id, str) or not c_id or c_id in b_seen:
-                    continue
-                b_seen.add(c_id)
-                c_path = (
-                    f"surface:{surface_id}.batch[{b_i}].components[{idx_i}]"
-                    if multi_batch
-                    else f"surface:{surface_id}.components[{idx_i}]"
-                )
-                if version == "0.8":
-                    c_type, c_props = _extract_v08_component(c_obj)
-                    if not c_type:
-                        continue
-                else:
-                    c_type = c_obj.get("component")
-                    c_props = c_obj
-                    if not isinstance(c_type, str) or not c_type:
-                        continue
-                if c_type == "Surface":
-                    continue
-                s_comp_map[c_id] = (c_type, c_props, c_path)
-        s_adj: dict[str, list[str]] = {cid_k: [] for cid_k in s_comp_map}
-        for cid_k, (c_type, c_props, _c_path) in s_comp_map.items():
-            for _rp, ref_id in _extract_child_refs(c_type, c_props, version):
-                if ref_id in s_comp_map:
-                    s_adj[cid_k].append(ref_id)
-        batch_state_cache[bc] = (s_comp_map, s_adj)
-        return s_comp_map, s_adj
-
-    for snap_idx, (snap_bc, snap_dm) in enumerate(snapshots):
-        is_final_snap = snap_idx == len(snapshots) - 1 and snap_bc == len(component_batches) and snap_dm == data_model
-        s_comp_map, s_adj = _active_state_at_batch(snap_bc)
-        tmp_errors: list[dict[str, Any]] = []
-        tmp_warnings: list[dict[str, Any]] = []
-
-        # Re-check active component media URL & openUrl bindings against historical snapshots
-        if not is_final_snap:
-            for _cid, (c_type, c_props, c_path) in s_comp_map.items():
-                raw_c_cat = c_props.get("@catalogId")
-                c_effective_cat = (
-                    raw_c_cat
-                    if isinstance(raw_c_cat, str) and raw_c_cat.strip()
-                    else surface_catalog_id
-                )
-                c_is_custom = _is_custom_catalog_id(c_effective_cat, canonical_catalog_id)
-                media_props = _MEDIA_URL_PROPS.get(c_type, ("url", "posterUrl") if c_is_custom else ())
-                for media_prop in media_props:
-                    if media_prop in c_props:
-                        _validate_media_prop(
-                            c_props[media_prop],
-                            block_index,
-                            f"{c_path}.{media_prop}",
-                            tmp_errors,
-                            snap_dm,
-                            strict=strict,
-                            warnings=tmp_warnings,
-                            is_historical_snapshot=True,
-                        )
-                for url_path, url_val in _iter_open_url_slots(c_props, c_path):
-                    _validate_open_url_arg(
-                        url_val,
-                        block_index,
-                        url_path,
-                        tmp_errors,
-                        snap_dm,
-                        strict=strict,
-                        warnings=tmp_warnings,
-                        is_historical_snapshot=True,
-                    )
-
-        # Validate ChildList dynamic template bindings against this snapshot's dataModel array items
-        template_bindings: list[tuple[str, str]] = []
-        for _cid, (_ctype, props, _cpath) in s_comp_map.items():
-            ch = props.get("children")
-            if isinstance(ch, dict):
-                if version == "0.8" and isinstance(ch.get("template"), dict):
-                    tpl = ch["template"]
-                    if isinstance(tpl.get("componentId"), str) and isinstance(tpl.get("dataBinding"), str):
-                        template_bindings.append((tpl["componentId"], tpl["dataBinding"]))
-                elif isinstance(ch.get("componentId"), str) and isinstance(ch.get("path"), str):
-                    template_bindings.append((ch["componentId"], ch["path"]))
-
-        for tpl_root_id, list_ptr in template_bindings:
-            found_list, items_val = _resolve_json_pointer(snap_dm, list_ptr)
-            if not found_list or not isinstance(items_val, list):
-                continue
-            if tpl_root_id not in s_comp_map:
-                continue
-            tpl_nodes: list[str] = []
-            seen_tpl: set[str] = set()
-            t_queue = [tpl_root_id]
-            while t_queue:
-                cur_id = t_queue.pop()
-                if cur_id in seen_tpl or cur_id not in s_comp_map:
-                    continue
-                seen_tpl.add(cur_id)
-                tpl_nodes.append(cur_id)
-                t_queue.extend(s_adj.get(cur_id, []))
-            for item_idx, item in enumerate(items_val):
-                for tcid in tpl_nodes:
-                    t_type, t_props, t_cpath = s_comp_map[tcid]
-                    raw_t_cat = t_props.get("@catalogId")
-                    t_effective_cat = (
-                        raw_t_cat
-                        if isinstance(raw_t_cat, str) and raw_t_cat.strip()
-                        else surface_catalog_id
-                    )
-                    t_is_custom = _is_custom_catalog_id(t_effective_cat, canonical_catalog_id)
-                    media_props = _MEDIA_URL_PROPS.get(t_type, ("url", "posterUrl") if t_is_custom else ())
-                    for media_prop in media_props:
-                        if media_prop in t_props and isinstance(t_props[media_prop], dict):
-                            val_obj = t_props[media_prop]
-                            ptr = val_obj.get("@path") if "@path" in val_obj else val_obj.get("path")
-                            has_call = "@call" in val_obj or "call" in val_obj
-                            if (isinstance(ptr, str) and not ptr.startswith("/")) or has_call:
-                                _validate_media_prop(
-                                    val_obj,
-                                    block_index,
-                                    f"{t_cpath}[item:{item_idx}].{media_prop}",
-                                    tmp_errors,
-                                    snap_dm,
-                                    strict=strict,
-                                    warnings=tmp_warnings,
-                                    item_ctx=item,
-                                    is_historical_snapshot=not is_final_snap,
-                                )
-                    for url_path, url_val in _iter_open_url_slots(t_props, f"{t_cpath}[item:{item_idx}]"):
-                        if isinstance(url_val, dict):
-                            ptr = url_val.get("@path") if "@path" in url_val else url_val.get("path")
-                            has_call = "@call" in url_val or "call" in url_val
-                            if (isinstance(ptr, str) and not ptr.startswith("/")) or has_call:
-                                _validate_open_url_arg(
-                                    url_val,
-                                    block_index,
-                                    url_path,
-                                    tmp_errors,
-                                    snap_dm,
-                                    strict=strict,
-                                    warnings=tmp_warnings,
-                                    item_ctx=item,
-                                    is_historical_snapshot=not is_final_snap,
-                                )
-
-        _append_unique_issues(errors, tmp_errors, seen_errors)
-        _append_unique_issues(warnings, tmp_warnings, seen_warnings)
-
     # Reachability / orphan detection (ignore placeholders superseded by incremental updates)
     if root_id in comp_map:
         for cid, (_ctype, _props, cpath) in comp_map.items():
@@ -1875,26 +1858,440 @@ def validate_payload(
         surface_catalog_ids: dict[str, str | None] = {}
         surface_component_batches: dict[str, list[list[dict[str, Any]]]] = {}
         surface_data_models: dict[str, dict[str, Any]] = {}
-        surface_data_model_history: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         surface_roots: dict[str, str] = {}
+        surface_active_comp_map: dict[str, dict[str, tuple[str, dict[str, Any], str]]] = {}
+        surface_active_adj: dict[str, dict[str, list[str]]] = {}
+        # slot tuple: (kind, slot_path, raw_val, abs_ptrs, rel_ptrs, comp_cpath, slot_suffix)
+        surface_url_slots: dict[
+            str,
+            dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+        ] = {}
+        surface_childlist_templates: dict[str, dict[str, tuple[str, str]]] = {}
+        surface_ptr_index: dict[
+            str,
+            tuple[
+                dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+                dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+                list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+            ],
+        ] = {}
+        surface_ptr_index_dirty: set[str] = set()
+        surface_seen_errors: dict[str, set[tuple[str, int, str, str]]] = {}
+        surface_seen_warnings: dict[str, set[tuple[str, int, str, str]]] = {}
+        surface_total_comp_entries: dict[str, int] = {}
+        surface_tpl_abs_eval_count: dict[str, int] = {}
 
-        def _record_surface_snapshot(sid_snap: str) -> None:
-            bc = len(surface_component_batches.get(sid_snap, []))
-            dm_copy = copy.deepcopy(surface_data_models.get(sid_snap, {}))
-            hist = surface_data_model_history.setdefault(sid_snap, [])
-            if not hist or hist[-1][0] != bc or hist[-1][1] != dm_copy:
-                hist.append((bc, dm_copy))
+        def _clear_surface_stream_state(sid_clear: str) -> None:
+            surface_active_comp_map.pop(sid_clear, None)
+            surface_active_adj.pop(sid_clear, None)
+            surface_url_slots.pop(sid_clear, None)
+            surface_childlist_templates.pop(sid_clear, None)
+            surface_ptr_index.pop(sid_clear, None)
+            surface_ptr_index_dirty.discard(sid_clear)
+            surface_seen_errors.pop(sid_clear, None)
+            surface_seen_warnings.pop(sid_clear, None)
+            surface_total_comp_entries.pop(sid_clear, None)
+            surface_tpl_abs_eval_count.pop(sid_clear, None)
+
+        def _emit_surface_issues(
+            sid_emit: str,
+            tmp_errors: list[dict[str, Any]],
+            tmp_warnings: list[dict[str, Any]],
+        ) -> None:
+            if tmp_errors:
+                s_err = surface_seen_errors.setdefault(sid_emit, set())
+                _append_unique_issues(errors, tmp_errors, s_err)
+            if tmp_warnings:
+                s_warn = surface_seen_warnings.setdefault(sid_emit, set())
+                _append_unique_issues(warnings, tmp_warnings, s_warn)
+
+        def _validate_single_url_slot(
+            slot: tuple[str, str, Any, frozenset[str], frozenset[str], str, str],
+            dm: dict[str, Any],
+            tmp_errors: list[dict[str, Any]],
+            tmp_warnings: list[dict[str, Any]],
+            *,
+            item_ctx: Any = None,
+            item_idx: int | None = None,
+            is_historical_snapshot: bool = True,
+        ) -> None:
+            kind, slot_path, raw_val, _abs_p, _rel_p, comp_cpath, slot_suffix = slot
+            target_path = f"{comp_cpath}[item:{item_idx}]{slot_suffix}" if item_idx is not None else slot_path
+            if kind == "media":
+                _validate_media_prop(
+                    raw_val,
+                    bidx,
+                    target_path,
+                    tmp_errors,
+                    dm,
+                    strict=strict,
+                    warnings=tmp_warnings,
+                    item_ctx=item_ctx,
+                    is_historical_snapshot=is_historical_snapshot,
+                )
+            else:
+                _validate_open_url_arg(
+                    raw_val,
+                    bidx,
+                    target_path,
+                    tmp_errors,
+                    dm,
+                    strict=strict,
+                    warnings=tmp_warnings,
+                    item_ctx=item_ctx,
+                    is_historical_snapshot=is_historical_snapshot,
+                )
+
+        def _get_surface_ptr_index(
+            sid_idx: str,
+        ) -> tuple[
+            dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+            dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+            list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+        ]:
+            if sid_idx not in surface_ptr_index_dirty and sid_idx in surface_ptr_index:
+                return surface_ptr_index[sid_idx]
+            exact_map: dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]] = {}
+            prefix_map: dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]] = {}
+            all_dyn: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
+            for comp_slots in surface_url_slots.get(sid_idx, {}).values():
+                for slot in comp_slots:
+                    abs_ptrs = slot[3]
+                    if not abs_ptrs:
+                        continue
+                    all_dyn.append(slot)
+                    seen_anc: set[str] = set()
+                    for ap in abs_ptrs:
+                        if ap in {"", "/"}:
+                            exact_map.setdefault("/", []).append(slot)
+                        else:
+                            exact_map.setdefault(ap, []).append(slot)
+                            for anc in _pointer_ancestors(ap):
+                                if anc not in seen_anc:
+                                    seen_anc.add(anc)
+                                    prefix_map.setdefault(anc, []).append(slot)
+            res_idx = (exact_map, prefix_map, all_dyn)
+            surface_ptr_index[sid_idx] = res_idx
+            surface_ptr_index_dirty.discard(sid_idx)
+            return res_idx
+
+        def _collect_template_nodes_and_slots(
+            sid_tpl: str, tpl_root_id: str
+        ) -> tuple[list[str], list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]]:
+            comp_map = surface_active_comp_map.get(sid_tpl, {})
+            if tpl_root_id not in comp_map:
+                return [], []
+            adj_map = surface_active_adj.get(sid_tpl, {})
+            slots_by_cid = surface_url_slots.get(sid_tpl, {})
+            tpl_nodes: list[str] = []
+            seen_tpl: set[str] = set()
+            t_queue = [tpl_root_id]
+            while t_queue:
+                cur_id = t_queue.pop()
+                if cur_id in seen_tpl or cur_id not in comp_map:
+                    continue
+                seen_tpl.add(cur_id)
+                tpl_nodes.append(cur_id)
+                t_queue.extend(adj_map.get(cur_id, []))
+            rel_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
+            for tcid in tpl_nodes:
+                for slot in slots_by_cid.get(tcid, ()):
+                    if slot[4]:  # has relative pointers that depend on item_ctx
+                        rel_slots.append(slot)
+            return tpl_nodes, rel_slots
+
+        def _ingest_component_batch(sid_ing: str, b_idx: int, comps: list[dict[str, Any]]) -> None:
+            total_seen = surface_total_comp_entries.get(sid_ing, 0) + len(comps)
+            surface_total_comp_entries[sid_ing] = total_seen
+            if total_seen > max_components:
+                return
+            sver = surface_versions.get(sid_ing, "1.0")
+            canonical_cat_id = load_catalog_spec(sver)["catalogId"]
+            surf_cat = surface_catalog_ids.get(sid_ing)
+            comp_map = surface_active_comp_map.setdefault(sid_ing, {})
+            adj_map = surface_active_adj.setdefault(sid_ing, {})
+            slots_by_cid = surface_url_slots.setdefault(sid_ing, {})
+            tpl_map = surface_childlist_templates.setdefault(sid_ing, {})
+
+            batch_seen_ids: set[str] = set()
+            updated_cids: set[str] = set()
+            for idx, comp in enumerate(comps):
+                if not isinstance(comp, dict):
+                    continue
+                cid = comp.get("id")
+                if not isinstance(cid, str) or not cid or cid in batch_seen_ids:
+                    continue
+                batch_seen_ids.add(cid)
+                cpath = (
+                    f"surface:{sid_ing}.components[{idx}]"
+                    if b_idx == 0
+                    else f"surface:{sid_ing}.batch[{b_idx}].components[{idx}]"
+                )
+                if sver == "0.8":
+                    c_type, c_props = _extract_v08_component(comp)
+                    if not c_type:
+                        continue
+                else:
+                    c_type = comp.get("component")
+                    c_props = comp
+                    if not isinstance(c_type, str) or not c_type:
+                        continue
+                if c_type == "Surface":
+                    continue
+
+                comp_map[cid] = (c_type, c_props, cpath)
+                adj_map[cid] = [ref_id for _rp, ref_id in _extract_child_refs(c_type, c_props, sver)]
+                updated_cids.add(cid)
+
+                raw_c_cat = c_props.get("@catalogId")
+                c_effective_cat = (
+                    raw_c_cat if isinstance(raw_c_cat, str) and raw_c_cat.strip() else surf_cat
+                )
+                c_is_custom = _is_custom_catalog_id(c_effective_cat, canonical_cat_id)
+                media_props = _MEDIA_URL_PROPS.get(c_type, ("url", "posterUrl") if c_is_custom else ())
+
+                comp_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
+                for media_prop in media_props:
+                    if media_prop in c_props:
+                        val_obj = c_props[media_prop]
+                        abs_p, rel_p = _extract_url_slot_pointers(val_obj)
+                        comp_slots.append(
+                            ("media", f"{cpath}.{media_prop}", val_obj, abs_p, rel_p, cpath, f".{media_prop}")
+                        )
+                for url_path, url_val in _iter_open_url_slots(c_props, cpath):
+                    abs_p, rel_p = _extract_url_slot_pointers(url_val)
+                    suffix = url_path[len(cpath) :] if url_path.startswith(cpath) else url_path
+                    comp_slots.append(("openUrl", url_path, url_val, abs_p, rel_p, cpath, suffix))
+
+                if comp_slots:
+                    slots_by_cid[cid] = comp_slots
+                else:
+                    slots_by_cid.pop(cid, None)
+
+                ch = c_props.get("children")
+                tpl_binding: tuple[str, str] | None = None
+                if isinstance(ch, dict):
+                    if sver == "0.8" and isinstance(ch.get("template"), dict):
+                        tpl = ch["template"]
+                        if isinstance(tpl.get("componentId"), str) and isinstance(tpl.get("dataBinding"), str):
+                            tpl_binding = (tpl["componentId"], tpl["dataBinding"])
+                    elif isinstance(ch.get("componentId"), str) and isinstance(ch.get("path"), str):
+                        tpl_binding = (ch["componentId"], ch["path"])
+                if tpl_binding is not None:
+                    tpl_map[cid] = tpl_binding
+                else:
+                    tpl_map.pop(cid, None)
+
+            surface_ptr_index_dirty.add(sid_ing)
+            if not updated_cids:
+                return
+
+            dm = surface_data_models.get(sid_ing, {})
+            tmp_errors: list[dict[str, Any]] = []
+            tmp_warnings: list[dict[str, Any]] = []
+
+            # Eagerly validate newly added/updated direct component URL slots against current dataModel
+            for cid in updated_cids:
+                for slot in slots_by_cid.get(cid, ()):
+                    _validate_single_url_slot(
+                        slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
+                    )
+
+            # Eagerly validate any affected ChildList template against current dataModel items
+            for owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
+                tpl_nodes, rel_slots = _collect_template_nodes_and_slots(sid_ing, tpl_root_id)
+                if not rel_slots:
+                    continue
+                if owner_cid not in updated_cids and not any(n in updated_cids for n in tpl_nodes):
+                    continue
+                found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                if not found_list or not isinstance(items_val, list):
+                    continue
+                for item_idx, item in enumerate(items_val):
+                    for slot in rel_slots:
+                        _validate_single_url_slot(
+                            slot,
+                            dm,
+                            tmp_errors,
+                            tmp_warnings,
+                            item_ctx=item,
+                            item_idx=item_idx,
+                            is_historical_snapshot=True,
+                        )
+
+            _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
+
+        def _validate_streaming_data_update(sid_upd: str, ptr: str) -> None:
+            comp_map = surface_active_comp_map.get(sid_upd)
+            if not comp_map:
+                return
+            dm = surface_data_models.get(sid_upd, {})
+            tmp_errors: list[dict[str, Any]] = []
+            tmp_warnings: list[dict[str, Any]] = []
+
+            # 1. Re-validate only direct URL slots whose bound pointer(s) overlap ptr
+            exact_map, prefix_map, all_dyn = _get_surface_ptr_index(sid_upd)
+            if all_dyn:
+                if ptr in {"", "/"}:
+                    affected_slots = all_dyn
+                else:
+                    affected_slots = []
+                    seen_slot_ids: set[int] = set()
+                    for slot in exact_map.get("/", ()):
+                        sid_obj = id(slot)
+                        if sid_obj not in seen_slot_ids:
+                            seen_slot_ids.add(sid_obj)
+                            affected_slots.append(slot)
+                    for slot in prefix_map.get(ptr, ()):
+                        sid_obj = id(slot)
+                        if sid_obj not in seen_slot_ids:
+                            seen_slot_ids.add(sid_obj)
+                            affected_slots.append(slot)
+                    for anc in _pointer_ancestors(ptr):
+                        if anc == ptr:
+                            continue
+                        for slot in exact_map.get(anc, ()):
+                            sid_obj = id(slot)
+                            if sid_obj not in seen_slot_ids:
+                                seen_slot_ids.add(sid_obj)
+                                affected_slots.append(slot)
+                for slot in affected_slots:
+                    _validate_single_url_slot(
+                        slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
+                    )
+
+            # 2. Re-validate affected ChildList templates (O(1) for single-element mutations)
+            tpl_map = surface_childlist_templates.get(sid_upd)
+            if tpl_map:
+                for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
+                    _tpl_nodes, rel_slots = _collect_template_nodes_and_slots(sid_upd, tpl_root_id)
+                    if not rel_slots:
+                        continue
+                    list_prefix = "/" if list_ptr in {"", "/"} else f"{list_ptr}/"
+                    is_single_item_target = (
+                        list_ptr not in {"", "/"}
+                        and isinstance(ptr, str)
+                        and ptr.startswith(list_prefix)
+                    )
+                    if is_single_item_target:
+                        found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                        if not found_list or not isinstance(items_val, list):
+                            continue
+                        rest = ptr[len(list_prefix) :]
+                        seg = rest.split("/", 1)[0]
+                        if seg == "-":
+                            target_idx = len(items_val) - 1 if items_val else None
+                        else:
+                            idx_parsed = _parse_rfc6901_array_index(seg)
+                            target_idx = (
+                                idx_parsed
+                                if idx_parsed is not None and idx_parsed < len(items_val)
+                                else None
+                            )
+                        if target_idx is not None:
+                            item = items_val[target_idx]
+                            for slot in rel_slots:
+                                _validate_single_url_slot(
+                                    slot,
+                                    dm,
+                                    tmp_errors,
+                                    tmp_warnings,
+                                    item_ctx=item,
+                                    item_idx=target_idx,
+                                    is_historical_snapshot=True,
+                                )
+                    elif ptr in {"", "/"} or list_ptr == ptr or list_ptr.startswith(ptr + "/"):
+                        found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                        if not found_list or not isinstance(items_val, list):
+                            continue
+                        for item_idx, item in enumerate(items_val):
+                            for slot in rel_slots:
+                                _validate_single_url_slot(
+                                    slot,
+                                    dm,
+                                    tmp_errors,
+                                    tmp_warnings,
+                                    item_ctx=item,
+                                    item_idx=item_idx,
+                                    is_historical_snapshot=True,
+                                )
+                    else:
+                        abs_overlap_slots = [
+                            slot
+                            for slot in rel_slots
+                            if any(_pointers_overlap(ap, ptr) for ap in slot[3])
+                        ]
+                        if abs_overlap_slots:
+                            found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                            if not found_list or not isinstance(items_val, list):
+                                continue
+                            # Always run O(1) absolute check with item_ctx=None first
+                            for slot in abs_overlap_slots:
+                                _validate_single_url_slot(
+                                    slot,
+                                    dm,
+                                    tmp_errors,
+                                    tmp_warnings,
+                                    item_ctx=None,
+                                    is_historical_snapshot=True,
+                                )
+                            evals = surface_tpl_abs_eval_count.get(sid_upd, 0)
+                            for item_idx, item in enumerate(items_val):
+                                if evals >= _MAX_TEMPLATE_ABS_RESCAN_EVALS:
+                                    break
+                                for slot in abs_overlap_slots:
+                                    _validate_single_url_slot(
+                                        slot,
+                                        dm,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        item_ctx=item,
+                                        item_idx=item_idx,
+                                        is_historical_snapshot=True,
+                                    )
+                                    evals += 1
+                            surface_tpl_abs_eval_count[sid_upd] = evals
+
+            _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
 
         def _flush_surface(sid_to_flush: str) -> None:
             nonlocal total_components
             batches = surface_component_batches.pop(sid_to_flush, None)
             dm = surface_data_models.pop(sid_to_flush, {})
-            history = surface_data_model_history.pop(sid_to_flush, [])
             scat = surface_catalog_ids.pop(sid_to_flush, None)
+            tpl_map = surface_childlist_templates.get(sid_to_flush, {})
             if batches is None:
+                _clear_surface_stream_state(sid_to_flush)
                 return
+
+            # Final non-historical check for rare prefix-less formatString URL slots inside ChildList templates
+            final_tpl_errors: list[dict[str, Any]] = []
+            final_tpl_warnings: list[dict[str, Any]] = []
+            for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
+                _tpl_nodes, rel_slots = _collect_template_nodes_and_slots(sid_to_flush, tpl_root_id)
+                prefixless_slots = [s for s in rel_slots if _is_prefixless_format_string_url(s[2])]
+                if not prefixless_slots:
+                    continue
+                found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                if not found_list or not isinstance(items_val, list):
+                    continue
+                for item_idx, item in enumerate(items_val):
+                    for slot in prefixless_slots:
+                        _validate_single_url_slot(
+                            slot,
+                            dm,
+                            final_tpl_errors,
+                            final_tpl_warnings,
+                            item_ctx=item,
+                            item_idx=item_idx,
+                            is_historical_snapshot=False,
+                        )
+            _emit_surface_issues(sid_to_flush, final_tpl_errors, final_tpl_warnings)
+
             sver = surface_versions.get(sid_to_flush, "1.0")
             sroot = surface_roots.get(sid_to_flush, "root")
+            flush_errors: list[dict[str, Any]] = []
+            flush_warnings: list[dict[str, Any]] = []
             total_components += _validate_surface_components(
                 surface_id=sid_to_flush,
                 component_batches=batches,
@@ -1903,12 +2300,13 @@ def validate_payload(
                 strict=strict,
                 max_components=max_components,
                 block_index=bidx,
-                errors=errors,
-                warnings=warnings,
+                errors=flush_errors,
+                warnings=flush_warnings,
                 data_model=dm,
                 surface_catalog_id=scat,
-                data_model_history=history,
             )
+            _emit_surface_issues(sid_to_flush, flush_errors, flush_warnings)
+            _clear_surface_stream_state(sid_to_flush)
 
         for midx, msg in enumerate(messages):
             mpath = f"$[{midx}]"
@@ -1980,8 +2378,8 @@ def validate_payload(
                     deleted_surfaces.discard(sid)
                     surface_component_batches.pop(sid, None)
                     surface_data_models.pop(sid, None)
-                    surface_data_model_history.pop(sid, None)
                     surface_catalog_ids.pop(sid, None)
+                    _clear_surface_stream_state(sid)
                     surface_roots[sid] = "root"
                 active_surfaces.add(sid)
                 ever_created_surfaces.add(sid)
@@ -2028,9 +2426,11 @@ def validate_payload(
                             f"{mpath}.createSurface",
                             f"Unexpected createSurface keys: {sorted(unknown_cs)}.",
                         )
+                    dm_updated_in_cs = False
                     if "dataModel" in body:
                         if isinstance(body["dataModel"], dict):
-                            surface_data_models[sid] = copy.deepcopy(body["dataModel"])
+                            surface_data_models[sid] = body["dataModel"]
+                            dm_updated_in_cs = True
                         else:
                             _add_issue(
                                 errors,
@@ -2041,7 +2441,10 @@ def validate_payload(
                             )
                     if "components" in body:
                         if isinstance(body["components"], list) and len(body["components"]) > 0:
-                            surface_component_batches.setdefault(sid, []).append(body["components"])
+                            batches = surface_component_batches.setdefault(sid, [])
+                            b_idx = len(batches)
+                            batches.append(body["components"])
+                            _ingest_component_batch(sid, b_idx, body["components"])
                         else:
                             _add_issue(
                                 errors,
@@ -2050,7 +2453,8 @@ def validate_payload(
                                 f"{mpath}.createSurface.components",
                                 "createSurface.components must be a non-empty list when provided.",
                             )
-                _record_surface_snapshot(sid)
+                    elif dm_updated_in_cs:
+                        _validate_streaming_data_update(sid, "/")
 
             elif env_key == "beginRendering":
                 sid = body.get("surfaceId")
@@ -2100,8 +2504,10 @@ def validate_payload(
                 if not isinstance(comps, list) or not comps:
                     _add_issue(errors, "EMPTY_COMPONENTS", bidx, f"{mpath}.{env_key}.components", "components must be a non-empty list.")
                 else:
-                    surface_component_batches.setdefault(sid, []).append(comps)
-                    _record_surface_snapshot(sid)
+                    batches = surface_component_batches.setdefault(sid, [])
+                    b_idx = len(batches)
+                    batches.append(comps)
+                    _ingest_component_batch(sid, b_idx, comps)
 
             elif env_key == "updateDataModel":
                 sid = body.get("surfaceId")
@@ -2134,15 +2540,20 @@ def validate_payload(
                         "A2UI v1.0 updateDataModel requires explicit 'value' (use null to delete).",
                     )
                 ptr = body.get("path", "/")
+                mutated = False
                 if ptr in {"", "/"}:
                     if body.get("value") is None:
                         surface_data_models[sid] = {}
+                        mutated = True
                     elif isinstance(body.get("value"), dict):
-                        surface_data_models[sid] = copy.deepcopy(body["value"])
+                        surface_data_models[sid] = body["value"]
+                        mutated = True
                 elif isinstance(ptr, str) and ptr.startswith("/") and "value" in body:
                     dm = surface_data_models.setdefault(sid, {})
                     _mutate_json_pointer(dm, ptr, body["value"])
-                _record_surface_snapshot(sid)
+                    mutated = True
+                if mutated and isinstance(ptr, str):
+                    _validate_streaming_data_update(sid, ptr)
 
             elif env_key in {"callRendererFunction", "callAgentFunction"}:
                 extra_fn_keys = set(body.keys()) - {"surfaceId", "functionCallId", "callFunction"}
@@ -2209,7 +2620,12 @@ def validate_payload(
                                 f"{mpath}.{env_key}.callFunction.catalogId",
                                 "callRendererFunction.callFunction requires non-empty string 'catalogId'.",
                             )
-                    elif "catalogId" in call_fn and (not isinstance(fn_cat, str) or not fn_cat.strip()):
+                    elif (
+                        "@call" not in call_fn
+                        and "call" not in call_fn
+                        and "catalogId" in call_fn
+                        and (not isinstance(fn_cat, str) or not fn_cat.strip())
+                    ):
                         _add_issue(
                             errors,
                             "INVALID_CATALOG_ID",
@@ -2236,10 +2652,106 @@ def validate_payload(
                         allow_user_activation=False,
                     )
 
+            elif env_key in {"agentFunctionResponse", "rendererFunctionResponse"}:
+                extra_resp_keys = set(body.keys()) - {"functionCallId", "value", "error"}
+                if extra_resp_keys:
+                    _add_issue(
+                        errors,
+                        "UNKNOWN_ENVELOPE_FIELD",
+                        bidx,
+                        f"{mpath}.{env_key}",
+                        f"Unexpected {env_key} keys: {sorted(extra_resp_keys)}.",
+                    )
+                fn_call_id = body.get("functionCallId")
+                if not isinstance(fn_call_id, str) or not fn_call_id.strip():
+                    _add_issue(
+                        errors,
+                        "MISSING_FUNCTION_CALL_ID",
+                        bidx,
+                        f"{mpath}.{env_key}.functionCallId",
+                        f"{env_key} requires non-empty string 'functionCallId'.",
+                    )
+                has_value = "value" in body
+                has_error = "error" in body
+                if has_value == has_error:
+                    _add_issue(
+                        errors,
+                        "INVALID_FUNCTION_RESPONSE",
+                        bidx,
+                        f"{mpath}.{env_key}",
+                        f"{env_key} must specify exactly one of 'value' or 'error'.",
+                    )
+                if has_error:
+                    err_obj = body.get("error")
+                    if not isinstance(err_obj, dict):
+                        _add_issue(
+                            errors,
+                            "INVALID_FUNCTION_RESPONSE_ERROR",
+                            bidx,
+                            f"{mpath}.{env_key}.error",
+                            f"{env_key}.error must be an object with 'code' and 'message'.",
+                        )
+                    else:
+                        extra_err_keys = set(err_obj.keys()) - {"code", "message"}
+                        if extra_err_keys:
+                            _add_issue(
+                                errors,
+                                "UNKNOWN_ENVELOPE_FIELD",
+                                bidx,
+                                f"{mpath}.{env_key}.error",
+                                f"Unexpected {env_key}.error keys: {sorted(extra_err_keys)}.",
+                            )
+                        err_code = err_obj.get("code")
+                        if not isinstance(err_code, str) or not err_code.strip():
+                            _add_issue(
+                                errors,
+                                "INVALID_FUNCTION_RESPONSE_ERROR",
+                                bidx,
+                                f"{mpath}.{env_key}.error.code",
+                                f"{env_key}.error.code must be a non-empty string.",
+                            )
+                        err_msg = err_obj.get("message")
+                        if not isinstance(err_msg, str) or not err_msg.strip():
+                            _add_issue(
+                                errors,
+                                "INVALID_FUNCTION_RESPONSE_ERROR",
+                                bidx,
+                                f"{mpath}.{env_key}.error.message",
+                                f"{env_key}.error.message must be a non-empty string.",
+                            )
+
             elif env_key == "dataModelUpdate":
                 sid = body.get("surfaceId")
                 if not isinstance(sid, str) or not sid:
                     _add_issue(errors, "MISSING_SURFACE_ID", bidx, f"{mpath}.dataModelUpdate.surfaceId", "dataModelUpdate requires 'surfaceId'.")
+                else:
+                    ptr = body.get("path", "/")
+                    contents = body.get("contents")
+                    mutated = False
+                    if isinstance(contents, list):
+                        conv_val = _convert_v08_contents(contents)
+                        if ptr in {"", "/"}:
+                            dm = surface_data_models.setdefault(sid, {})
+                            dm.update(conv_val)
+                            mutated = True
+                        elif isinstance(ptr, str) and ptr.startswith("/"):
+                            dm = surface_data_models.setdefault(sid, {})
+                            _mutate_json_pointer(dm, ptr, conv_val)
+                            mutated = True
+                    elif "value" in body:
+                        if ptr in {"", "/"}:
+                            if body.get("value") is None:
+                                surface_data_models[sid] = {}
+                                mutated = True
+                            elif isinstance(body.get("value"), dict):
+                                surface_data_models[sid] = body["value"]
+                                mutated = True
+                        elif isinstance(ptr, str) and ptr.startswith("/"):
+                            dm = surface_data_models.setdefault(sid, {})
+                            _mutate_json_pointer(dm, ptr, body["value"])
+                            mutated = True
+                    if mutated and isinstance(ptr, str):
+                        _validate_streaming_data_update(sid, ptr)
 
             elif env_key == "deleteSurface":
                 sid = body.get("surfaceId")

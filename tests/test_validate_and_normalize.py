@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 
 from legends_a2ui.normalizer import normalize_payload
-from legends_a2ui.spec_registry import BROKEN_V09_CATALOG_ID, CANONICAL_V1_CATALOG_ID
+from legends_a2ui.spec_registry import (
+    BROKEN_V09_CATALOG_ID,
+    CANONICAL_V08_CATALOG_ID,
+    CANONICAL_V09_CATALOG_ID,
+    CANONICAL_V1_CATALOG_ID,
+)
 from legends_a2ui.validator import validate_payload
 
 
@@ -1359,6 +1365,386 @@ class TestValidateAndNormalize(unittest.TestCase):
         }
         res_icon_ok = validate_payload(json.dumps(icon_ok), version="1.0", strict=True)
         self.assertTrue(res_icon_ok["ok"], res_icon_ok["errors"])
+
+    def test_streaming_url_validation_performance_and_childlist_single_item(self) -> None:
+        """Streaming in-place URL checks avoid snapshot blowup and catch single-item ChildList mutations."""
+        # 1. Large dataModel (50k ints) + 1,000 unrelated updateDataModel lines stays well under 1s
+        head = json.dumps(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "perf_s",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Image", "url": {"@path": "/u"}}],
+                    "dataModel": {"u": "https://example.com/ok.png", "arr": [1] * 50000, "c": 0},
+                },
+            },
+            separators=(",", ":"),
+        )
+        updates = [
+            json.dumps(
+                {"version": "1.0", "updateDataModel": {"surfaceId": "perf_s", "path": "/c", "value": i % 2}},
+                separators=(",", ":"),
+            )
+            for i in range(1000)
+        ]
+        t0 = time.perf_counter()
+        res_perf = validate_payload("\n".join([head] + updates), version="1.0", strict=True)
+        elapsed = time.perf_counter() - t0
+        self.assertTrue(res_perf["ok"], res_perf["errors"])
+        self.assertLess(elapsed, 1.5, f"Streaming validation took too long: {elapsed:.3f}s")
+
+        # 2. Single-item ChildList mutation (/items/1/u and /items/-) catches unsafe URL even if later overwritten
+        single_item = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "cl_single",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/items"}},
+                        {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {"items": [{"u": "/a.png"}, {"u": "/b.png"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "cl_single",
+                    "path": "/items/1/u",
+                    "value": "javascript:alert(1)",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "cl_single",
+                    "path": "/items/1/u",
+                    "value": "/b_safe.png",
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "cl_single",
+                    "path": "/items/-",
+                    "value": {"u": "javascript:alert(2)"},
+                },
+            },
+        ]
+        res_single = validate_payload(json.dumps(single_item), version="1.0", strict=True)
+        self.assertFalse(res_single["ok"])
+        media_errs = [e for e in res_single["errors"] if e["code"] == "UNSAFE_MEDIA_URL"]
+        self.assertEqual(len(media_errs), 2)
+
+        # 3. Deferred ChildList template component arriving in updateComponents catches existing unsafe dataModel item
+        deferred_tpl = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "cl_defer",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/items"}},
+                    ],
+                    "dataModel": {"items": [{"u": "javascript:alert(1)"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "cl_defer",
+                    "components": [
+                        {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "cl_defer",
+                    "path": "/items/0/u",
+                    "value": "https://example.com/ok.png",
+                },
+            },
+        ]
+        res_defer = validate_payload(json.dumps(deferred_tpl), version="1.0", strict=True)
+        self.assertFalse(res_defer["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_defer["errors"]})
+
+    def test_formatstring_null_and_unresolved_empty_string_smuggling(self) -> None:
+        """Null or missing formatString placeholders evaluate to empty string and cannot smuggle //host or https:///."""
+        for dm in ({"seg": None}, {}):
+            smuggle_media = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "emp_media",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "/${/seg}/evil.example/x.png"}},
+                        }
+                    ],
+                    "dataModel": dm,
+                },
+            }
+            res_m = validate_payload(json.dumps(smuggle_media), version="1.0", strict=True)
+            self.assertFalse(res_m["ok"], f"Expected UNSAFE_MEDIA_URL for dataModel={dm}")
+            self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_m["errors"]})
+
+            smuggle_open = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "emp_open",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Button",
+                            "child": "lbl",
+                            "action": {
+                                "functionCall": {
+                                    "@call": "openUrl",
+                                    "args": {
+                                        "url": {
+                                            "@call": "formatString",
+                                            "args": {"value": "https://${/seg}/evil.example"},
+                                        }
+                                    },
+                                }
+                            },
+                        },
+                        {"id": "lbl", "component": "Text", "text": "Open"},
+                    ],
+                    "dataModel": dm,
+                },
+            }
+            res_o = validate_payload(json.dumps(smuggle_open), version="1.0", strict=True)
+            self.assertFalse(res_o["ok"], f"Expected UNSAFE_OPEN_URL for dataModel={dm}")
+            self.assertIn("UNSAFE_OPEN_URL", {e["code"] for e in res_o["errors"]})
+
+        # Safe path/query templates with unresolved placeholders and resolved host templates still pass
+        safe_templates = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "safe_tpl",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["img_rel", "img_host", "btn_path"]},
+                    {
+                        "id": "img_rel",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": "/assets/${/img}.png"}},
+                    },
+                    {
+                        "id": "img_host",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": "https://${/host}/logo.png"}},
+                    },
+                    {
+                        "id": "btn_path",
+                        "component": "Button",
+                        "child": "btn_lbl",
+                        "action": {
+                            "functionCall": {
+                                "@call": "openUrl",
+                                "args": {
+                                    "url": {
+                                        "@call": "formatString",
+                                        "args": {"value": "https://example.com/users/${/id}"},
+                                    }
+                                },
+                            }
+                        },
+                    },
+                    {"id": "btn_lbl", "component": "Text", "text": "Profile"},
+                ],
+                "dataModel": {"host": "cdn.example.com"},
+            },
+        }
+        res_safe = validate_payload(json.dumps(safe_templates), version="1.0", strict=True)
+        self.assertTrue(res_safe["ok"], res_safe["errors"])
+
+    def test_normalize_upgrades_legacy_component_and_function_catalog_ids(self) -> None:
+        """Normalizer upgrades legacy Basic Catalog URIs on components, FunctionCalls, and RPC envelopes."""
+        legacy_payload = [
+            {
+                "version": "0.9",
+                "createSurface": {
+                    "surfaceId": "leg_cat",
+                    "catalogId": BROKEN_V09_CATALOG_ID,
+                },
+            },
+            {
+                "version": "0.9",
+                "updateComponents": {
+                    "surfaceId": "leg_cat",
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["t_broken", "t_v09", "t_custom"]},
+                        {
+                            "id": "t_broken",
+                            "component": "Text",
+                            "catalogId": BROKEN_V09_CATALOG_ID,
+                            "text": {
+                                "call": "formatString",
+                                "catalogId": BROKEN_V09_CATALOG_ID,
+                                "args": {"value": "Hello"},
+                            },
+                        },
+                        {
+                            "id": "t_v09",
+                            "component": "Text",
+                            "catalogId": CANONICAL_V09_CATALOG_ID,
+                            "text": {
+                                "call": "formatString",
+                                "catalogId": CANONICAL_V08_CATALOG_ID,
+                                "args": {"value": "World"},
+                            },
+                        },
+                        {
+                            "id": "t_custom",
+                            "component": "CustomBadge",
+                            "catalogId": "https://acme.example/catalogs/ui/v1/catalog.json",
+                            "badgeText": "OK",
+                        },
+                    ],
+                },
+            },
+            {
+                "version": "0.9",
+                "callRendererFunction": {
+                    "functionCallId": "fc_r1",
+                    "callFunction": {
+                        "call": "formatNumber",
+                        "catalogId": BROKEN_V09_CATALOG_ID,
+                        "args": {"value": {"path": "/n"}},
+                    },
+                },
+            },
+            {
+                "version": "0.9",
+                "callAgentFunction": {
+                    "surfaceId": "leg_cat",
+                    "functionCallId": "fc_a1",
+                    "callFunction": {
+                        "call": "formatString",
+                        "catalogId": "basic",
+                        "args": {"value": "Done"},
+                    },
+                },
+            },
+        ]
+        norm = normalize_payload(json.dumps(legacy_payload), fmt="json")
+        self.assertTrue(norm["ok"], norm["validation"])
+        self.assertTrue(validate_payload(norm["formatted"], version="1.0", strict=True)["ok"])
+
+        comps = {c["id"]: c for c in norm["payload"][1]["updateComponents"]["components"]}
+        self.assertEqual(comps["t_broken"]["@catalogId"], CANONICAL_V1_CATALOG_ID)
+        self.assertEqual(comps["t_broken"]["text"]["@call"], "formatString")
+        self.assertEqual(comps["t_broken"]["text"]["catalogId"], CANONICAL_V1_CATALOG_ID)
+        self.assertEqual(comps["t_v09"]["@catalogId"], CANONICAL_V1_CATALOG_ID)
+        self.assertEqual(comps["t_v09"]["text"]["catalogId"], CANONICAL_V1_CATALOG_ID)
+        self.assertEqual(comps["t_custom"]["@catalogId"], "https://acme.example/catalogs/ui/v1/catalog.json")
+
+        rpc_r = norm["payload"][2]["callRendererFunction"]["callFunction"]
+        self.assertEqual(rpc_r["@call"], "formatNumber")
+        self.assertEqual(rpc_r["catalogId"], CANONICAL_V1_CATALOG_ID)
+        self.assertEqual(rpc_r["args"]["value"], {"@path": "/n"})
+
+        rpc_a = norm["payload"][3]["callAgentFunction"]["callFunction"]
+        self.assertEqual(rpc_a["@call"], "formatString")
+        self.assertEqual(rpc_a["catalogId"], CANONICAL_V1_CATALOG_ID)
+
+    def test_v1_icon_svgpath_catalog_id_types_and_function_response_envelopes(self) -> None:
+        """Icon.name.svgPath types, component/FunctionCall catalogId types, and FunctionResponse envelopes are strictly validated."""
+        # 1. Invalid Icon.name.svgPath values (int, null, arbitrary dict)
+        for bad_svg in (123, None, {"foo": "bar"}, []):
+            svg_payload = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "bad_svg",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Icon", "name": {"svgPath": bad_svg}}],
+                },
+            }
+            res_svg = validate_payload(json.dumps(svg_payload), version="1.0", strict=True)
+            self.assertFalse(res_svg["ok"], f"Expected INVALID_ICON_NAME for svgPath={bad_svg!r}")
+            self.assertIn("INVALID_ICON_NAME", {e["code"] for e in res_svg["errors"]})
+
+        # 2. Invalid component @catalogId and FunctionCall.catalogId types (int, empty string, null, list, dict)
+        for bad_cat in (123, "", None, [], {}):
+            bad_cat_payload = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "bad_cat_t",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Text",
+                            "@catalogId": bad_cat,
+                            "text": {"@call": "formatString", "catalogId": bad_cat, "args": {"value": "hi"}},
+                        }
+                    ],
+                },
+            }
+            res_cat = validate_payload(json.dumps(bad_cat_payload), version="1.0", strict=True)
+            self.assertFalse(res_cat["ok"], f"Expected INVALID_CATALOG_ID for catalogId={bad_cat!r}")
+            cat_errs = [e for e in res_cat["errors"] if e["code"] == "INVALID_CATALOG_ID"]
+            self.assertEqual(len(cat_errs), 2)
+
+        # 3. Valid agentFunctionResponse and rendererFunctionResponse envelopes
+        valid_resps = [
+            {"version": "1.0", "agentFunctionResponse": {"functionCallId": "fc_1", "value": None}},
+            {"version": "1.0", "rendererFunctionResponse": {"functionCallId": "fc_2", "value": {"ok": True}}},
+            {
+                "version": "1.0",
+                "agentFunctionResponse": {
+                    "functionCallId": "fc_3",
+                    "error": {"code": "TIMEOUT", "message": "Function timed out."},
+                },
+            },
+        ]
+        res_ok_resp = validate_payload(json.dumps(valid_resps), version="1.0", strict=True)
+        self.assertTrue(res_ok_resp["ok"], res_ok_resp["errors"])
+
+        # 4. Invalid FunctionResponse envelopes (empty, both value+error, extra key, invalid error object)
+        bad_resps = [
+            {"version": "1.0", "agentFunctionResponse": {}},
+            {
+                "version": "1.0",
+                "rendererFunctionResponse": {
+                    "functionCallId": "fc_both",
+                    "value": 1,
+                    "error": {"code": "ERR", "message": "msg"},
+                },
+            },
+            {
+                "version": "1.0",
+                "agentFunctionResponse": {
+                    "functionCallId": "fc_extra",
+                    "value": "ok",
+                    "unexpected": True,
+                },
+            },
+            {
+                "version": "1.0",
+                "rendererFunctionResponse": {
+                    "functionCallId": "fc_bad_err",
+                    "error": {"code": "", "message": 123, "extra": 1},
+                },
+            },
+        ]
+        res_bad_resp = validate_payload(json.dumps(bad_resps), version="1.0", strict=True)
+        self.assertFalse(res_bad_resp["ok"])
+        resp_codes = {e["code"] for e in res_bad_resp["errors"]}
+        self.assertIn("MISSING_FUNCTION_CALL_ID", resp_codes)
+        self.assertIn("INVALID_FUNCTION_RESPONSE", resp_codes)
+        self.assertIn("UNKNOWN_ENVELOPE_FIELD", resp_codes)
+        self.assertIn("INVALID_FUNCTION_RESPONSE_ERROR", resp_codes)
 
 
 if __name__ == "__main__":
