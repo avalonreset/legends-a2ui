@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from legends_a2ui.net_safety import ensure_within_base
 from legends_a2ui.resources import get_vendor_dir, get_wiki_dir
 from legends_a2ui.spec_registry import (
     PINNED_UPSTREAM_COMMIT,
@@ -171,20 +172,24 @@ def search_docs(
     docs: list[dict[str, Any]] = []
     if vdir.is_dir():
         for path in sorted(vdir.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in {".md", ".json"}:
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() not in {".md", ".json"}:
                 continue
             if path.name == "manifest.json":
                 continue
-            rel = path.relative_to(vdir).as_posix()
+            try:
+                resolved = ensure_within_base(path, vdir)
+            except Exception:
+                continue
+            rel = resolved.relative_to(vdir).as_posix()
             display_rel = f"vendor/a2ui-spec/{rel}"
             if not _file_matches_version(display_rel, version):
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = resolved.read_text(encoding="utf-8", errors="replace")
             docs.append(
                 {
                     "source": "vendor",
                     "localPath": display_rel,
-                    "absolutePath": str(path),
+                    "absolutePath": str(resolved),
                     "upstreamPath": upstream_map.get(rel),
                     "lines": text.splitlines(),
                     "lower": text.lower(),
@@ -193,15 +198,19 @@ def search_docs(
 
     if wdir.is_dir():
         for path in sorted(wdir.rglob("*.md")):
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
-            rel = f"wiki/{path.relative_to(wdir).as_posix()}"
-            text = path.read_text(encoding="utf-8", errors="replace")
+            try:
+                resolved = ensure_within_base(path, wdir)
+            except Exception:
+                continue
+            rel = f"wiki/{resolved.relative_to(wdir).as_posix()}"
+            text = resolved.read_text(encoding="utf-8", errors="replace")
             docs.append(
                 {
                     "source": "wiki",
                     "localPath": rel,
-                    "absolutePath": str(path),
+                    "absolutePath": str(resolved),
                     "upstreamPath": None,
                     "lines": text.splitlines(),
                     "lower": text.lower(),

@@ -12,6 +12,28 @@ A2UI_FENCE_LANGS = frozenset({"a2ui", "a2ui-json", "a2ui-jsonl"})
 _FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*([^\s`~]*)(.*)$")
 
 
+def _reject_nonstandard_json_constant(token: str) -> Any:
+    raise ValueError(f"Non-standard JSON constant '{token}' is disallowed.")
+
+
+def loads_strict_json(
+    raw_text: str,
+    *,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+) -> Any:
+    """Parse strict RFC 8259 JSON with byte/depth bounds and NaN/Infinity refusal."""
+    encoded_len = len(raw_text.encode("utf-8"))
+    if encoded_len > max_bytes:
+        raise ValueError(f"Input size ({encoded_len} bytes) exceeds max_bytes ({max_bytes}).")
+    if _check_raw_nesting_depth(raw_text, max_depth) > max_depth:
+        raise ValueError(f"JSON nesting depth exceeded max_depth ({max_depth}).")
+    parsed = json.loads(raw_text, parse_constant=_reject_nonstandard_json_constant)
+    if _measure_object_depth(parsed, max_depth) > max_depth:
+        raise ValueError(f"JSON nesting depth exceeded max_depth ({max_depth}).")
+    return parsed
+
+
 def _check_raw_nesting_depth(raw_text: str, max_depth: int) -> int:
     """Fast linear bracket/brace depth pre-scan before json.loads (prevents RecursionError)."""
     depth = 0
@@ -194,7 +216,7 @@ def _parse_single_block(
 
     # Try full JSON parse first.
     try:
-        parsed = json.loads(trimmed)
+        parsed = json.loads(trimmed, parse_constant=_reject_nonstandard_json_constant)
         if _measure_object_depth(parsed, max_depth) > max_depth:
             return {
                 "blockIndex": block_index,
@@ -253,7 +275,7 @@ def _parse_single_block(
     ]
     for offset, line_str in non_empty_lines:
         try:
-            item = json.loads(line_str)
+            item = json.loads(line_str, parse_constant=_reject_nonstandard_json_constant)
             if _measure_object_depth(item, max_depth) > max_depth:
                 line_errors.append(
                     {

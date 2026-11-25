@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import re
 from typing import Any
-import unicodedata
 from urllib.parse import urlsplit
 
 from legends_a2ui.net_safety import ensure_within_base
@@ -26,13 +25,9 @@ CATALOG_RELATIVE_PATHS = {
     "0.8": "v0_8/json/standard_catalog_definition.json",
 }
 
-_U_START_CATEGORIES = frozenset({"Lu", "Ll", "Lt", "Lm", "Lo", "Nl"})
-_U_CONT_CATEGORIES = _U_START_CATEGORIES | frozenset({"Mn", "Mc", "Nd", "Pc"})
-
-_SAFE_DATA_MEDIA_PREFIXES = (
-    "data:image/",
-    "data:audio/",
-    "data:video/",
+_SAFE_DATA_MEDIA_RE = re.compile(
+    r"^data:(?:image/(?:png|jpeg|jpg|gif|webp|avif|bmp)|(?:audio|video)/[a-z0-9.+-]+)[;,]",
+    re.IGNORECASE,
 )
 
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -40,11 +35,18 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("stripe_restricted_key", re.compile(r"\brk_live_[A-Za-z0-9]{12,}\b")),
     ("stripe_webhook_secret", re.compile(r"\bwhsec_[A-Za-z0-9]{12,}\b")),
     ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("github_fine_grained_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
+    ("openai_project_key", re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b")),
+    ("openai_service_account_key", re.compile(r"\bsk-svcacct-[A-Za-z0-9_-]{20,}\b")),
+    ("anthropic_api_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
     (
         "private_key_pem",
-        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA |ENCRYPTED |PGP )?PRIVATE KEY-----"),
     ),
     ("aws_access_key_id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("aws_temp_access_key_id", re.compile(r"\bASIA[0-9A-Z]{16}\b")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
     (
         "aws_secret_assignment",
         re.compile(r"(?i)\bAWS_SECRET_ACCESS_KEY\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{16,}"),
@@ -67,20 +69,16 @@ _CATALOG_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def is_uax31_start(ch: str) -> bool:
-    return ch == "_" or unicodedata.category(ch) in _U_START_CATEGORIES
+    return isinstance(ch, str) and len(ch) == 1 and ch.isidentifier()
 
 
 def is_uax31_continue(ch: str) -> bool:
-    return ch == "_" or unicodedata.category(ch) in _U_CONT_CATEGORIES
+    return isinstance(ch, str) and len(ch) == 1 and f"a{ch}".isidentifier()
 
 
 def is_valid_uax31_id(value: str) -> bool:
-    """Validate Unicode UAX #31 identifier syntax using stdlib unicodedata."""
-    if not isinstance(value, str) or not value:
-        return False
-    if not is_uax31_start(value[0]):
-        return False
-    return all(is_uax31_continue(ch) for ch in value[1:])
+    """Validate Unicode UAX #31 identifier syntax via Python's str.isidentifier()."""
+    return isinstance(value, str) and bool(value) and value.isidentifier()
 
 
 def sanitize_uax31_id(raw: str) -> str:
@@ -135,15 +133,19 @@ def validate_media_url(raw_url: str) -> tuple[bool, str | None]:
         if not rest.startswith("//"):
             return False, f"{scheme}: media URL must include // and a host."
         parsed = urlsplit(trimmed)
-        if not parsed.netloc or any(ch.isspace() for ch in parsed.netloc):
+        if not parsed.netloc or not parsed.hostname or any(ch.isspace() for ch in parsed.netloc):
             return False, f"{scheme}: media URL must include a valid non-empty host."
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            return False, f"{scheme}: media URL must not contain userinfo credentials."
         return True, None
 
     if scheme == "data":
-        lowered = trimmed.lower()
-        if any(lowered.startswith(prefix) for prefix in _SAFE_DATA_MEDIA_PREFIXES):
+        if _SAFE_DATA_MEDIA_RE.match(trimmed):
             return True, None
-        return False, "data: media URLs must declare an image/, audio/, or video/ media type."
+        return (
+            False,
+            "data: media URLs must declare a safe raster image/ (png, jpeg, jpg, gif, webp, avif, bmp), audio/, or video/ media type.",
+        )
 
     return False, f"Disallowed media URL scheme: {scheme}:"
 
@@ -172,8 +174,10 @@ def validate_open_url(raw_url: str) -> tuple[bool, str | None]:
         if not rest.startswith("//"):
             return False, f"{scheme}: openUrl target must include // and a host."
         parsed = urlsplit(trimmed)
-        if not parsed.netloc or any(ch.isspace() for ch in parsed.netloc):
+        if not parsed.netloc or not parsed.hostname or any(ch.isspace() for ch in parsed.netloc):
             return False, f"{scheme}: openUrl target must include a valid host."
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            return False, f"{scheme}: openUrl target must not contain userinfo credentials."
         return True, None
     if scheme == "mailto":
         if not rest.strip() or "@" not in rest:

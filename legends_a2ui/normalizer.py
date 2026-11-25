@@ -42,11 +42,11 @@ _V08_LITERAL_KEYS = ("literalString", "literalNumber", "literalBoolean", "litera
 def format_a2ui_messages(messages: list[dict[str, Any]], fmt: str = "json") -> str:
     """Format A2UI v1.0 messages as json, jsonl, or markdown-fence."""
     if fmt == "json":
-        return json.dumps(messages, indent=2) + "\n"
+        return json.dumps(messages, indent=2, allow_nan=False) + "\n"
     if fmt == "jsonl":
-        return "\n".join(json.dumps(m, separators=(",", ":")) for m in messages) + "\n"
+        return "\n".join(json.dumps(m, separators=(",", ":"), allow_nan=False) for m in messages) + "\n"
     if fmt == "markdown-fence":
-        return "```a2ui\n" + json.dumps(messages, indent=2) + "\n```\n"
+        return "```a2ui\n" + json.dumps(messages, indent=2, allow_nan=False) + "\n```\n"
     raise ValueError(f"Unsupported output format: {fmt}")
 
 
@@ -113,7 +113,14 @@ def _upgrade_dynamic_value(val: Any, changes: list[str]) -> Any:
             }
         return upgraded
 
-    return {k: _upgrade_dynamic_value(v, changes) for k, v in val.items()}
+    out_dict: dict[str, Any] = {}
+    for k, v in val.items():
+        new_k = k
+        if isinstance(k, str) and k.startswith("@") and not k.startswith("@@"):
+            new_k = f"@{k}"
+            changes.append(f"escaped literal dynamic key '{k}' -> '{new_k}'")
+        out_dict[new_k] = _upgrade_dynamic_value(v, changes)
+    return out_dict
 
 
 def _upgrade_action(action: Any, changes: list[str]) -> Any:
@@ -382,12 +389,6 @@ def _normalize_component(raw_comp: dict[str, Any], changes: list[str]) -> dict[s
             comp["variant"] = "body"
             changes.append("coerced unknown Text.variant -> body")
 
-    # Ensure TextField.value exists in v1.0
-    if ctype == "TextField" and "value" not in comp:
-        cid = sanitize_uax31_id(str(comp.get("id", "field")))
-        comp["value"] = {"@path": f"/{cid}"}
-        changes.append(f"synthesized TextField.value binding /'{cid}'")
-
     return comp
 
 
@@ -632,18 +633,22 @@ def normalize_payload(
             surface_comp_lists.setdefault(sid, []).append(msg["updateComponents"]["components"])
 
     for sid, comp_lists in surface_comp_lists.items():
-        all_ids: list[str] = []
+        raw_ids: list[str] = []
         for clist in comp_lists:
             for c in clist:
                 if isinstance(c.get("id"), str):
-                    all_ids.append(c["id"])
+                    raw_ids.append(c["id"])
+        # Deduplicate per surface so incremental updateComponents replacements
+        # map deterministically to the same UAX #31 identifier.
+        all_ids = list(dict.fromkeys(raw_ids))
+        all_ids_set = set(all_ids)
 
         id_map: dict[str, str] = {}
         used: set[str] = set()
 
         # Remap v0.8 custom root ID -> "root" if "root" is not already present
         v08_root = v08_roots.get(sid)
-        if v08_root and v08_root != "root" and "root" not in all_ids and v08_root in all_ids:
+        if v08_root and v08_root != "root" and "root" not in all_ids_set and v08_root in all_ids_set:
             id_map[v08_root] = "root"
             used.add("root")
             changes.append(f"remapped v0.8 root '{v08_root}' -> 'root'")
@@ -657,7 +662,7 @@ def normalize_payload(
             cand = sanitize_uax31_id(raw_id)
             unique = cand
             suffix = 2
-            while unique in used or (unique in all_ids and unique != raw_id):
+            while unique in used or (unique in all_ids_set and unique != raw_id):
                 unique = f"{cand}_{suffix}"
                 suffix += 1
             used.add(unique)
@@ -669,10 +674,29 @@ def normalize_payload(
             for clist in comp_lists:
                 for idx, comp in enumerate(clist):
                     clist[idx] = _remap_component_ids(comp, id_map)
+            for msg in ensured_msgs:
+                act = msg.get("action")
+                if (
+                    isinstance(act, dict)
+                    and act.get("surfaceId") == sid
+                    and isinstance(act.get("sourceComponentId"), str)
+                    and act["sourceComponentId"] in id_map
+                ):
+                    old_src = act["sourceComponentId"]
+                    act["sourceComponentId"] = id_map[old_src]
+                    changes.append(f"remapped action.sourceComponentId '{old_src}' -> '{act['sourceComponentId']}'")
+
+        # Synthesize missing TextField.value after final UAX #31 ID remapping
+        for clist in comp_lists:
+            for comp in clist:
+                if comp.get("component") == "TextField" and "value" not in comp:
+                    final_id = str(comp.get("id") or "field")
+                    comp["value"] = {"@path": f"/{final_id}"}
+                    changes.append(f"synthesized TextField.value binding '/{final_id}'")
 
     formatted = format_a2ui_messages(ensured_msgs, fmt)
     strict_check = validate_payload(
-        json.dumps(ensured_msgs),
+        json.dumps(ensured_msgs, allow_nan=False),
         extract_markdown=False,
         version="1.0",
         strict=True,

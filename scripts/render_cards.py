@@ -215,7 +215,7 @@ def render_slot_3() -> None:
         (
             "03",
             '"Preview card without a server"',
-            'compose <tspan fill="#ff0000">→</tspan> preview --theme noir <tspan fill="#ff0000">→</tspan> file:// HTML',
+            'compose <tspan fill="#ff0000">→</tspan> preview --theme precision-noir <tspan fill="#ff0000">→</tspan> file:// HTML',
         ),
         (
             "04",

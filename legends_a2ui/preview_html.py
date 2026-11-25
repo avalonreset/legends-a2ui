@@ -18,19 +18,30 @@ STRICT_CSP = (
 
 def _safe_embed_json(obj: Any) -> str:
     """Serialize JSON safely for <script type='application/json'> (prevents CWE-79 breakout)."""
-    raw = json.dumps(obj, indent=2, ensure_ascii=True)
-    return raw.replace("</", "<\\/").replace("<!--", "<\\!--")
+    raw = json.dumps(obj, indent=2, ensure_ascii=True, allow_nan=False)
+    return raw.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 _PREVIEW_CSS = """
 :root {
+  color-scheme: dark;
+  accent-color: #9e0b1a;
   --pn-font: 'legends', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --pn-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   --pn-r-1: 2px;
   --pn-r-2: 4px;
   --pn-r-3: 6px;
 }
+html[data-theme="precision-noir"] {
+  color-scheme: dark;
+}
+html[data-theme="light"] {
+  color-scheme: light;
+}
 * { box-sizing: border-box; }
+input, textarea, select {
+  accent-color: #9e0b1a;
+}
 html, body {
   margin: 0;
   padding: 0;
@@ -41,6 +52,7 @@ html, body {
   -webkit-font-smoothing: antialiased;
 }
 body.a2ui-dark {
+  color-scheme: dark;
   background: #000000;
   color: #d4d4d8;
   --bg-shell: #07090b;
@@ -61,6 +73,7 @@ body.a2ui-dark {
   --danger-text: #f2555f;
 }
 body.a2ui-light {
+  color-scheme: light;
   background: #f4f4f6;
   color: #27272a;
   --bg-shell: #ffffff;
@@ -394,6 +407,29 @@ _PREVIEW_JS = r"""
   const surfaces = new Map();
   let showingSource = false;
   const actionLogs = [];
+  let reactiveUpdaters = [];
+  const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+  function hasOwn(obj, key) {
+    return obj !== null && typeof obj === "object" && Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  function sanitizePlainValue(v) {
+    if (v === null || typeof v !== "object") return v;
+    if (Array.isArray(v)) return v.map(sanitizePlainValue);
+    const out = Object.create(null);
+    for (const k of Object.keys(v)) {
+      if (FORBIDDEN_KEYS.has(k)) continue;
+      out[k] = sanitizePlainValue(v[k]);
+    }
+    return out;
+  }
+
+  function refreshReactiveBindings() {
+    for (const fn of reactiveUpdaters) {
+      try { fn(); } catch (_err) {}
+    }
+  }
 
   function escapeHtml(str) {
     return String(str)
@@ -404,6 +440,15 @@ _PREVIEW_JS = r"""
       .replace(/'/g, "&#39;");
   }
 
+  function hasValidAuthority(rest) {
+    if (!rest.startsWith("//")) return false;
+    const afterSlashes = rest.slice(2);
+    const cut = afterSlashes.search(/[/?#]/);
+    const authority = cut === -1 ? afterSlashes : afterSlashes.slice(0, cut);
+    if (!authority || /\s/.test(authority) || authority.includes("@")) return false;
+    return true;
+  }
+
   function isSafeMediaUrl(url) {
     if (typeof url !== "string") return false;
     if (/[\x00-\x1f\x7f]/.test(url)) return false;
@@ -411,12 +456,14 @@ _PREVIEW_JS = r"""
     if (!t) return false;
     const norm = t.replace(/\\/g, "/");
     if (norm.startsWith("//")) return false;
-    if (t.startsWith("/")) return true;
+    if (t.startsWith("/") && !t.startsWith("/\\")) return true;
     const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/.exec(t);
     if (!m) return false;
     const scheme = m[1].toLowerCase();
-    if (scheme === "http" || scheme === "https") return m[2].startsWith("//");
-    if (scheme === "data") return /^data:(image|audio|video)\//i.test(t);
+    if (scheme === "http" || scheme === "https") return hasValidAuthority(m[2]);
+    if (scheme === "data") {
+      return /^data:(?:image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)|(?:audio|video)\/[a-z0-9.+-]+)[;,]/i.test(t);
+    }
     return false;
   }
 
@@ -424,11 +471,13 @@ _PREVIEW_JS = r"""
     if (typeof url !== "string") return false;
     if (/[\x00-\x1f\x7f]/.test(url)) return false;
     const t = url.trim();
+    const norm = t.replace(/\\/g, "/");
+    if (norm.startsWith("//")) return false;
     const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/.exec(t);
     if (!m) return false;
     const scheme = m[1].toLowerCase();
-    if (scheme === "http" || scheme === "https") return m[2].startsWith("//");
-    if (scheme === "mailto") return m[2].includes("@");
+    if (scheme === "http" || scheme === "https") return hasValidAuthority(m[2]);
+    if (scheme === "mailto") return m[2].trim().length > 0 && m[2].includes("@");
     return false;
   }
 
@@ -439,15 +488,26 @@ _PREVIEW_JS = r"""
     let inList = false;
 
     function inlineFmt(line) {
+      const tokens = [];
+      function stash(frag) {
+        const key = "\uE000" + tokens.length + "\uE001";
+        tokens.push(frag);
+        return key;
+      }
       let s = line;
-      s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+      s = s.replace(/`([^`]+)`/g, function (_m, code) {
+        return stash("<code>" + code + "</code>");
+      });
+      s = s.replace(/(^|[^\\])\[([^\[\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, function (_m, lead, label, href) {
+        if (isSafeOpenUrl(href)) {
+          return lead + stash('<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + "</a>");
+        }
+        return lead + label;
+      });
       s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-      s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (_m, label, href) {
-        if (isSafeOpenUrl(href)) {
-          return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
-        }
-        return label;
+      s = s.replace(/\uE000(\d+)\uE001/g, function (_m, idx) {
+        return tokens[Number(idx)] || "";
       });
       return s;
     }
@@ -475,18 +535,24 @@ _PREVIEW_JS = r"""
   }
 
   function getByPointer(root, pointer, itemCtx) {
-    if (typeof pointer !== "string") return undefined;
+    if (typeof pointer !== "string" || !pointer) return undefined;
     if (!pointer.startsWith("/")) {
-      if (itemCtx && typeof itemCtx === "object" && pointer in itemCtx) {
-        return itemCtx[pointer];
+      if (!itemCtx || typeof itemCtx !== "object") return undefined;
+      const relParts = pointer.split("/").map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+      let cur = itemCtx;
+      for (const part of relParts) {
+        if (FORBIDDEN_KEYS.has(part)) return undefined;
+        if (cur && typeof cur === "object" && hasOwn(cur, part)) cur = cur[part];
+        else return undefined;
       }
-      return undefined;
+      return cur;
     }
     if (pointer === "/") return root;
     const parts = pointer.slice(1).split("/").map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
     let cur = root;
     for (const part of parts) {
-      if (cur && typeof cur === "object" && part in cur) cur = cur[part];
+      if (FORBIDDEN_KEYS.has(part)) return undefined;
+      if (cur && typeof cur === "object" && hasOwn(cur, part)) cur = cur[part];
       else return undefined;
     }
     return cur;
@@ -494,14 +560,29 @@ _PREVIEW_JS = r"""
 
   function setByPointer(root, pointer, value) {
     if (typeof pointer !== "string" || !pointer.startsWith("/")) return;
+    if (pointer === "/") return;
     const parts = pointer.slice(1).split("/").map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+    if (parts.some((p) => FORBIDDEN_KEYS.has(p))) return;
     let cur = root;
     for (let i = 0; i < parts.length - 1; i += 1) {
       const key = parts[i];
-      if (!cur[key] || typeof cur[key] !== "object") cur[key] = {};
+      if (!hasOwn(cur, key) || !cur[key] || typeof cur[key] !== "object") {
+        if (value === null) return;
+        cur[key] = Object.create(null);
+      }
       cur = cur[key];
     }
-    cur[parts[parts.length - 1]] = value;
+    const lastKey = parts[parts.length - 1];
+    if (value === null) {
+      if (Array.isArray(cur)) {
+        const idx = Number(lastKey);
+        if (Number.isInteger(idx) && idx >= 0 && idx < cur.length) cur.splice(idx, 1);
+      } else if (cur && typeof cur === "object" && hasOwn(cur, lastKey)) {
+        delete cur[lastKey];
+      }
+    } else if (cur && typeof cur === "object") {
+      cur[lastKey] = sanitizePlainValue(value);
+    }
   }
 
   function resolveDynamic(val, dataModel, itemCtx) {
@@ -539,6 +620,23 @@ _PREVIEW_JS = r"""
           if (typeof args.max === "number" && v > args.max) return false;
           return true;
         }
+        if (fn === "regex" && typeof args.pattern === "string") {
+          try {
+            const v = String(resolveDynamic(args.value, dataModel, itemCtx) || "");
+            return new RegExp(args.pattern, "u").test(v);
+          } catch (_err) {
+            return false;
+          }
+        }
+        if (fn === "and" && Array.isArray(args.values)) {
+          return args.values.every((x) => Boolean(resolveDynamic(x, dataModel, itemCtx)));
+        }
+        if (fn === "or" && Array.isArray(args.values)) {
+          return args.values.some((x) => Boolean(resolveDynamic(x, dataModel, itemCtx)));
+        }
+        if (fn === "not") {
+          return !Boolean(resolveDynamic(args.value, dataModel, itemCtx));
+        }
         return true;
       }
     }
@@ -566,9 +664,12 @@ _PREVIEW_JS = r"""
       surfaces.set(cs.surfaceId, {
         id: cs.surfaceId,
         components: comps,
-        dataModel: cs.dataModel ? JSON.parse(JSON.stringify(cs.dataModel)) : {},
-        tabState: {},
-        modalState: {},
+        dataModel:
+          cs.dataModel && typeof cs.dataModel === "object" && !Array.isArray(cs.dataModel)
+            ? sanitizePlainValue(cs.dataModel)
+            : Object.create(null),
+        tabState: Object.create(null),
+        modalState: Object.create(null),
       });
     } else if (msg.updateComponents) {
       const uc = msg.updateComponents;
@@ -581,8 +682,10 @@ _PREVIEW_JS = r"""
       const s = surfaces.get(udm.surfaceId);
       if (s) {
         if (!udm.path || udm.path === "/") {
-          if (udm.value && typeof udm.value === "object") {
-            Object.assign(s.dataModel, udm.value);
+          if (udm.value === null) {
+            s.dataModel = Object.create(null);
+          } else if (udm.value && typeof udm.value === "object" && !Array.isArray(udm.value)) {
+            s.dataModel = sanitizePlainValue(udm.value);
           }
         } else {
           setByPointer(s.dataModel, udm.path, udm.value);
@@ -609,17 +712,28 @@ _PREVIEW_JS = r"""
     }
 
     function appendChecks(container) {
-      if (!Array.isArray(comp["@checks"])) return;
-      for (const rule of comp["@checks"]) {
-        const res = resolveDynamic(rule.condition, dm, itemCtx);
-        const passed = typeof res === "object" && res !== null ? Boolean(res.valid) : Boolean(res);
-        if (!passed) {
-          const err = document.createElement("div");
-          err.className = "a2ui-check-error";
-          err.textContent = rule.message || "Validation check failed.";
-          container.appendChild(err);
+      if (!Array.isArray(comp["@checks"]) || comp["@checks"].length === 0) return;
+      const slot = document.createElement("div");
+      slot.className = "a2ui-checks-slot";
+      function updateChecks() {
+        slot.innerHTML = "";
+        for (const rule of comp["@checks"]) {
+          const res = resolveDynamic(rule.condition, surface.dataModel, itemCtx);
+          const passed =
+            typeof res === "object" && res !== null && hasOwn(res, "valid")
+              ? Boolean(res.valid)
+              : Boolean(res);
+          if (!passed) {
+            const err = document.createElement("div");
+            err.className = "a2ui-check-error";
+            err.textContent = rule.message || "Validation check failed.";
+            slot.appendChild(err);
+          }
         }
       }
+      updateChecks();
+      reactiveUpdaters.push(updateChecks);
+      container.appendChild(slot);
     }
 
     function renderChildList(childrenSpec, parentEl) {
@@ -674,8 +788,14 @@ _PREVIEW_JS = r"""
     if (type === "Text") {
       const el = document.createElement("div");
       el.className = "a2ui-text " + (comp.variant === "caption" ? "caption" : "body");
-      const val = resolveDynamic(comp.text, dm, itemCtx);
-      el.innerHTML = renderSafeMarkdown(val === undefined ? "" : String(val));
+      function updateText() {
+        const val = resolveDynamic(comp.text, surface.dataModel, itemCtx);
+        el.innerHTML = renderSafeMarkdown(val === undefined ? "" : String(val));
+      }
+      updateText();
+      if (comp.text && typeof comp.text === "object") {
+        reactiveUpdaters.push(updateText);
+      }
       return applyWeight(el);
     }
 
@@ -850,7 +970,8 @@ _PREVIEW_JS = r"""
       input.value = curVal === undefined || curVal === null ? "" : String(curVal);
       input.addEventListener("input", (e) => {
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(dm, comp.value["@path"], e.target.value);
+          setByPointer(surface.dataModel, comp.value["@path"], e.target.value);
+          refreshReactiveBindings();
         }
       });
       wrap.appendChild(input);
@@ -868,7 +989,8 @@ _PREVIEW_JS = r"""
       cb.checked = Boolean(resolveDynamic(comp.value, dm, itemCtx));
       cb.addEventListener("change", (e) => {
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(dm, comp.value["@path"], e.target.checked);
+          setByPointer(surface.dataModel, comp.value["@path"], e.target.checked);
+          refreshReactiveBindings();
         }
       });
       const txt = document.createElement("span");
@@ -895,11 +1017,11 @@ _PREVIEW_JS = r"""
 
       function drawOptions() {
         optionsBox.innerHTML = "";
-        const selected = Array.isArray(resolveDynamic(comp.value, dm, itemCtx))
-          ? resolveDynamic(comp.value, dm, itemCtx)
+        const selected = Array.isArray(resolveDynamic(comp.value, surface.dataModel, itemCtx))
+          ? resolveDynamic(comp.value, surface.dataModel, itemCtx)
           : [];
         for (const opt of comp.options || []) {
-          const optLabel = String(resolveDynamic(opt.label, dm, itemCtx) || opt.value);
+          const optLabel = String(resolveDynamic(opt.label, surface.dataModel, itemCtx) || opt.value);
           if (filterText && !optLabel.toLowerCase().includes(filterText)) continue;
           const isSel = selected.includes(opt.value);
           if (comp.displayStyle === "chips") {
@@ -912,9 +1034,10 @@ _PREVIEW_JS = r"""
                 ? (isSel ? selected.filter((x) => x !== opt.value) : [...selected, opt.value])
                 : [opt.value];
               if (comp.value && typeof comp.value["@path"] === "string") {
-                setByPointer(dm, comp.value["@path"], next);
+                setByPointer(surface.dataModel, comp.value["@path"], next);
               }
               drawOptions();
+              refreshReactiveBindings();
             });
             optionsBox.appendChild(chip);
           } else {
@@ -929,9 +1052,10 @@ _PREVIEW_JS = r"""
                 ? (inp.checked ? [...selected, opt.value] : selected.filter((x) => x !== opt.value))
                 : [opt.value];
               if (comp.value && typeof comp.value["@path"] === "string") {
-                setByPointer(dm, comp.value["@path"], next);
+                setByPointer(surface.dataModel, comp.value["@path"], next);
               }
               drawOptions();
+              refreshReactiveBindings();
             });
             const sp = document.createElement("span");
             sp.textContent = optLabel;
@@ -980,7 +1104,8 @@ _PREVIEW_JS = r"""
         const num = Number(e.target.value);
         lbl.textContent = baseText + ": " + num;
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(dm, comp.value["@path"], num);
+          setByPointer(surface.dataModel, comp.value["@path"], num);
+          refreshReactiveBindings();
         }
       });
       wrap.appendChild(lbl);
@@ -1006,7 +1131,8 @@ _PREVIEW_JS = r"""
       inp.value = cur ? String(cur) : "";
       inp.addEventListener("change", (e) => {
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(dm, comp.value["@path"], e.target.value);
+          setByPointer(surface.dataModel, comp.value["@path"], e.target.value);
+          refreshReactiveBindings();
         }
       });
       wrap.appendChild(inp);
@@ -1018,6 +1144,7 @@ _PREVIEW_JS = r"""
   }
 
   function renderAll() {
+    reactiveUpdaters = [];
     surfaceMount.innerHTML = "";
     const ids = Array.from(surfaces.keys());
     surfaceLabel.textContent = ids.length ? ids.join(", ") : "none";
@@ -1028,6 +1155,25 @@ _PREVIEW_JS = r"""
     }
   }
 
+  const initialThemeMode = document.documentElement.getAttribute("data-theme-mode") || "precision-noir";
+  let manualThemeOverride = false;
+  function applyTheme(mode) {
+    const isLight = mode === "light";
+    document.body.classList.toggle("a2ui-dark", !isLight);
+    document.body.classList.toggle("a2ui-light", isLight);
+    document.documentElement.setAttribute("data-theme", isLight ? "light" : "precision-noir");
+    if (toggleThemeBtn) toggleThemeBtn.textContent = isLight ? "Dark" : "Light";
+  }
+  if (initialThemeMode === "auto" && typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    const mq = window.matchMedia("(prefers-color-scheme: light)");
+    applyTheme(mq.matches ? "light" : "precision-noir");
+    const onSchemeChange = (e) => {
+      if (!manualThemeOverride) applyTheme(e.matches ? "light" : "precision-noir");
+    };
+    if (typeof mq.addEventListener === "function") mq.addEventListener("change", onSchemeChange);
+    else if (typeof mq.addListener === "function") mq.addListener(onSchemeChange);
+  }
+
   sourceView.textContent = JSON.stringify(messages, null, 2);
   toggleSourceBtn.addEventListener("click", () => {
     showingSource = !showingSource;
@@ -1036,10 +1182,9 @@ _PREVIEW_JS = r"""
     toggleSourceBtn.textContent = showingSource ? "UI" : "JSON";
   });
   toggleThemeBtn.addEventListener("click", () => {
+    manualThemeOverride = true;
     const isDark = document.body.classList.contains("a2ui-dark");
-    document.body.classList.toggle("a2ui-dark", !isDark);
-    document.body.classList.toggle("a2ui-light", isDark);
-    toggleThemeBtn.textContent = isDark ? "Dark" : "Light";
+    applyTheme(isDark ? "light" : "precision-noir");
   });
   clearLogBtn.addEventListener("click", () => {
     actionLogs.length = 0;
@@ -1068,13 +1213,15 @@ def render_preview_html(
             "changesApplied": norm["changesApplied"],
         }
 
-    body_class = "a2ui-light" if theme == "light" else "a2ui-dark"
-    toggle_label = "Dark" if theme == "light" else "Light"
+    theme_mode = theme if theme in {"precision-noir", "light", "auto"} else "precision-noir"
+    body_class = "a2ui-light" if theme_mode == "light" else "a2ui-dark"
+    data_theme = "light" if theme_mode == "light" else "precision-noir"
+    toggle_label = "Dark" if theme_mode == "light" else "Light"
     safe_title = html.escape(title)
     embedded_json = _safe_embed_json(norm["payload"])
 
     document = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="{data_theme}" data-theme-mode="{html.escape(theme_mode)}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">

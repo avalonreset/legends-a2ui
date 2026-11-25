@@ -26,10 +26,16 @@ const KNOWN_KEYS = new Set([
   "deleteSurface",
   "callRendererFunction",
   "agentFunctionResponse",
+]);
+
+const LEGACY_V08_KEYS = new Set([
   "beginRendering",
   "surfaceUpdate",
   "dataModelUpdate",
 ]);
+
+const LEGACY_V08_ERROR =
+  "Legacy A2UI v0.8 envelopes require normalization via legends-a2ui normalize before rendering in v1.0/v0.9 hosts.";
 
 const HEADING_PREFIX: Record<string, string> = {
   h1: "# ",
@@ -43,11 +49,20 @@ function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+function isLegacyV08Message(raw: unknown): boolean {
+  if (!isObj(raw)) return false;
+  if (typeof raw.version === "string") {
+    const t = raw.version.trim().toLowerCase();
+    if (t === "0.8" || t === "v0.8") return true;
+  }
+  return Object.keys(raw).some((k) => LEGACY_V08_KEYS.has(k));
+}
+
 export function sanitizeUax31Id(rawId: string): string {
-  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(rawId)) return rawId;
-  const cleaned = rawId.replace(/[^A-Za-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
+  if (/^[\\p{XID_Start}_][\\p{XID_Continue}]*$/u.test(rawId)) return rawId;
+  const cleaned = rawId.replace(/[^\\p{XID_Continue}]+/gu, "_").replace(/^_+|_+$/g, "");
   if (!cleaned) return "c_id";
-  return /^[A-Za-z_]/.test(cleaned) ? cleaned : `c_${cleaned}`;
+  return /^[\\p{XID_Start}_]/u.test(cleaned) ? cleaned : `c_${cleaned}`;
 }
 
 function normalizeVersion(rawVersion: unknown, msg: Record<string, unknown>): string {
@@ -58,7 +73,7 @@ function normalizeVersion(rawVersion: unknown, msg: Record<string, unknown>): st
     if (t === "0.9" || t === "v0.9") return "v0.9";
     if (t === "0.8" || t === "v0.8") return "v0.8";
   }
-  if ("beginRendering" in msg || "surfaceUpdate" in msg || "dataModelUpdate" in msg) {
+  if (isLegacyV08Message(msg)) {
     return "v0.8";
   }
   return "1.0";
@@ -92,7 +107,8 @@ function normalizeMessage(raw: unknown): Record<string, unknown> | null {
   if (!Object.keys(raw).some((k) => KNOWN_KEYS.has(k))) return null;
   const msg: Record<string, unknown> = { ...raw };
   const ver = normalizeVersion(msg.version, msg);
-  if (ver !== "v0.8") msg.version = ver;
+  if (ver === "v0.8") return null;
+  msg.version = ver;
 
   if (isObj(msg.createSurface)) {
     const cs: Record<string, unknown> = { ...msg.createSurface };
@@ -135,6 +151,9 @@ export function parseA2uiPayload(raw: string, isStreaming = false): A2uiParseRes
       : isObj(parsed) && Array.isArray(parsed.messages)
         ? parsed.messages
         : [parsed];
+    if (items.some(isLegacyV08Message)) {
+      return { status: "error", messages: [], error: LEGACY_V08_ERROR };
+    }
     const msgs = items.map(normalizeMessage).filter((m): m is Record<string, unknown> => m !== null);
     if (msgs.length > 0) return { status: "ready", messages: msgs };
     return { status: "error", messages: [], error: "No recognized A2UI messages found." };
@@ -147,7 +166,11 @@ export function parseA2uiPayload(raw: string, isStreaming = false): A2uiParseRes
   let bad = 0;
   for (let i = 0; i < lines.length; i += 1) {
     try {
-      const m = normalizeMessage(JSON.parse(lines[i]!));
+      const parsedLine: unknown = JSON.parse(lines[i]!);
+      if (isLegacyV08Message(parsedLine)) {
+        return { status: "error", messages: [], error: LEGACY_V08_ERROR };
+      }
+      const m = normalizeMessage(parsedLine);
       if (m) msgs.push(m);
     } catch {
       if (!(isStreaming && i === lines.length - 1)) bad += 1;
@@ -162,20 +185,31 @@ export function parseA2uiPayload(raw: string, isStreaming = false): A2uiParseRes
 }
 """
 
-_A2UI_SECURITY_TS = """export function isSafeMediaUrl(rawUrl: string): boolean {
+_A2UI_SECURITY_TS = """function hasValidAuthority(rest: string): boolean {
+  if (!rest.startsWith("//")) return false;
+  const afterSlashes = rest.slice(2);
+  const cut = afterSlashes.search(/[/?#]/);
+  const authority = cut === -1 ? afterSlashes : afterSlashes.slice(0, cut);
+  if (!authority || /\\s/.test(authority) || authority.includes("@")) return false;
+  return true;
+}
+
+export function isSafeMediaUrl(rawUrl: string): boolean {
   if (typeof rawUrl !== "string") return false;
   if (/[\\x00-\\x1f\\x7f]/.test(rawUrl)) return false;
   const trimmed = rawUrl.trim();
   if (!trimmed) return false;
   const normalized = trimmed.replace(/\\\\/g, "/");
   if (normalized.startsWith("//")) return false;
-  if (trimmed.startsWith("/")) return true;
+  if (trimmed.startsWith("/") && !trimmed.startsWith("/\\\\")) return true;
   const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/.exec(trimmed);
   if (!match) return false;
   const scheme = match[1]!.toLowerCase();
   const rest = match[2]!;
-  if (scheme === "http" || scheme === "https") return rest.startsWith("//");
-  if (scheme === "data") return /^data:(image|audio|video)\\//i.test(trimmed);
+  if (scheme === "http" || scheme === "https") return hasValidAuthority(rest);
+  if (scheme === "data") {
+    return /^data:(?:image\\/(?:png|jpeg|jpg|gif|webp|avif|bmp)|(?:audio|video)\\/[a-z0-9.+-]+)[;,]/i.test(trimmed);
+  }
   return false;
 }
 
@@ -183,12 +217,14 @@ export function isSafeOpenUrl(rawUrl: string): boolean {
   if (typeof rawUrl !== "string") return false;
   if (/[\\x00-\\x1f\\x7f]/.test(rawUrl)) return false;
   const trimmed = rawUrl.trim();
+  const normalized = trimmed.replace(/\\\\/g, "/");
+  if (normalized.startsWith("//")) return false;
   const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):(.*)$/.exec(trimmed);
   if (!match) return false;
   const scheme = match[1]!.toLowerCase();
   const rest = match[2]!;
-  if (scheme === "http" || scheme === "https") return rest.startsWith("//");
-  if (scheme === "mailto") return rest.includes("@");
+  if (scheme === "http" || scheme === "https") return hasValidAuthority(rest);
+  if (scheme === "mailto") return rest.trim().length > 0 && rest.includes("@");
   return false;
 }
 """
@@ -553,13 +589,27 @@ export function runSelfCheck(): void {
   if (!A2UI_V09_BASIC_CATALOG_ID.endsWith("/catalogs/basic/catalog.json")) {
     throw new Error("Expected canonical v0.9 catalogId");
   }
-  if (sanitizeUax31Id("1-bad-id") !== "c_1_bad_id") {
+  if (sanitizeUax31Id("1-bad-id") !== "c_1_bad_id" || sanitizeUax31Id("caf\\u00e9_btn") !== "caf\\u00e9_btn") {
     throw new Error("Expected UAX #31 sanitized ID");
   }
-  if (isSafeMediaUrl("javascript:alert(1)") || !isSafeMediaUrl("https://example.com/a.png")) {
+  const v08Res = parseA2uiPayload(JSON.stringify({ beginRendering: { surfaceId: "legacy", root: "root" } }));
+  if (v08Res.status !== "error" || !v08Res.error?.includes("legends-a2ui normalize")) {
+    throw new Error("Expected legacy v0.8 error instructing normalization");
+  }
+  if (
+    isSafeMediaUrl("javascript:alert(1)") ||
+    isSafeMediaUrl("data:image/svg+xml,<svg onload=alert(1)>") ||
+    isSafeMediaUrl("https://user:pass@example.com/a.png") ||
+    !isSafeMediaUrl("https://example.com/a.png") ||
+    !isSafeMediaUrl("data:image/png;base64,iVBOR")
+  ) {
     throw new Error("Media URL safety check failed");
   }
-  if (isSafeOpenUrl("data:text/html,hi") || !isSafeOpenUrl("https://a2ui.org")) {
+  if (
+    isSafeOpenUrl("data:text/html,hi") ||
+    isSafeOpenUrl("https://a2ui.org@evil.example/phish") ||
+    !isSafeOpenUrl("https://a2ui.org")
+  ) {
     throw new Error("openUrl safety check failed");
   }
 }

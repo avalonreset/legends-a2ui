@@ -324,6 +324,410 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertIn("value", comps["email_input"])
         self.assertTrue(validate_payload(norm["formatted"], version="1.0", strict=True)["ok"])
 
+    def test_incremental_update_components_replacement_and_same_batch_duplicate(self) -> None:
+        """Incremental replacements pass across batches; same-batch duplicates still fail."""
+        incremental = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "inc_dash",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "inc_dash",
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["left_panel"]},
+                        {"id": "left_panel", "component": "Column", "children": ["loading_txt"], "weight": 1},
+                        {"id": "loading_txt", "component": "Text", "text": "Loading...", "variant": "caption"},
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "inc_dash",
+                    "components": [
+                        {"id": "left_panel", "component": "Column", "children": ["ready_card"], "weight": 1},
+                        {"id": "ready_card", "component": "Card", "child": "ready_txt"},
+                        {"id": "ready_txt", "component": "Text", "text": "Ready.", "variant": "body"},
+                    ],
+                },
+            },
+        ]
+        vres = validate_payload(json.dumps(incremental), version="1.0", strict=True)
+        self.assertTrue(vres["ok"], f"Errors: {vres['errors']}, Warnings: {vres['warnings']}")
+        self.assertEqual(vres["errors"], [])
+        self.assertEqual(vres["warnings"], [])
+
+        nres = normalize_payload(json.dumps(incremental), fmt="json")
+        self.assertTrue(nres["ok"], f"Normalize failed: {nres['validation']}")
+        self.assertEqual(nres["validation"]["warnings"], [])
+        # Replaced ID must NOT get suffixed with _2 across batches
+        b1_ids = [c["id"] for c in nres["payload"][1]["updateComponents"]["components"]]
+        b2_ids = [c["id"] for c in nres["payload"][2]["updateComponents"]["components"]]
+        self.assertIn("left_panel", b1_ids)
+        self.assertIn("left_panel", b2_ids)
+        self.assertNotIn("left_panel_2", b2_ids)
+
+        # Non-UAX31 ID replaced across two batches must remap to the exact same sanitized ID
+        hyphen_inc = [
+            {
+                "version": "1.0",
+                "createSurface": {"surfaceId": "inc_h", "catalogId": CANONICAL_V1_CATALOG_ID},
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "inc_h",
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["left-panel"]},
+                        {"id": "left-panel", "component": "Text", "text": "Step 1"},
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "inc_h",
+                    "components": [
+                        {"id": "left-panel", "component": "Text", "text": "Step 2"},
+                    ],
+                },
+            },
+        ]
+        hnorm = normalize_payload(json.dumps(hyphen_inc), fmt="json")
+        self.assertTrue(hnorm["ok"], hnorm["validation"])
+        self.assertEqual(hnorm["payload"][1]["updateComponents"]["components"][1]["id"], "left_panel")
+        self.assertEqual(hnorm["payload"][2]["updateComponents"]["components"][0]["id"], "left_panel")
+
+        # Duplicate ID within the SAME batch MUST still be rejected
+        same_batch_dup = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "dup_surface",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["dup_node"]},
+                    {"id": "dup_node", "component": "Text", "text": "First"},
+                    {"id": "dup_node", "component": "Text", "text": "Second"},
+                ],
+            },
+        }
+        dup_res = validate_payload(json.dumps(same_batch_dup), version="1.0", strict=True)
+        self.assertFalse(dup_res["ok"])
+        self.assertIn("DUPLICATE_COMPONENT_ID", {e["code"] for e in dup_res["errors"]})
+
+        # Truly never-referenced orphan in an incremental update MUST still be flagged
+        inc_orphan = json.loads(json.dumps(incremental))
+        inc_orphan[2]["updateComponents"]["components"].append(
+            {"id": "stray_orphan", "component": "Text", "text": "Never attached"}
+        )
+        orph_res = validate_payload(json.dumps(inc_orphan), version="1.0", strict=False)
+        self.assertIn("ORPHAN_COMPONENT", {w["code"] for w in orph_res["warnings"]})
+        self.assertTrue(any("stray_orphan" in w["message"] for w in orph_res["warnings"]))
+
+    def test_custom_catalog_id_cannot_bypass_security_gates(self) -> None:
+        """Custom @catalogId overrides never bypass media URL, action, or @checks ReDoS gates."""
+        payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "custom_sec",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["img_c", "btn_c", "fld_c"]},
+                    {
+                        "id": "img_c",
+                        "component": "Image",
+                        "@catalogId": "custom:cat",
+                        "url": "javascript:alert(1)",
+                    },
+                    {
+                        "id": "btn_c",
+                        "component": "Button",
+                        "@catalogId": "https://evil.example/catalogs/basic",
+                        "child": "btn_lbl",
+                        "action": {
+                            "functionCall": {
+                                "@call": "openUrl",
+                                "args": {"url": "javascript:alert(1)"},
+                            }
+                        },
+                    },
+                    {"id": "btn_lbl", "component": "Text", "text": "Open"},
+                    {
+                        "id": "fld_c",
+                        "component": "TextField",
+                        "@catalogId": "custom:cat",
+                        "label": "Input",
+                        "value": {"@path": "/in"},
+                        "@checks": [
+                            {
+                                "condition": {
+                                    "@call": "regex",
+                                    "args": {"value": {"@path": "/in"}, "pattern": "(a+)+$"},
+                                },
+                                "message": "Bad",
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+        res = validate_payload(json.dumps(payload), version="1.0", strict=True)
+        self.assertFalse(res["ok"])
+        codes = {e["code"] for e in res["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", codes)
+        self.assertIn("UNSAFE_OPEN_URL", codes)
+        self.assertIn("UNSAFE_REGEX", codes)
+
+    def test_function_call_urls_template_relative_paths_and_array_dynamic_values(self) -> None:
+        """FunctionCall URLs, ChildList relative bindings, nested arrays, and openUrl call-sites fail closed."""
+        # 1. formatString with unsafe scheme in Image.url and openUrl
+        fn_url = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "fn_url",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["img1", "img2", "btn1", "btn2", "txt_bad"]},
+                    {
+                        "id": "img1",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": "javascript:alert(1)"}},
+                    },
+                    {
+                        "id": "img2",
+                        "component": "Image",
+                        "url": {"@call": "formatNumber", "args": {"value": 42}},
+                    },
+                    {
+                        "id": "btn1",
+                        "component": "Button",
+                        "child": "lbl1",
+                        "action": {
+                            "functionCall": {
+                                "@call": "openUrl",
+                                "args": {"url": {"@call": "formatString", "args": {"value": "javascript:alert(1)"}}},
+                            }
+                        },
+                    },
+                    {"id": "lbl1", "component": "Text", "text": "Go"},
+                    {
+                        "id": "btn2",
+                        "component": "Button",
+                        "child": "lbl2",
+                        "action": {"functionCall": {"@call": "openUrl"}},
+                    },
+                    {"id": "lbl2", "component": "Text", "text": "NoArgs"},
+                    {
+                        "id": "txt_bad",
+                        "component": "Text",
+                        "text": {"@call": "openUrl", "args": {"url": "https://a2ui.org"}},
+                    },
+                ],
+            },
+        }
+        res1 = validate_payload(json.dumps(fn_url), version="1.0", strict=True)
+        self.assertFalse(res1["ok"])
+        codes1 = {e["code"] for e in res1["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", codes1)
+        self.assertIn("UNSAFE_OPEN_URL", codes1)
+        self.assertIn("MISSING_REQUIRED_FUNCTION_ARG", codes1)
+        self.assertIn("INVALID_FUNCTION_CALL_SITE", codes1)
+
+        # 2. ChildList dynamic template relative @path resolved against inline dataModel array items
+        tpl_payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "tpl_sec",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "List", "children": {"componentId": "row_tpl", "path": "/items"}},
+                    {"id": "row_tpl", "component": "Row", "children": ["tpl_img", "tpl_btn"]},
+                    {"id": "tpl_img", "component": "Image", "url": {"@path": "url"}},
+                    {
+                        "id": "tpl_btn",
+                        "component": "Button",
+                        "child": "tpl_lbl",
+                        "action": {"functionCall": {"@call": "openUrl", "args": {"url": {"@path": "href"}}}},
+                    },
+                    {"id": "tpl_lbl", "component": "Text", "text": "Visit"},
+                ],
+                "dataModel": {
+                    "items": [
+                        {"url": "https://example.com/ok.png", "href": "https://a2ui.org"},
+                        {"url": "javascript:alert(1)", "href": "javascript:alert(2)"},
+                    ]
+                },
+            },
+        }
+        res2 = validate_payload(json.dumps(tpl_payload), version="1.0", strict=True)
+        self.assertFalse(res2["ok"])
+        codes2 = {e["code"] for e in res2["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", codes2)
+        self.assertIn("UNSAFE_OPEN_URL", codes2)
+
+        # 3. Array DynamicValue recursion (transitional path, bad single-@ key, unsafe regex inside and.values)
+        arr_payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "arr_sec",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["f1", "b1"]},
+                    {
+                        "id": "f1",
+                        "component": "TextField",
+                        "label": "Field",
+                        "value": {"@path": "/f"},
+                        "@checks": [
+                            {
+                                "condition": {
+                                    "@call": "and",
+                                    "args": {
+                                        "values": [
+                                            {"path": "/f"},
+                                            {"@call": "regex", "args": {"value": {"@path": "/f"}, "pattern": "(a+)+$"}},
+                                        ]
+                                    },
+                                },
+                                "message": "Invalid",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "b1",
+                        "component": "Button",
+                        "child": "b1_lbl",
+                        "action": {
+                            "event": {
+                                "name": "send",
+                                "context": {"items": [{"@bad": 1}]},
+                            }
+                        },
+                    },
+                    {"id": "b1_lbl", "component": "Text", "text": "Send"},
+                ],
+            },
+        }
+        res3 = validate_payload(json.dumps(arr_payload), version="1.0", strict=True)
+        self.assertFalse(res3["ok"])
+        codes3 = {e["code"] for e in res3["errors"]}
+        self.assertIn("TRANSITIONAL_PATH_BINDING", codes3)
+        self.assertIn("UNSAFE_REGEX", codes3)
+        self.assertIn("INVALID_RESERVED_KEY", codes3)
+
+    def test_surface_lifecycle_unknown_props_nan_json_and_normalizer_edge_cases(self) -> None:
+        """Empty createSurface, post-delete mutations, unknown component props, NaN JSON, and normalizer details."""
+        # 1. createSurface without components fails with MISSING_ROOT_COMPONENT
+        empty_cs = {"version": "1.0", "createSurface": {"surfaceId": "empty_s", "catalogId": CANONICAL_V1_CATALOG_ID}}
+        res_empty = validate_payload(json.dumps(empty_cs), version="1.0", strict=True)
+        self.assertFalse(res_empty["ok"])
+        self.assertIn("MISSING_ROOT_COMPONENT", {e["code"] for e in res_empty["errors"]})
+
+        # 2. Invalid components/dataModel types on createSurface
+        bad_types = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "bad_t",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": "not_a_list",
+                "dataModel": [1, 2],
+            },
+        }
+        res_bt = validate_payload(json.dumps(bad_types), version="1.0", strict=True)
+        self.assertFalse(res_bt["ok"])
+        bt_codes = {e["code"] for e in res_bt["errors"]}
+        self.assertIn("INVALID_COMPONENTS", bt_codes)
+        self.assertIn("INVALID_DATA_MODEL", bt_codes)
+
+        # 3. Post-delete mutation fails; re-creation resets cleanly
+        post_del = [
+            _valid_v1_surface(),
+            {"version": "1.0", "deleteSurface": {"surfaceId": "demo_surface"}},
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "demo_surface", "path": "/ok", "value": False},
+            },
+        ]
+        res_pd = validate_payload(json.dumps(post_del), version="1.0", strict=True)
+        self.assertFalse(res_pd["ok"])
+        self.assertIn("INACTIVE_SURFACE", {e["code"] for e in res_pd["errors"]})
+
+        recreate = [
+            _valid_v1_surface(),
+            {"version": "1.0", "deleteSurface": {"surfaceId": "demo_surface"}},
+            _valid_v1_surface(),
+        ]
+        res_rc = validate_payload(json.dumps(recreate), version="1.0", strict=True)
+        self.assertTrue(res_rc["ok"], res_rc["errors"])
+
+        # 4. Unknown Basic Catalog component properties flagged
+        unk_prop = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "unk_s",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Text", "text": "Hi", "onclick": "alert(1)"},
+                ],
+            },
+        }
+        res_unk_strict = validate_payload(json.dumps(unk_prop), version="1.0", strict=True)
+        self.assertFalse(res_unk_strict["ok"])
+        self.assertIn("UNKNOWN_COMPONENT_PROPERTY", {e["code"] for e in res_unk_strict["errors"]})
+        res_unk_relaxed = validate_payload(json.dumps(unk_prop), version="1.0", strict=False)
+        self.assertTrue(res_unk_relaxed["ok"])
+        self.assertIn("UNKNOWN_COMPONENT_PROPERTY", {w["code"] for w in res_unk_relaxed["warnings"]})
+
+        # 5. Non-standard NaN/Infinity JSON rejected
+        nan_json = '{"version":"1.0","createSurface":{"surfaceId":"s","catalogId":"https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json","components":[{"id":"root","component":"Text","text":"Hi"}],"dataModel":{"x":NaN}}}'
+        res_nan = validate_payload(nan_json, version="1.0", strict=True)
+        self.assertFalse(res_nan["ok"])
+
+        # 6. Normalizer escapes single-@ keys, remaps action.sourceComponentId, and synthesizes TextField.value after collision suffixing
+        edge_norm = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "edge_s",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["field_1", "field-1", "go-btn"]},
+                        {"id": "field_1", "component": "TextField", "label": "First"},
+                        {"id": "field-1", "component": "TextField", "label": "Second"},
+                        {
+                            "id": "go-btn",
+                            "component": "Button",
+                            "child": "go_lbl",
+                            "action": {"event": {"name": "go", "context": {"meta": {"@type": "demo"}}}},
+                        },
+                        {"id": "go_lbl", "component": "Text", "text": "Go"},
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "action": {
+                    "surfaceId": "edge_s",
+                    "name": "go",
+                    "sourceComponentId": "go-btn",
+                    "timestamp": "2026-11-25T00:00:00Z",
+                    "context": {},
+                },
+            },
+        ]
+        nres = normalize_payload(json.dumps(edge_norm), fmt="json")
+        self.assertTrue(nres["ok"], nres["validation"])
+        comps = {c["id"]: c for c in nres["payload"][0]["createSurface"]["components"]}
+        self.assertIn("field_1_2", comps)
+        self.assertEqual(comps["field_1_2"]["value"], {"@path": "/field_1_2"})
+        self.assertIn("@@type", comps["go_btn"]["action"]["event"]["context"]["meta"])
+        self.assertEqual(nres["payload"][1]["action"]["sourceComponentId"], "go_btn")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,7 +29,9 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Build wheel and sdist
+        shell: bash
         run: |
+          set -e
           python -m pip install --upgrade "pip>=26.2.2" build setuptools
           python -m build
       - name: Clean install outside checkout

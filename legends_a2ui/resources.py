@@ -24,6 +24,7 @@ def resolve_resources() -> dict[str, Any]:
         "recipe": str((root / "docs" / "AGENT-RECIPE.md").resolve()),
         "pack_manifest": str((root / "knowledge" / "a2ui" / "pack.json").resolve()),
         "vendor_manifest": str((root / "vendor" / "a2ui-spec" / "manifest.json").resolve()),
+        "wiki": str((root / "wiki").resolve()),
     }
 
 

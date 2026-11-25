@@ -75,10 +75,41 @@ class TestComposeProjectPreviewScaffold(unittest.TestCase):
         self.assertFalse(p4["ok"])
         self.assertIn("SECRET_LEAK", {e["code"] for e in p4["validation"]["errors"]})
 
+    def test_project_auto_detects_sibling_doctor_json_as_health_deck(self) -> None:
+        """Nested runtime health-check JSON auto-selects health-deck and surfaces warnings."""
+        astro_doctor = {
+            "ok": True,
+            "module": "legends-astro",
+            "version": "0.4.0",
+            "runtime": {
+                "ok": True,
+                "node": {"version": "v25.9.0", "status": "odd_major_compatible", "enginesRequired": ">=22.23.4"},
+                "snapshot": {"ok": True, "files": 56, "schema": "legends-astro-vendor-docs/v2"},
+                "canaryOk": True,
+                "warnings": [
+                    {
+                        "code": "node_odd_major_warning",
+                        "message": "Node v25.9.0 is an odd major; prefer even LTS.",
+                    }
+                ],
+            },
+            "pathCollisionCheck": {"globalAstroOnPath": False, "path": None, "warning": None},
+            "knowledgePack": {"ok": True, "fileCount": 12, "errors": []},
+        }
+        projected = project_json_to_surface(json.dumps(astro_doctor), preset="auto", fmt="json")
+        self.assertTrue(projected["ok"], projected["validation"])
+        self.assertEqual(projected["preset"], "health-deck")
+        self.assertTrue(validate_payload(projected["formatted"], version="1.0", strict=True)["ok"])
+        comps = {c["id"]: c for c in projected["payload"][0]["createSurface"]["components"]}
+        self.assertIn("Warnings: `1`", comps["health_summary"]["text"])
+        self.assertIn("node_odd_major_warning", comps["health_issues"]["text"])
+        self.assertIn("runtime.node", comps["health_diag"]["text"])
+        self.assertIn("v25.9.0", comps["health_diag"]["text"])
+
     def test_preview_html_security_csp_xss_themes_and_18_components(self) -> None:
         composed = compose_surface(
             "ship-call",
-            variables={"title": "Ship </script><script>alert(1)</script>"},
+            variables={"title": "Ship <!-- comment --> </script><script>alert(1)</script>"},
             fmt="json",
         )
         self.assertTrue(composed["ok"])
@@ -87,11 +118,26 @@ class TestComposeProjectPreviewScaffold(unittest.TestCase):
         self.assertTrue(dark["ok"])
         doc = dark["html"]
         self.assertIn(STRICT_CSP, doc)
-        self.assertIn("<\\/script>", doc)
+        self.assertIn(r"\u003c/script\u003e", doc)
+        self.assertIn(r"\u003c!--", doc)
+        self.assertNotIn("<\\!--", doc)
+        # Verify embedded JSON parses cleanly as strict RFC 8259 JSON
+        start_tag = '<script type="application/json" id="a2ui-payload">'
+        j_start = doc.index(start_tag) + len(start_tag)
+        j_end = doc.index("</script>", j_start)
+        parsed_embedded = json.loads(doc[j_start:j_end])
+        self.assertEqual(len(parsed_embedded), 1)
         self.assertNotIn("https://cdn.", doc)
         self.assertNotIn("unpkg.com", doc)
         self.assertIn('body class="a2ui-dark"', doc)
+        self.assertIn('data-theme="precision-noir"', doc)
+        self.assertIn("color-scheme: dark;", doc)
+        self.assertIn("accent-color: #9e0b1a;", doc)
         self.assertIn("#9e0b1a", doc)
+        # Linear O(N) Markdown link matcher and reactive binding refresh helper
+        self.assertIn(r"(^|[^\\])\[([^\[\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)", doc)
+        self.assertIn("refreshReactiveBindings", doc)
+        self.assertIn("sanitizePlainValue", doc)
         # All 18 Basic Catalog component handlers exist in runtime JS
         for comp_name in (
             "Text", "Image", "Icon", "Video", "AudioPlayer", "Row", "Column", "List",
@@ -103,6 +149,13 @@ class TestComposeProjectPreviewScaffold(unittest.TestCase):
         light = render_preview_html(composed["formatted"], theme="light")
         self.assertTrue(light["ok"])
         self.assertIn('body class="a2ui-light"', light["html"])
+        self.assertIn('data-theme="light"', light["html"])
+        self.assertIn("color-scheme: light;", light["html"])
+
+        auto_theme = render_preview_html(composed["formatted"], theme="auto")
+        self.assertTrue(auto_theme["ok"])
+        self.assertIn('data-theme-mode="auto"', auto_theme["html"])
+        self.assertIn("prefers-color-scheme: light", auto_theme["html"])
 
         # Preview-first planSha256 gate on disk write
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,6 +197,45 @@ class TestComposeProjectPreviewScaffold(unittest.TestCase):
                     parser_src = (out_dir / "a2uiParser.ts").read_text(encoding="utf-8")
                     self.assertIn("https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json", parser_src)
                     self.assertIn("https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json", parser_src)
+                    self.assertIn("legends-a2ui normalize", parser_src)
+                    self.assertIn(r"\p{XID_Start}", parser_src)
+                    sec_src = (out_dir / "a2uiSecurity.ts").read_text(encoding="utf-8")
+                    self.assertIn("hasValidAuthority", sec_src)
+                    self.assertNotIn("^data:(image|audio|video)", sec_src)
+
+    def test_compose_rejects_nan_infinity_and_invalid_numeric_variables(self) -> None:
+        bad_nan = compose_surface("wizard-step", variables={"value": "nan", "max": "inf"}, fmt="json")
+        self.assertFalse(bad_nan["ok"])
+        self.assertIn("finite", bad_nan["error"].lower())
+
+        bad_step = compose_surface("wizard-step", variables={"step": "not-an-int"}, fmt="json")
+        self.assertFalse(bad_step["ok"])
+        self.assertIn("integer", bad_step["error"].lower())
+
+    def test_projector_sanitizes_markdown_breakout_and_enforces_bounds(self) -> None:
+        malicious = {
+            "mode": "preview",
+            "planSha256": "b" * 64,
+            "title": "Plan\n## Injected [phish](https://evil.example)",
+            "target": "prod` `breakout",
+            "plannedFiles": [
+                {"path": "ok.ts`\n## Fake Heading [click](https://evil.example)", "bytes": 10, "exists": False}
+            ],
+        }
+        proj = project_json_to_surface(json.dumps(malicious), preset="plan-approval", fmt="json")
+        self.assertTrue(proj["ok"], proj.get("validation"))
+        comps = {c["id"]: c for c in proj["payload"][0]["createSurface"]["components"]}
+        self.assertNotIn("\n", comps["plan_heading"]["text"])
+        self.assertNotIn("[phish](https://evil.example)", comps["plan_heading"]["text"])
+        self.assertNotIn("\n## Fake Heading", comps["plan_files_md"]["text"])
+        self.assertNotIn("[click](https://evil.example)", comps["plan_files_md"]["text"])
+        self.assertNotIn("`breakout", comps["plan_meta"]["text"])
+
+        # Bounds enforcement in projector
+        too_big = project_json_to_surface(json.dumps({"a": "x" * 200}), max_bytes=64)
+        self.assertFalse(too_big["ok"])
+        too_deep = project_json_to_surface("[" * 40 + "]" * 40, max_depth=16)
+        self.assertFalse(too_deep["ok"])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,9 @@ def main() -> int:
     assert info["source"] == "package_data", info["source"]
     root = Path(info["root"])
     assert root.is_absolute(), info["root"]
+    assert (root / "THIRD_PARTY_NOTICES.md").is_file(), "Missing THIRD_PARTY_NOTICES.md in packaged _data"
+    wiki_dir = Path(info["wiki"])
+    assert wiki_dir.is_dir(), str(wiki_dir)
     recipe = Path(info["recipe"])
     if not recipe.is_absolute():
         recipe = root / recipe
@@ -26,9 +29,16 @@ def main() -> int:
     assert pack_manifest.is_file(), str(pack_manifest)
     pack = json.loads(pack_manifest.read_text(encoding="utf-8"))
     assert pack["schema"] == "legends.knowledge-pack/v1", pack.get("schema")
+    vault_dir = (pack_manifest.parent / "vault").resolve()
     for item in pack["files"]:
-        target = pack_manifest.parent / "vault" / item["path"]
-        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        rel = item["path"]
+        rel_path = Path(rel)
+        assert not rel_path.is_absolute() and not rel_path.drive and ".." not in rel_path.parts, rel
+        target = vault_dir / rel
+        assert not target.is_symlink(), rel
+        resolved = target.resolve()
+        assert resolved.is_relative_to(vault_dir), rel
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
         assert digest == item["sha256"], item["path"]
     vendor_manifest = Path(info["vendor_manifest"])
     assert vendor_manifest.is_file(), str(vendor_manifest)

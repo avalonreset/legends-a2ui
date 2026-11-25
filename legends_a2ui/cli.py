@@ -13,7 +13,7 @@ from legends_a2ui.docs_lookup import query_catalog, search_docs
 from legends_a2ui.doctor import check_knowledge_pack, run_doctor
 from legends_a2ui.net_safety import SafetyError, execute_write_plan, reject_symlink_chain
 from legends_a2ui.normalizer import normalize_payload
-from legends_a2ui.parser import DEFAULT_MAX_BYTES, DEFAULT_MAX_DEPTH
+from legends_a2ui.parser import DEFAULT_MAX_BYTES, DEFAULT_MAX_DEPTH, loads_strict_json
 from legends_a2ui.preview_html import render_preview_html
 from legends_a2ui.projector import VALID_PRESETS, project_json_to_surface
 from legends_a2ui.resources import resolve_resources
@@ -22,15 +22,28 @@ from legends_a2ui.validator import DEFAULT_MAX_COMPONENTS, validate_payload
 
 
 def _read_input_text(input_arg: str, *, max_bytes: int = DEFAULT_MAX_BYTES) -> str:
+    byte_limit = max(1, int(max_bytes)) * 4
     if input_arg == "-":
-        raw = sys.stdin.read()
-        return raw
+        buf = getattr(sys.stdin, "buffer", None)
+        if buf is not None:
+            raw_bytes = buf.read(byte_limit + 1)
+            if len(raw_bytes) > byte_limit:
+                raise ValueError(
+                    f"Stdin input exceeds maximum read limit ({byte_limit} bytes)."
+                )
+            return raw_bytes.decode("utf-8-sig")
+        raw_text = sys.stdin.read(byte_limit + 1)
+        if len(raw_text.encode("utf-8")) > byte_limit:
+            raise ValueError(
+                f"Stdin input exceeds maximum read limit ({byte_limit} bytes)."
+            )
+        return raw_text
     path = Path(input_arg)
     reject_symlink_chain(path)
     if not path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_arg}")
     size = path.stat().st_size
-    if size > max_bytes * 4:
+    if size > byte_limit:
         raise ValueError(f"Input file size ({size} bytes) far exceeds max_bytes ({max_bytes}).")
     return path.read_text(encoding="utf-8-sig")
 
@@ -63,6 +76,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
+    for flag_name, val in (
+        ("--max-bytes", args.max_bytes),
+        ("--max-components", args.max_components),
+        ("--max-depth", args.max_depth),
+    ):
+        if val < 1:
+            msg = f"{flag_name} must be >= 1 (got {val})."
+            if args.json:
+                _print_json({"ok": False, "error": msg})
+            else:
+                print(f"error: {msg}", file=sys.stderr)
+            return 2
+
     try:
         raw = _read_input_text(args.input, max_bytes=args.max_bytes)
     except FileNotFoundError as exc:
@@ -176,31 +202,48 @@ def _cmd_compose(args: argparse.Namespace) -> int:
         return 0
 
     if not args.template:
-        print("error: specify --template <name> or --list", file=sys.stderr)
+        msg = "specify --template <name> or --list"
+        if args.json:
+            _print_json({"ok": False, "error": msg})
+        else:
+            print(f"error: {msg}", file=sys.stderr)
         return 2
 
     variables: dict[str, Any] = {}
     if args.vars_file:
         try:
             vtext = _read_input_text(args.vars_file)
-            loaded = json.loads(vtext)
+            loaded = loads_strict_json(
+                vtext, max_bytes=DEFAULT_MAX_BYTES, max_depth=DEFAULT_MAX_DEPTH
+            )
             if not isinstance(loaded, dict):
                 raise ValueError("--vars-file must contain a JSON object.")
             variables.update(loaded)
         except FileNotFoundError as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            if args.json:
+                _print_json({"ok": False, "error": str(exc)})
+            else:
+                print(f"error: {exc}", file=sys.stderr)
             return 2
         except Exception as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            if args.json:
+                _print_json({"ok": False, "error": str(exc)})
+            else:
+                print(f"error: {exc}", file=sys.stderr)
             return 1
     if args.vars:
         try:
-            loaded = json.loads(args.vars)
+            loaded = loads_strict_json(
+                args.vars, max_bytes=DEFAULT_MAX_BYTES, max_depth=DEFAULT_MAX_DEPTH
+            )
             if not isinstance(loaded, dict):
                 raise ValueError("--vars must be a JSON object.")
             variables.update(loaded)
         except Exception as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            if args.json:
+                _print_json({"ok": False, "error": str(exc)})
+            else:
+                print(f"error: {exc}", file=sys.stderr)
             return 2
 
     res = compose_surface(

@@ -12,6 +12,7 @@ MIRROR_FILES = [
     "CAPABILITIES.md",
     "LICENSE",
     "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
     "VERSION",
     "SUPPORT.md",
     "CONTRIBUTING.md",

@@ -82,6 +82,10 @@ class TestRegistryAndCatalog(unittest.TestCase):
         self.assertTrue(is_valid_uax31_id("root"))
         self.assertTrue(is_valid_uax31_id("_valid_123"))
         self.assertTrue(is_valid_uax31_id("caf\u00e9_btn"))
+        self.assertTrue(is_valid_uax31_id("a\u00b7b"))
+        self.assertFalse(is_valid_uax31_id("\u2e2f"))
+        self.assertFalse(is_valid_uax31_id("\u037a"))
+        self.assertFalse(is_valid_uax31_id("\u0e33"))
         self.assertFalse(is_valid_uax31_id("submit-btn"))
         self.assertFalse(is_valid_uax31_id("1st_item"))
         self.assertFalse(is_valid_uax31_id("has space"))
@@ -95,6 +99,9 @@ class TestRegistryAndCatalog(unittest.TestCase):
         self.assertTrue(validate_media_url("https://example.com/img.png")[0])
         self.assertTrue(validate_media_url("http://example.com/a.mp4")[0])
         self.assertTrue(validate_media_url("data:image/png;base64,iVBOR")[0])
+        self.assertTrue(validate_media_url("data:image/webp;base64,UklGR")[0])
+        self.assertTrue(validate_media_url("data:audio/mpeg;base64,AA==")[0])
+        self.assertTrue(validate_media_url("data:video/mp4;base64,AA==")[0])
         self.assertTrue(validate_media_url("/assets/banner.png")[0])
 
         for bad in (
@@ -109,6 +116,10 @@ class TestRegistryAndCatalog(unittest.TestCase):
             "blob:https://example.com/id",
             "ftp://example.com/a.png",
             "data:text/html,<script>alert(1)</script>",
+            "data:image/svg+xml,<svg onload=alert(1)>",
+            "data:image/svg+xml;base64,PHN2Zz4=",
+            "https://user:pass@example.com/a.png",
+            "https://a2ui.org@evil.example/a.png",
         ):
             self.assertFalse(validate_media_url(bad)[0], f"Should reject media URL: {bad!r}")
 
@@ -123,8 +134,30 @@ class TestRegistryAndCatalog(unittest.TestCase):
             "vbscript:foo",
             "//evil.com/phish",
             "/relative/path",
+            "https://a2ui.org@evil.example/phish",
+            "https://user:secret@example.com/docs",
         ):
             self.assertFalse(validate_open_url(bad)[0], f"Should reject openUrl: {bad!r}")
+
+    def test_expanded_secret_scanner_patterns(self) -> None:
+        from legends_a2ui.spec_registry import scan_for_secrets
+
+        tokens = [
+            "github_" + "pat_" + ("A" * 24),
+            "sk-" + "proj-" + ("B" * 24),
+            "sk-" + "svcacct-" + ("C" * 24),
+            "sk-" + "ant-" + ("D" * 24),
+            "AS" + "IA" + ("1234567890ABCDEF"),
+            "xo" + "xb-" + ("1234567890-abcdef"),
+            "AI" + "za" + ("E" * 35),
+            "-----BEGIN " + "ENCRYPTED PRIVATE KEY-----",
+            "-----BEGIN " + "PGP PRIVATE KEY-----",
+        ]
+        for tok in tokens:
+            hits = scan_for_secrets({"val": tok})
+            self.assertGreaterEqual(len(hits), 1, f"Failed to detect secret format: {tok[:8]}...")
+            for hit in hits:
+                self.assertNotIn(tok, hit["message"])
 
     def test_docs_lookup_offline_and_live_locations(self) -> None:
         res = search_docs("Checkable", version="1.0", live_locations=True, limit=5)

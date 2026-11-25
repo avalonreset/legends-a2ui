@@ -15,6 +15,8 @@ import tempfile
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
+from legends_a2ui import __version__
+
 
 class SafetyError(RuntimeError):
     """Raised when a path, symlink, CFA, overwrite, plan, or network guard fails."""
@@ -30,7 +32,19 @@ LIVE_ALLOWED_HOSTS = frozenset(
 )
 
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+_NAT64_LOCAL = ipaddress.ip_network("64:ff9b:1::/48")
 _DARWIN_SYSTEM_SYMLINKS = frozenset({Path("/var"), Path("/tmp"), Path("/etc")})
+_WINDOWS_RESERVED_DEVICES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
 _CFA_USER_FOLDERS = (
     "Desktop",
     "Documents",
@@ -39,6 +53,35 @@ _CFA_USER_FOLDERS = (
     "Music",
     "OneDrive",
 )
+
+
+def reject_unsafe_local_path(path: Path | str) -> None:
+    """Refuse UNC paths, extended/device prefixes, and reserved Windows DOS device names."""
+    raw = str(path)
+    if "\x00" in raw:
+        raise SafetyError("Refusing path containing NUL byte.")
+    if raw.startswith(("\\\\", "//")):
+        raise SafetyError(f"Refusing UNC or Windows device path: {raw}")
+    if raw.startswith(("\\.\\", "\\?\\")):
+        raise SafetyError(f"Refusing Windows device namespace path: {raw}")
+    try:
+        drive = Path(raw).drive
+    except Exception:
+        drive = ""
+    if drive.startswith(("\\\\", "//")):
+        raise SafetyError(f"Refusing UNC drive path: {raw}")
+
+    for seg in raw.replace("\\", "/").split("/"):
+        if not seg:
+            continue
+        if len(seg) == 2 and seg[1] == ":" and seg[0].isalpha():
+            continue
+        seg_no_drive = seg.split(":", 1)[1] if len(seg) >= 2 and seg[1] == ":" else seg
+        if not seg_no_drive:
+            continue
+        base = seg_no_drive.split(".", 1)[0].rstrip(" ").upper()
+        if base in _WINDOWS_RESERVED_DEVICES:
+            raise SafetyError(f"Refusing reserved Windows device name '{seg}' in path: {raw}")
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -55,7 +98,8 @@ def _is_reparse_point(path: Path) -> bool:
 
 
 def reject_symlink_chain(path: Path) -> None:
-    """Refuse any symlink or Windows reparse point along a path chain (CWE-59)."""
+    """Refuse unsafe local paths and any symlink or Windows reparse point along a path chain (CWE-59)."""
+    reject_unsafe_local_path(path)
     candidate = Path(os.path.abspath(str(path)))
     parts = candidate.parts
     if not parts:
@@ -101,9 +145,14 @@ def is_cfa_protected_path(path: Path) -> bool:
             ("SystemRoot", "C:\\Windows"),
             ("ProgramFiles", "C:\\Program Files"),
             ("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            ("ProgramData", "C:\\ProgramData"),
         ):
-            val = os.environ.get(env_key, fallback)
-            if val:
+            val = os.environ.get(env_key) or fallback
+            if val and len(Path(val).parts) >= 2:
+                protected.append(Path(val))
+        for od_key in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+            val = os.environ.get(od_key)
+            if val and len(Path(val).parts) >= 2:
                 protected.append(Path(val))
 
     for root in protected:
@@ -121,27 +170,46 @@ def reject_cfa_protected_path(path: Path) -> None:
         )
 
 
-def compute_plan_sha256(planned_entries: list[dict[str, Any]]) -> str:
-    """Compute deterministic SHA-256 over planned file paths, sizes, and content digests."""
+def compute_plan_sha256(
+    planned_entries: list[dict[str, Any]],
+    *,
+    base_dir: Path | str | None = None,
+) -> str:
+    """Compute deterministic SHA-256 over normalized target paths, content, and pre-mutation state."""
     canonical = sorted(
         (
             {
                 "path": str(item["path"]),
+                "absolutePath": _normalized_cmp(Path(str(item.get("absolutePath") or item["path"]))),
                 "bytes": int(item["bytes"]),
                 "sha256": str(item["sha256"]),
+                "exists": bool(item.get("exists", False)),
+                "existingSha256": item.get("existingSha256"),
             }
             for item in planned_entries
         ),
-        key=lambda row: row["path"],
+        key=lambda row: (row["absolutePath"], row["path"]),
     )
-    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload = {
+        "baseDir": _normalized_cmp(Path(str(base_dir))) if base_dir is not None else None,
+        "entries": canonical,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def _atomic_write_bytes(target: Path, data: bytes, *, overwrite: bool) -> None:
     """Write bytes atomically with O_CREAT|O_EXCL no-clobber default."""
-    target.parent.mkdir(parents=True, exist_ok=True)
+    reject_symlink_chain(target)
+    if target.exists() and target.is_dir():
+        raise SafetyError(f"Refusing to overwrite directory target: {target}")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SafetyError(f"Cannot create parent directory for {target}: {exc}") from exc
     reject_symlink_chain(target.parent)
+    if target.exists() and target.is_dir():
+        raise SafetyError(f"Refusing to overwrite directory target: {target}")
     if target.exists() and not overwrite:
         raise SafetyError(f"Target file already exists (pass --overwrite to replace): {target}")
     if _is_reparse_point(target):
@@ -157,31 +225,46 @@ def _atomic_write_bytes(target: Path, data: bytes, *, overwrite: bool) -> None:
             raise SafetyError(
                 f"Target file already exists (pass --overwrite to replace): {target}"
             ) from exc
+        except OSError as exc:
+            raise SafetyError(f"Failed to create target file {target}: {exc}") from exc
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
-        except Exception:
+        except OSError as exc:
             try:
                 target.unlink(missing_ok=True)
             except OSError:
                 pass
-            raise
+            raise SafetyError(f"Failed writing target file {target}: {exc}") from exc
         return
 
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix=".legends-a2ui-", suffix=".tmp", dir=str(target.parent)
-    )
+    try:
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=".legends-a2ui-", suffix=".tmp", dir=str(target.parent)
+        )
+    except OSError as exc:
+        raise SafetyError(f"Failed creating temporary file next to {target}: {exc}") from exc
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(tmp_fd, "wb") as handle:
             handle.write(data)
+        if target.exists() and target.is_dir():
+            raise SafetyError(f"Refusing to overwrite directory target: {target}")
+        if _is_reparse_point(target):
+            raise SafetyError(f"Refusing to write through symlink/reparse target: {target}")
         os.replace(str(tmp_path), str(target))
-    except Exception:
+    except SafetyError:
         try:
             tmp_path.unlink(missing_ok=True)
         except OSError:
             pass
         raise
+    except OSError as exc:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise SafetyError(f"Atomic replace failed for {target}: {exc}") from exc
 
 
 def execute_write_plan(
@@ -195,6 +278,10 @@ def execute_write_plan(
     """Preview or apply a multi-file write plan with SHA-256 confirmation and safety checks."""
     entries: list[dict[str, Any]] = []
     validated_pairs: list[tuple[Path, bytes]] = []
+    resolved_base: Path | None = None
+    if base_dir is not None:
+        reject_symlink_chain(base_dir)
+        resolved_base = base_dir.resolve()
 
     for raw_target, content in planned:
         target = Path(raw_target)
@@ -204,10 +291,19 @@ def execute_write_plan(
         else:
             target = Path(os.path.abspath(str(target)))
         reject_cfa_protected_path(target)
+        if target.exists() and target.is_dir():
+            raise SafetyError(f"Refusing directory as file write target: {target}")
+        exists = target.exists()
+        existing_sha256: str | None = None
+        if target.is_file():
+            try:
+                existing_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise SafetyError(f"Cannot hash existing file {target}: {exc}") from exc
         digest = hashlib.sha256(content).hexdigest()
         rel_display = (
-            target.relative_to(base_dir.resolve()).as_posix()
-            if base_dir is not None
+            target.relative_to(resolved_base).as_posix()
+            if resolved_base is not None
             else str(target)
         )
         entries.append(
@@ -216,12 +312,13 @@ def execute_write_plan(
                 "absolutePath": str(target),
                 "bytes": len(content),
                 "sha256": digest,
-                "exists": target.exists(),
+                "exists": exists,
+                "existingSha256": existing_sha256,
             }
         )
         validated_pairs.append((target, content))
 
-    plan_sha = compute_plan_sha256(entries)
+    plan_sha = compute_plan_sha256(entries, base_dir=resolved_base)
 
     if not apply:
         return {
@@ -258,13 +355,24 @@ def execute_write_plan(
 
 
 def is_public_ip(ip_str: str) -> bool:
-    """Return True only if IP is globally routable (rejects private/loopback/CGNAT/link-local)."""
+    """Return True only if IP is globally routable (rejects private/loopback/CGNAT/link-local/transition)."""
+    if not isinstance(ip_str, str) or "%" in ip_str:
+        return False
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    if addr.version == 4 and addr in _CGNAT_NET:
+    if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT_NET:
         return False
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return is_public_ip(str(addr.ipv4_mapped))
+        if addr.sixtofour is not None:
+            return False
+        if addr.teredo is not None:
+            return False
+        if addr in _NAT64_WELL_KNOWN or addr in _NAT64_LOCAL:
+            return False
     if (
         addr.is_private
         or addr.is_loopback
@@ -294,7 +402,11 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
     def connect(self) -> None:
         raw_sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
-        self.sock = self._context.wrap_socket(raw_sock, server_hostname=self.host)
+        try:
+            self.sock = self._context.wrap_socket(raw_sock, server_hostname=self.host)
+        except BaseException:
+            raw_sock.close()
+            raise
 
 
 def _resolve_pinned_public_ip(hostname: str, port: int) -> str:
@@ -314,6 +426,23 @@ def _resolve_pinned_public_ip(hostname: str, port: int) -> str:
     return ips[0]
 
 
+def create_tls_context() -> ssl.SSLContext:
+    """Create a strict TLS 1.2+ SSLContext, opportunistically loading certifi if installed."""
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ssl_ctx.check_hostname = True
+    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+    try:
+        import certifi  # type: ignore[import-not-found]
+
+        cafile = certifi.where()
+        if cafile and os.path.isfile(cafile):
+            ssl_ctx.load_verify_locations(cafile=cafile)
+    except Exception:
+        pass
+    return ssl_ctx
+
+
 def safe_https_get_json(
     url: str,
     *,
@@ -325,14 +454,13 @@ def safe_https_get_json(
     """Fetch JSON over HTTPS with host allowlist, DNS IP pinning, and safe redirects (CWE-918)."""
     current_url = url
     req_headers = {
-        "User-Agent": "legends-a2ui/0.1.0",
+        "User-Agent": f"legends-a2ui/{__version__}",
         "Accept": "application/json",
     }
     if headers:
         req_headers.update(headers)
 
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ssl_ctx = create_tls_context()
 
     for _hop in range(max_redirects + 1):
         parsed = urlsplit(current_url)

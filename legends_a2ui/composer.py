@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from legends_a2ui.normalizer import format_a2ui_messages
@@ -612,14 +613,42 @@ def _media_review(v: dict[str, Any], surface_id: str) -> list[dict[str, Any]]:
     ]
 
 
+def _parse_finite_int(raw: Any, default: int, name: str) -> int:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        raise ValueError(f"Variable '{name}' must be an integer (got boolean).")
+    try:
+        if isinstance(raw, float) and not math.isfinite(raw):
+            raise ValueError(f"Variable '{name}' must be a finite integer.")
+        val = int(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Variable '{name}' must be a valid integer (got {raw!r}).") from exc
+    return val
+
+
+def _parse_finite_float(raw: Any, default: float, name: str) -> float:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        raise ValueError(f"Variable '{name}' must be a finite number (got boolean).")
+    try:
+        val = float(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Variable '{name}' must be a valid number (got {raw!r}).") from exc
+    if not math.isfinite(val):
+        raise ValueError(f"Variable '{name}' must be a finite number (got {raw!r}).")
+    return val
+
+
 def _wizard_step(v: dict[str, Any], surface_id: str) -> list[dict[str, Any]]:
-    step_num = int(v.get("step", 1))
-    total_steps = int(v.get("total_steps", 3))
+    step_num = _parse_finite_int(v.get("step"), 1, "step")
+    total_steps = _parse_finite_int(v.get("total_steps"), 3, "total_steps")
     title = str(v.get("title", "Configure Deployment Parameters"))
     slider_label = str(v.get("slider_label", "Rollout percentage"))
-    slider_min = float(v.get("min", 0))
-    slider_max = float(v.get("max", 100))
-    slider_val = float(v.get("value", 25))
+    slider_min = _parse_finite_float(v.get("min"), 0.0, "min")
+    slider_max = _parse_finite_float(v.get("max"), 100.0, "max")
+    slider_val = _parse_finite_float(v.get("value"), 25.0, "value")
     return [
         {
             "version": "1.0",
@@ -819,8 +848,30 @@ def compose_surface(
         }
 
     sid = surface_id or sanitize_uax31_id(f"surface_{template_name}")
-    messages = TEMPLATES[template_name]["builder"](vars_dict, sid)
-    validation = validate_payload(json.dumps(messages), version="1.0", strict=True)
+    try:
+        messages = TEMPLATES[template_name]["builder"](vars_dict, sid)
+        serialized = json.dumps(messages, allow_nan=False)
+    except (ValueError, TypeError) as exc:
+        return {
+            "ok": False,
+            "template": template_name,
+            "error": str(exc),
+            "payload": None,
+            "formatted": "",
+            "validation": {
+                "ok": False,
+                "errors": [
+                    {
+                        "code": "INVALID_TEMPLATE_VARIABLE",
+                        "blockIndex": 0,
+                        "path": "$",
+                        "message": str(exc),
+                    }
+                ],
+                "warnings": [],
+            },
+        }
+    validation = validate_payload(serialized, version="1.0", strict=True)
     formatted = format_a2ui_messages(messages, fmt) if validation["ok"] else ""
     return {
         "ok": bool(validation["ok"]),

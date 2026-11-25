@@ -21,15 +21,33 @@ from legends_a2ui.net_safety import (
 from legends_a2ui.resources import get_knowledge_pack_path, get_vendor_dir
 from legends_a2ui.spec_registry import (
     BROKEN_V09_CATALOG_ID,
+    CANONICAL_V09_CATALOG_ID,
+    CANONICAL_V1_CATALOG_ID,
     PINNED_UPSTREAM_COMMIT,
     verify_vendor_manifest,
 )
 
 MIN_A2UI_NPM_VERSION = (0, 16, 0)
 _SKIP_DIRS = frozenset(
-    {"node_modules", ".git", ".venv", "venv", "dist", "build", "__pycache__", ".next", ".astro"}
+    {
+        "node_modules",
+        ".git",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        "__pycache__",
+        ".next",
+        ".astro",
+        "__tests__",
+    }
 )
+_TEST_FILE_RE = re.compile(r"\.(?:test|spec)\.[^.]+$", re.IGNORECASE)
 _V08_KEYS_RE = re.compile(r"\b(?:beginRendering|surfaceUpdate|dataModelUpdate)\b")
+_DEFENSIVE_CONST_RE = re.compile(r"\b(?:BROKEN_V09_CATALOG_ID|LEGACY_[A-Z0-9_]*)\b")
+_DEFENSIVE_PARSER_RE = re.compile(
+    r"\b(?:normalizeVersion|normalizeMessage|parseA2uiPayload|upgradeLegacy)\b"
+)
 
 
 def _parse_semver_prefix(raw: str) -> tuple[int, int, int] | None:
@@ -68,14 +86,30 @@ def check_knowledge_pack(pack_path: Path | None = None) -> dict[str, Any]:
         errors.append("Knowledge pack has no files listed.")
     for item in files:
         rel = item.get("path", "")
-        if not isinstance(rel, str) or not rel or ".." in Path(rel).parts:
+        rel_path = Path(rel) if isinstance(rel, str) else None
+        if (
+            not isinstance(rel, str)
+            or not rel
+            or rel_path is None
+            or rel_path.is_absolute()
+            or bool(rel_path.drive)
+            or ".." in rel_path.parts
+        ):
             errors.append(f"Unsafe pack file path: {rel!r}")
             continue
         target = vault_dir / rel
-        if not target.is_file():
+        if target.is_symlink():
+            errors.append(f"Symlink refused in pack vault: {rel}")
+            continue
+        try:
+            resolved = ensure_within_base(target, vault_dir)
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+        if not resolved.is_file():
             errors.append(f"Missing pack vault file: {rel}")
             continue
-        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
         if digest != item.get("sha256"):
             errors.append(f"SHA-256 mismatch for pack file: {rel}")
 
@@ -120,6 +154,44 @@ def _probe_playwright() -> dict[str, Any]:
     has_py = importlib.util.find_spec("playwright") is not None
     has_bin = shutil.which("playwright") is not None
     return {"available": bool(has_py or has_bin), "pythonPackage": has_py, "cli": has_bin}
+
+
+def _has_active_broken_catalog_uri(text: str, *, has_canonical_both: bool) -> bool:
+    """Return True if BROKEN_V09_CATALOG_ID appears outside defensive rewrite constants."""
+    if BROKEN_V09_CATALOG_ID not in text:
+        return False
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if BROKEN_V09_CATALOG_ID not in line:
+            continue
+        prev_line = lines[idx - 1] if idx > 0 else ""
+        context = f"{prev_line} {line}"
+        if has_canonical_both and _DEFENSIVE_CONST_RE.search(context):
+            continue
+        return True
+    return False
+
+
+def _has_active_v08_keys(text: str, *, has_canonical_both: bool) -> bool:
+    """Return True if legacy v0.8 keys appear outside canonical v1.0/v0.9 upgrade parsers."""
+    if not _V08_KEYS_RE.search(text):
+        return False
+    if (
+        has_canonical_both
+        and "createSurface" in text
+        and "updateComponents" in text
+        and _DEFENSIVE_PARSER_RE.search(text)
+    ):
+        return False
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if not _V08_KEYS_RE.search(line):
+            continue
+        prev_line = lines[idx - 1] if idx > 0 else ""
+        if has_canonical_both and _DEFENSIVE_CONST_RE.search(f"{prev_line} {line}"):
+            continue
+        return True
+    return False
 
 
 def inspect_project(project_dir: Path) -> dict[str, Any]:
@@ -177,6 +249,8 @@ def inspect_project(project_dir: Path) -> dict[str, Any]:
             continue
         if path.name.startswith(".env"):
             continue
+        if _TEST_FILE_RE.search(path.name):
+            continue
         if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx", ".md"}:
             continue
         try:
@@ -188,9 +262,12 @@ def inspect_project(project_dir: Path) -> dict[str, Any]:
             continue
         scanned += 1
         rel = path.relative_to(root).as_posix()
-        if BROKEN_V09_CATALOG_ID in text:
+        has_canonical_both = (
+            CANONICAL_V1_CATALOG_ID in text and CANONICAL_V09_CATALOG_ID in text
+        )
+        if _has_active_broken_catalog_uri(text, has_canonical_both=has_canonical_both):
             broken_uri_hits.append(rel)
-        if _V08_KEYS_RE.search(text):
+        if _has_active_v08_keys(text, has_canonical_both=has_canonical_both):
             v08_key_hits.append(rel)
 
     if broken_uri_hits:

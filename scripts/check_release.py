@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import struct
+import subprocess
 import sys
 from urllib.parse import unquote
 
@@ -72,7 +73,14 @@ FORBIDDEN = [
     r"(?i)sk_live_[a-z0-9]{12,}",
     r"(?i)rk_live_[a-z0-9]{12,}",
     r"gh[pousr]_[A-Za-z0-9]{20,}",
-    r"-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----",
+    r"github_pat_[A-Za-z0-9_]{22,}",
+    r"sk-proj-[A-Za-z0-9_-]{20,}",
+    r"sk-svcacct-[A-Za-z0-9_-]{20,}",
+    r"sk-ant-[A-Za-z0-9_-]{20,}",
+    r"\bASIA[0-9A-Z]{16}\b",
+    r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+    r"\bAIza[0-9A-Za-z_-]{35}\b",
+    r"-----BEGIN (?:RSA |OPENSSH |EC |DSA |ENCRYPTED |PGP )?PRIVATE KEY-----",
     r"CREATE_NO_WINDOW",
     r"0x08000000",
     r"(?i)windowsHide\s*:\s*true",
@@ -84,6 +92,12 @@ FORBIDDEN = [
     r"(?i)IndexedDB",
     r"(?i)ctolegends\.com",
     r"(?i)rccol",
+]
+INTERNAL_MARKERS = [
+    r"\bStage [1-5]\b",
+    r"\bBT-0[1-9]\b",
+    r"\bC[1-9]-0[1-9]\b",
+    r"(?i)\bbattle-test\b",
 ]
 FORBIDDEN_FILES = {".pem", ".key", ".p12", ".pfx", ".ps1", ".bat", ".cmd", ".vbs", ".ahk"}
 PNG_METADATA_CHUNKS = {"tEXt", "iTXt", "zTXt", "eXIf"}
@@ -230,13 +244,25 @@ def check(root: Path = ROOT) -> list[str]:
     if pack_path.is_file():
         try:
             pack = json.loads(pack_path.read_text(encoding="utf-8-sig"))
-            vault_dir = pack_path.parent / "vault"
+            vault_dir = (pack_path.parent / "vault").resolve()
             for f_entry in pack.get("files", []):
-                v_target = vault_dir / f_entry.get("path", "")
-                if not v_target.is_file():
-                    errors.append(f"Pack file missing: {f_entry.get('path')}")
-                elif hashlib.sha256(v_target.read_bytes()).hexdigest() != f_entry.get("sha256"):
-                    errors.append(f"Pack file hash mismatch: {f_entry.get('path')}")
+                rel_p = f_entry.get("path", "")
+                rp = Path(rel_p) if isinstance(rel_p, str) else None
+                if not isinstance(rel_p, str) or not rel_p or rp is None or rp.is_absolute() or bool(rp.drive) or ".." in rp.parts:
+                    errors.append(f"Unsafe pack file path: {rel_p!r}")
+                    continue
+                v_target = vault_dir / rel_p
+                if v_target.is_symlink():
+                    errors.append(f"Symlink refused in pack vault: {rel_p}")
+                    continue
+                v_resolved = v_target.resolve()
+                if not v_resolved.is_relative_to(vault_dir):
+                    errors.append(f"Pack file escapes vault containment: {rel_p}")
+                    continue
+                if not v_resolved.is_file():
+                    errors.append(f"Pack file missing: {rel_p}")
+                elif hashlib.sha256(v_resolved.read_bytes()).hexdigest() != f_entry.get("sha256"):
+                    errors.append(f"Pack file hash mismatch: {rel_p}")
         except Exception as exc:
             errors.append(f"Invalid knowledge/a2ui/pack.json: {exc}")
 
@@ -244,9 +270,17 @@ def check(root: Path = ROOT) -> list[str]:
     if vendor_manifest.is_file():
         try:
             v_data = json.loads(vendor_manifest.read_text(encoding="utf-8-sig"))
+            v_base = vendor_manifest.parent.resolve()
             for item in v_data.get("files", []):
                 rel_p = item.get("localPath", "")
-                vf = vendor_manifest.parent / rel_p
+                rp = Path(rel_p) if isinstance(rel_p, str) else None
+                if not isinstance(rel_p, str) or not rel_p or rp is None or rp.is_absolute() or bool(rp.drive) or ".." in rp.parts:
+                    errors.append(f"Unsafe vendor spec path: {rel_p!r}")
+                    continue
+                vf = v_base / rel_p
+                if vf.is_symlink() or not vf.resolve().is_relative_to(v_base):
+                    errors.append(f"Vendor spec escapes containment: {rel_p}")
+                    continue
                 if not vf.is_file():
                     errors.append(f"Missing vendor spec file: {rel_p}")
                 elif hashlib.sha256(vf.read_bytes()).hexdigest() != item.get("sha256"):
@@ -275,10 +309,31 @@ def check(root: Path = ROOT) -> list[str]:
                     errors.append(f"Possible private or EDR-sensitive residue ({pattern}): {rel}")
         if rel.as_posix().startswith("vendor/"):
             continue
+        if path.name != "check_release.py":
+            for marker in INTERNAL_MARKERS:
+                if re.search(marker, text):
+                    errors.append(f"Internal pipeline marker ({marker}) must not ship: {rel}")
         if "\u2014" in text or "\u2013" in text:
             errors.append(f"Disallowed em/en-dash in non-vendor file: {rel}")
         if path.suffix == ".md":
             errors.extend(check_links(path, root))
+
+    if (root / ".git").exists():
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(root), "log", "--format=%H %s"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    for marker in INTERNAL_MARKERS:
+                        if re.search(marker, line):
+                            errors.append(f"Internal pipeline marker ({marker}) in git log: {line}")
+        except OSError:
+            pass
     return errors
 
 
