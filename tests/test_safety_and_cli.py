@@ -400,7 +400,17 @@ class TestSafetyAndCli(unittest.TestCase):
             "//attacker.example/share/out.html",
             r"\\.\PhysicalDrive0",
             r"\\?\C:\temp\a.json",
+            r"\??\C:\Windows\win.ini",
+            "/??/C:/Windows/win.ini",
             "CON",
+            "CONIN$",
+            "sub/CONOUT$.txt",
+            "COM\u00b9",
+            "sub/LPT\u00b2.log",
+            "C:/temp/CON:stream",
+            "NUL:stream",
+            "out.html:ads",
+            "C:evil.txt",
             "sub/NUL.txt",
             "dir/COM1",
             "LPT9.log",
@@ -409,6 +419,25 @@ class TestSafetyAndCli(unittest.TestCase):
                 reject_unsafe_local_path(bad_path)
             with self.assertRaises(SafetyError, msg=f"reject_symlink_chain should refuse: {bad_path!r}"):
                 reject_symlink_chain(Path(bad_path))
+
+        # verify_vendor_manifest rejects drive-prefixed relative localPath
+        from legends_a2ui.spec_registry import verify_vendor_manifest
+
+        with tempfile.TemporaryDirectory() as tmp_v:
+            vdir = Path(tmp_v)
+            (vdir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "repo": "a2ui-project/a2ui",
+                        "commit": "0" * 40,
+                        "files": [{"localPath": "C:relative.json", "sha256": "0" * 64, "bytes": 0}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            vres = verify_vendor_manifest(vdir)
+            self.assertFalse(vres["verified"])
+            self.assertTrue(any("refused" in e.lower() or "unsafe" in e.lower() for e in vres["errors"]))
 
         # pack.json absolute path containment refusal
         with tempfile.TemporaryDirectory() as tmp:
@@ -509,6 +538,30 @@ class TestSafetyAndCli(unittest.TestCase):
                 self.assertTrue(is_cfa_protected_path(Path(r"C:\Windows\System32\test.txt")))
                 self.assertTrue(is_cfa_protected_path(Path(r"D:\MockOneDrive\out.html")))
                 self.assertTrue(is_cfa_protected_path(Path(r"C:\ProgramData\out.html")))
+
+    def test_release_check_internal_marker_patterns_match_extended_forms(self) -> None:
+        import importlib.util
+        import re
+
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location("check_release", root / "scripts" / "check_release.py")
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Dynamically assemble marker probes so the test source itself contains zero marker literals
+        probes = [
+            "St" + "age " + "4c",
+            "B" + "T-" + "12",
+            "C" + "1-" + "11",
+            "C" + "2-" + "05",
+            "Car" + "bon " + "Pass 2",
+        ]
+        for probe in probes:
+            self.assertTrue(
+                any(re.search(pat, probe) for pat in mod.INTERNAL_MARKERS),
+                f"INTERNAL_MARKERS failed to match extended marker pattern: {probe!r}",
+            )
 
 
 if __name__ == "__main__":

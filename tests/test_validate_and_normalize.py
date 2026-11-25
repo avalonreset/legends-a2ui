@@ -728,6 +728,346 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertIn("@@type", comps["go_btn"]["action"]["event"]["context"]["meta"])
         self.assertEqual(nres["payload"][1]["action"]["sourceComponentId"], "go_btn")
 
+    def test_mixed_formatstring_array_data_model_rpc_envelopes_and_dynamic_slots(self) -> None:
+        """Mixed formatString URLs, array updateDataModel, RPC envelopes, catalogId openUrl, and dynamic slots fail closed."""
+        # 1. Mixed resolved + unresolved formatString URLs fail closed
+        mixed_fmt = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "mixed_fmt",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["img_m", "btn_m"]},
+                    {
+                        "id": "img_m",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": "/${/evil}${/missing}"}},
+                    },
+                    {
+                        "id": "btn_m",
+                        "component": "Button",
+                        "child": "btn_lbl",
+                        "action": {
+                            "functionCall": {
+                                "@call": "openUrl",
+                                "args": {
+                                    "url": {
+                                        "@call": "formatString",
+                                        "args": {"value": "https://${/creds}evil.example/${/missing}"},
+                                    }
+                                },
+                            }
+                        },
+                    },
+                    {"id": "btn_lbl", "component": "Text", "text": "Open"},
+                ],
+                "dataModel": {
+                    "evil": "/attacker.example/x.png?",
+                    "creds": "a2ui.org@",
+                },
+            },
+        }
+        res_m = validate_payload(json.dumps(mixed_fmt), version="1.0", strict=True)
+        self.assertFalse(res_m["ok"])
+        codes_m = {e["code"] for e in res_m["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", codes_m)
+        self.assertIn("UNSAFE_OPEN_URL", codes_m)
+
+        # 2. updateDataModel array-index mutations propagate to ChildList templates and absolute @path checks
+        arr_mut = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "arr_mut",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["list_a", "abs_img"]},
+                        {"id": "list_a", "component": "List", "children": {"componentId": "row_img", "path": "/items"}},
+                        {"id": "row_img", "component": "Image", "url": {"@path": "url"}},
+                        {"id": "abs_img", "component": "Image", "url": {"@path": "/items/0/url"}},
+                    ],
+                    "dataModel": {"items": [{"url": "https://example.com/safe.png"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "arr_mut",
+                    "path": "/items/0/url",
+                    "value": "javascript:alert(1)",
+                },
+            },
+        ]
+        res_arr = validate_payload(json.dumps(arr_mut), version="1.0", strict=True)
+        self.assertFalse(res_arr["ok"])
+        media_errs = [e for e in res_arr["errors"] if e["code"] == "UNSAFE_MEDIA_URL"]
+        self.assertGreaterEqual(len(media_errs), 2)
+
+        # 3. callRendererFunction and callAgentFunction envelopes validate required fields and reject openUrl/ReDoS
+        rpc_bad = [
+            {
+                "version": "1.0",
+                "callRendererFunction": {
+                    "functionCallId": "call_1",
+                    "callFunction": {
+                        "@call": "openUrl",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "args": {"url": "javascript:alert(1)"},
+                    },
+                },
+            },
+            {
+                "version": "1.0",
+                "callAgentFunction": {
+                    "functionCallId": "",
+                    "callFunction": {
+                        "@call": "regex",
+                        "args": {"value": "abc", "pattern": "(a+)+$"},
+                    },
+                },
+            },
+        ]
+        res_rpc = validate_payload(json.dumps(rpc_bad), version="1.0", strict=True)
+        self.assertFalse(res_rpc["ok"])
+        codes_rpc = {e["code"] for e in res_rpc["errors"]}
+        self.assertIn("INVALID_FUNCTION_CALL_SITE", codes_rpc)
+        self.assertIn("UNSAFE_OPEN_URL", codes_rpc)
+        self.assertIn("MISSING_FUNCTION_CALL_ID", codes_rpc)
+        self.assertIn("MISSING_CATALOG_ID", codes_rpc)
+        self.assertIn("UNSAFE_REGEX", codes_rpc)
+
+        # Valid callRendererFunction passes strict validation
+        rpc_ok = {
+            "version": "1.0",
+            "callRendererFunction": {
+                "functionCallId": "call_ok",
+                "callFunction": {
+                    "@call": "formatNumber",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "args": {"value": 42},
+                },
+            },
+        }
+        self.assertTrue(validate_payload(json.dumps(rpc_ok), version="1.0", strict=True)["ok"])
+
+        # 4. Unconditional openUrl & regex safety regardless of FunctionCall.catalogId
+        custom_fn_bypass = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "fn_cat_bypass",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["t_open", "b_missing", "f_redos"]},
+                    {
+                        "id": "t_open",
+                        "component": "Text",
+                        "text": {
+                            "@call": "openUrl",
+                            "catalogId": "custom:cat",
+                            "args": {"url": "https://a2ui.org"},
+                        },
+                    },
+                    {
+                        "id": "b_missing",
+                        "component": "Button",
+                        "child": "b_lbl",
+                        "action": {"functionCall": {"@call": "openUrl", "catalogId": "custom:cat"}},
+                    },
+                    {"id": "b_lbl", "component": "Text", "text": "Go"},
+                    {
+                        "id": "f_redos",
+                        "component": "TextField",
+                        "label": "Code",
+                        "value": {"@path": "/code"},
+                        "@checks": [
+                            {
+                                "condition": {
+                                    "@call": "regex",
+                                    "catalogId": "custom:cat",
+                                    "args": {"value": {"@path": "/code"}, "pattern": "(a+)+$"},
+                                },
+                                "message": "Bad",
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+        res_cf = validate_payload(json.dumps(custom_fn_bypass), version="1.0", strict=True)
+        self.assertFalse(res_cf["ok"])
+        codes_cf = {e["code"] for e in res_cf["errors"]}
+        self.assertIn("INVALID_FUNCTION_CALL_SITE", codes_cf)
+        self.assertIn("MISSING_REQUIRED_FUNCTION_ARG", codes_cf)
+        self.assertIn("UNSAFE_REGEX", codes_cf)
+
+        # 5. Unchecked DynamicValue slots: ChoicePicker.options[].label, Tabs.tabs[], Icon.name, @accessibility
+        slots_bad = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "slots_bad",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["cp", "tabs", "ico", "acc_txt"]},
+                    {
+                        "id": "cp",
+                        "component": "ChoicePicker",
+                        "value": {"@path": "/choice"},
+                        "options": [
+                            {
+                                "label": {"@call": "openUrl", "args": {"url": "javascript:alert(1)"}},
+                                "value": "a",
+                                "extra": True,
+                            }
+                        ],
+                    },
+                    {
+                        "id": "tabs",
+                        "component": "Tabs",
+                        "tabs": [{"title": "One", "child": "tab_body", "extra": 1}],
+                    },
+                    {"id": "tab_body", "component": "Text", "text": "Tab 1"},
+                    {
+                        "id": "ico",
+                        "component": "Icon",
+                        "name": {
+                            "svgPath": {"@call": "openUrl", "args": {"url": "https://a2ui.org"}},
+                            "bogus": 1,
+                        },
+                    },
+                    {
+                        "id": "acc_txt",
+                        "component": "Text",
+                        "text": "Status",
+                        "@accessibility": {
+                            "label": {"path": "/lbl"},
+                            "live": "invalid_mode",
+                            "extraProp": 1,
+                        },
+                    },
+                ],
+            },
+        }
+        res_sl = validate_payload(json.dumps(slots_bad), version="1.0", strict=True)
+        self.assertFalse(res_sl["ok"])
+        codes_sl = {e["code"] for e in res_sl["errors"]}
+        self.assertIn("UNKNOWN_CHOICE_OPTION_PROPERTY", codes_sl)
+        self.assertIn("UNKNOWN_TAB_ITEM_PROPERTY", codes_sl)
+        self.assertIn("INVALID_ICON_NAME", codes_sl)
+        self.assertIn("INVALID_ACCESSIBILITY", codes_sl)
+        self.assertIn("UNSAFE_OPEN_URL", codes_sl)
+        self.assertIn("INVALID_FUNCTION_CALL_SITE", codes_sl)
+        self.assertIn("TRANSITIONAL_PATH_BINDING", codes_sl)
+
+    def test_custom_surface_catalog_and_legacy_normalization_edge_cases(self) -> None:
+        """Custom surface catalogId inherits cleanly; v0.9 List.listStyle, v0.8 MultipleChoice.variant, and collision validationRegexp normalize cleanly."""
+        # 1. Valid custom-catalog surface passes strict validation while still checking URLs
+        custom_surface = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "chart_surface",
+                "catalogId": "https://acme.example/catalogs/charts/v1/catalog.json",
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "BarChart",
+                        "series": [1, 2, 3],
+                        "title": {"@call": "formatChartTitle", "args": {"prefix": "Q4"}},
+                    }
+                ],
+            },
+        }
+        res_custom = validate_payload(json.dumps(custom_surface), version="1.0", strict=True)
+        self.assertTrue(res_custom["ok"], res_custom["errors"])
+
+        # Custom surface still blocks unsafe URLs
+        custom_unsafe = json.loads(json.dumps(custom_surface))
+        custom_unsafe["createSurface"]["components"][0]["url"] = "javascript:alert(1)"
+        res_cu = validate_payload(json.dumps(custom_unsafe), version="1.0", strict=True)
+        self.assertFalse(res_cu["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_cu["errors"]})
+
+        # 2. v0.9 List.listStyle stripped cleanly
+        v09_list = {
+            "version": "0.9",
+            "createSurface": {
+                "surfaceId": "s_list",
+                "catalogId": "https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json",
+            },
+        }
+        v09_comps = {
+            "version": "0.9",
+            "updateComponents": {
+                "surfaceId": "s_list",
+                "components": [
+                    {"id": "root", "component": "List", "listStyle": "bulleted", "children": ["item_a"]},
+                    {"id": "item_a", "component": "Text", "text": "Item A"},
+                ],
+            },
+        }
+        n_list = normalize_payload(json.dumps([v09_list, v09_comps]), fmt="json")
+        self.assertTrue(n_list["ok"], n_list["validation"])
+        root_list = n_list["payload"][1]["updateComponents"]["components"][0]
+        self.assertNotIn("listStyle", root_list)
+
+        # 3. v0.8 MultipleChoice.variant ("chips"/"checkbox") -> displayStyle + variant from maxAllowedSelections
+        v08_mc = [
+            {"beginRendering": {"surfaceId": "mc_s", "root": "root"}},
+            {
+                "surfaceUpdate": {
+                    "surfaceId": "mc_s",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": {
+                                "MultipleChoice": {
+                                    "variant": "chips",
+                                    "selections": {"path": "/tags"},
+                                    "maxAllowedSelections": 1,
+                                    "options": [
+                                        {"label": {"literalString": "One"}, "value": "one"},
+                                    ],
+                                }
+                            },
+                        }
+                    ],
+                }
+            },
+        ]
+        n_mc = normalize_payload(json.dumps(v08_mc), fmt="json")
+        self.assertTrue(n_mc["ok"], n_mc["validation"])
+        cp = n_mc["payload"][1]["updateComponents"]["components"][0]
+        self.assertEqual(cp["component"], "ChoicePicker")
+        self.assertEqual(cp["displayStyle"], "chips")
+        self.assertEqual(cp["variant"], "mutuallyExclusive")
+
+        # 4. Collision-suffixed TextField.validationRegexp binds to final suffixed @path
+        coll_re = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "coll_re",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["code_1", "code-1"]},
+                    {"id": "code_1", "component": "TextField", "label": "Primary Code"},
+                    {
+                        "id": "code-1",
+                        "component": "TextField",
+                        "label": "Secondary Code",
+                        "validationRegexp": "^[A-Z]{3}$",
+                    },
+                ],
+            },
+        }
+        n_re = normalize_payload(json.dumps(coll_re), fmt="json")
+        self.assertTrue(n_re["ok"], n_re["validation"])
+        re_comps = {c["id"]: c for c in n_re["payload"][0]["createSurface"]["components"]}
+        self.assertIn("code_1_2", re_comps)
+        self.assertEqual(re_comps["code_1_2"]["value"], {"@path": "/code_1_2"})
+        self.assertEqual(
+            re_comps["code_1_2"]["@checks"][0]["condition"]["args"]["value"],
+            {"@path": "/code_1_2"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -248,10 +248,18 @@ def _normalize_component(raw_comp: dict[str, Any], changes: list[str]) -> dict[s
     if ctype == "Image" and comp.get("fit") == "scale-down":
         comp["fit"] = "scaleDown"
         changes.append("renamed Image.fit scale-down -> scaleDown")
+    if ctype == "List" and "listStyle" in comp:
+        comp.pop("listStyle", None)
+        changes.append("stripped removed v0.9 List.listStyle")
     if ctype == "ChoicePicker":
         if "selections" in comp and "value" not in comp:
             comp["value"] = comp.pop("selections")
             changes.append("renamed ChoicePicker.selections -> value")
+        if comp.get("variant") in {"checkbox", "chips"}:
+            legacy_display = comp.pop("variant")
+            if "displayStyle" not in comp:
+                comp["displayStyle"] = legacy_display
+            changes.append(f"moved legacy ChoicePicker.variant '{legacy_display}' -> displayStyle")
         if "maxAllowedSelections" in comp:
             max_sel = comp.pop("maxAllowedSelections")
             if "variant" not in comp:
@@ -285,23 +293,8 @@ def _normalize_component(raw_comp: dict[str, Any], changes: list[str]) -> dict[s
             changes.append("renamed TextField.textFieldType -> variant")
         if "validationRegexp" in comp:
             pattern = comp.pop("validationRegexp")
-            val_ref = comp.get("value")
-            if isinstance(val_ref, dict):
-                val_ref = _upgrade_dynamic_value(val_ref, changes)
-            if not val_ref and isinstance(comp.get("id"), str):
-                val_ref = {"@path": f"/{sanitize_uax31_id(comp['id'])}"}
             if isinstance(pattern, str) and pattern:
-                checks_list = comp.setdefault("@checks", [])
-                checks_list.append(
-                    {
-                        "condition": {
-                            "@call": "regex",
-                            "args": {"value": val_ref, "pattern": pattern},
-                        },
-                        "message": "Invalid format.",
-                    }
-                )
-                changes.append("converted TextField.validationRegexp -> @checks regex")
+                comp["_pendingValidationRegexp"] = pattern
 
     # Children upgrades (v0.8 explicitList/template -> v1.0 ChildList; keep ChildList.path UNPREFIXED!)
     if "children" in comp and isinstance(comp["children"], dict):
@@ -686,13 +679,30 @@ def normalize_payload(
                     act["sourceComponentId"] = id_map[old_src]
                     changes.append(f"remapped action.sourceComponentId '{old_src}' -> '{act['sourceComponentId']}'")
 
-        # Synthesize missing TextField.value after final UAX #31 ID remapping
+        # Synthesize missing TextField.value and deferred validationRegexp checks after final UAX #31 ID remapping
         for clist in comp_lists:
             for comp in clist:
-                if comp.get("component") == "TextField" and "value" not in comp:
-                    final_id = str(comp.get("id") or "field")
-                    comp["value"] = {"@path": f"/{final_id}"}
-                    changes.append(f"synthesized TextField.value binding '/{final_id}'")
+                if comp.get("component") == "TextField":
+                    if "value" not in comp:
+                        final_id = str(comp.get("id") or "field")
+                        comp["value"] = {"@path": f"/{final_id}"}
+                        changes.append(f"synthesized TextField.value binding '/{final_id}'")
+                    pending_pat = comp.pop("_pendingValidationRegexp", None)
+                    if isinstance(pending_pat, str) and pending_pat:
+                        checks_list = comp.setdefault("@checks", [])
+                        checks_list.append(
+                            {
+                                "condition": {
+                                    "@call": "regex",
+                                    "args": {
+                                        "value": copy.deepcopy(comp["value"]),
+                                        "pattern": pending_pat,
+                                    },
+                                },
+                                "message": "Invalid format.",
+                            }
+                        )
+                        changes.append("converted TextField.validationRegexp -> @checks regex")
 
     formatted = format_a2ui_messages(ensured_msgs, fmt)
     strict_check = validate_payload(

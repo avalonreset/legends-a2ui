@@ -1,12 +1,16 @@
 """Offline A2UI protocol, Basic Catalog, graph, URL safety, and secret validator."""
 from __future__ import annotations
 
+import copy
 import re
 from typing import Any
 
 from legends_a2ui.parser import DEFAULT_MAX_BYTES, DEFAULT_MAX_DEPTH, parse_payload
 from legends_a2ui.spec_registry import (
     BROKEN_V09_CATALOG_ID,
+    CANONICAL_V08_CATALOG_ID,
+    CANONICAL_V09_CATALOG_ID,
+    CANONICAL_V1_CATALOG_ID,
     is_valid_uax31_id,
     load_catalog_spec,
     scan_for_secrets,
@@ -89,6 +93,84 @@ _DYNAMIC_VALUE_PROPS = frozenset(
         "userMessage",
     }
 )
+
+
+_NON_CUSTOM_CATALOG_IDS = frozenset(
+    {
+        "",
+        "basic",
+        "standard",
+        BROKEN_V09_CATALOG_ID,
+        CANONICAL_V1_CATALOG_ID,
+        CANONICAL_V09_CATALOG_ID,
+        CANONICAL_V08_CATALOG_ID,
+    }
+)
+
+
+def _is_custom_catalog_id(cat_id: Any, canonical_catalog_id: str) -> bool:
+    """Return True when cat_id names a non-Basic custom catalog URI/identifier."""
+    if not isinstance(cat_id, str):
+        return False
+    cleaned = cat_id.strip()
+    if not cleaned:
+        return False
+    if cleaned == canonical_catalog_id or cleaned in _NON_CUSTOM_CATALOG_IDS:
+        return False
+    return True
+
+
+def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> None:
+    """Apply an RFC 6901 JSON Pointer mutation across nested dicts and lists (None deletes)."""
+    if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
+        return
+    parts = [p.replace("~1", "/").replace("~0", "~") for p in pointer.lstrip("/").split("/")]
+    if not parts:
+        return
+    cur: Any = root
+    for seg in parts[:-1]:
+        if isinstance(cur, dict):
+            nxt = cur.get(seg)
+            if not isinstance(nxt, (dict, list)):
+                if value is None:
+                    return
+                nxt = {}
+                cur[seg] = nxt
+            cur = nxt
+        elif isinstance(cur, list):
+            if not seg.isdigit():
+                return
+            idx = int(seg)
+            if idx < 0 or idx >= len(cur):
+                return
+            nxt = cur[idx]
+            if not isinstance(nxt, (dict, list)):
+                if value is None:
+                    return
+                nxt = {}
+                cur[idx] = nxt
+            cur = nxt
+        else:
+            return
+    last = parts[-1]
+    if isinstance(cur, dict):
+        if value is None:
+            cur.pop(last, None)
+        else:
+            cur[last] = copy.deepcopy(value)
+    elif isinstance(cur, list):
+        if last.isdigit():
+            idx = int(last)
+            if value is None:
+                if 0 <= idx < len(cur):
+                    cur.pop(idx)
+            else:
+                if 0 <= idx < len(cur):
+                    cur[idx] = copy.deepcopy(value)
+                elif idx == len(cur):
+                    cur.append(copy.deepcopy(value))
+        elif last == "-" and value is not None:
+            cur.append(copy.deepcopy(value))
 
 
 def _detect_message_version(msg: dict[str, Any]) -> str:
@@ -233,16 +315,15 @@ def _validate_url_function_call(
                 )
             return
 
-        # Validate the static-prefix + placeholder form as well as the resolved form
+        # Validate the static-prefix + placeholder form as well as the resolved form unconditionally
         placeholder_str = _FORMAT_EXPR_RE.sub("placeholder", tpl)
         ok_tpl, reason_tpl = validator_fn(placeholder_str)
         if not ok_tpl:
             _add_issue(errors, code, block_index, path, reason_tpl or f"Unsafe {kind} URL template in formatString.")
             return
-        if all_resolved:
-            ok_res, reason_res = validator_fn(resolved_str)
-            if not ok_res:
-                _add_issue(errors, code, block_index, path, reason_res or f"Unsafe resolved {kind} URL.")
+        ok_res, reason_res = validator_fn(resolved_str)
+        if not ok_res:
+            _add_issue(errors, code, block_index, path, reason_res or f"Unsafe resolved {kind} URL.")
         return
 
     _add_issue(
@@ -312,6 +393,7 @@ def _validate_dynamic_value(
     data_model: dict[str, Any],
     catalog_function_specs: dict[str, dict[str, Any]] | None = None,
     catalog_id: str | None = None,
+    effective_catalog_id: str | None = None,
     allow_user_activation: bool = False,
     item_ctx: Any = None,
 ) -> None:
@@ -330,6 +412,7 @@ def _validate_dynamic_value(
                 data_model=data_model,
                 catalog_function_specs=catalog_function_specs,
                 catalog_id=catalog_id,
+                effective_catalog_id=effective_catalog_id,
                 allow_user_activation=False,
                 item_ctx=item_ctx,
             )
@@ -374,14 +457,16 @@ def _validate_dynamic_value(
                 errors, "INVALID_FUNCTION_CALL", block_index, path, "FunctionCall name must be a non-empty string."
             )
             return
-        is_custom_fn_cat = (
-            isinstance(call_val.get("catalogId"), str)
-            and catalog_id is not None
-            and call_val["catalogId"] != catalog_id
+        raw_fn_cat = call_val.get("catalogId")
+        effective_fn_cat = (
+            raw_fn_cat
+            if isinstance(raw_fn_cat, str) and raw_fn_cat.strip()
+            else effective_catalog_id
         )
+        is_custom_fn_cat = _is_custom_catalog_id(effective_fn_cat, catalog_id or "")
         fn_spec = None if is_custom_fn_cat else (catalog_function_specs or {}).get(fn_name)
         if fn_name != "@index" and catalog_functions and fn_name not in catalog_functions:
-            if not is_custom_fn_cat and "catalogId" not in call_val:
+            if not is_custom_fn_cat:
                 _add_issue(
                     warnings if not strict else errors,
                     "UNKNOWN_FUNCTION",
@@ -389,7 +474,8 @@ def _validate_dynamic_value(
                     path,
                     f"Function '{fn_name}' is not in the Basic Catalog.",
                 )
-        if fn_spec and fn_spec.get("requiresUserActivation") and not allow_user_activation:
+        requires_activation = bool(fn_spec and fn_spec.get("requiresUserActivation")) or fn_name == "openUrl"
+        if requires_activation and not allow_user_activation:
             _add_issue(
                 errors,
                 "INVALID_FUNCTION_CALL_SITE",
@@ -399,6 +485,8 @@ def _validate_dynamic_value(
             )
         args = call_val.get("args")
         req_args = list(fn_spec.get("requiredArgs", [])) if fn_spec else []
+        if fn_name == "openUrl" and "url" not in req_args:
+            req_args.append("url")
         allowed_args = set((fn_spec.get("args") or {}).keys()) if fn_spec else set()
 
         if args is None:
@@ -458,6 +546,7 @@ def _validate_dynamic_value(
                     data_model=data_model,
                     catalog_function_specs=catalog_function_specs,
                     catalog_id=catalog_id,
+                    effective_catalog_id=effective_catalog_id,
                     allow_user_activation=False,
                     item_ctx=item_ctx,
                 )
@@ -528,6 +617,7 @@ def _validate_dynamic_value(
             data_model=data_model,
             catalog_function_specs=catalog_function_specs,
             catalog_id=catalog_id,
+            effective_catalog_id=effective_catalog_id,
             allow_user_activation=False,
             item_ctx=item_ctx,
         )
@@ -633,6 +723,7 @@ def _validate_action(
     data_model: dict[str, Any],
     catalog_function_specs: dict[str, dict[str, Any]] | None = None,
     catalog_id: str | None = None,
+    effective_catalog_id: str | None = None,
     item_ctx: Any = None,
 ) -> None:
     if not isinstance(action, dict):
@@ -683,6 +774,7 @@ def _validate_action(
                 data_model=data_model,
                 catalog_function_specs=catalog_function_specs,
                 catalog_id=catalog_id,
+                effective_catalog_id=effective_catalog_id,
                 allow_user_activation=False,
                 item_ctx=item_ctx,
             )
@@ -703,6 +795,7 @@ def _validate_action(
                         data_model=data_model,
                         catalog_function_specs=catalog_function_specs,
                         catalog_id=catalog_id,
+                        effective_catalog_id=effective_catalog_id,
                         allow_user_activation=False,
                         item_ctx=item_ctx,
                     )
@@ -726,6 +819,7 @@ def _validate_action(
             data_model=data_model,
             catalog_function_specs=catalog_function_specs,
             catalog_id=catalog_id,
+            effective_catalog_id=effective_catalog_id,
             allow_user_activation=True,
             item_ctx=item_ctx,
         )
@@ -833,6 +927,7 @@ def _validate_surface_components(
     errors: list[dict[str, Any]],
     warnings: list[dict[str, Any]],
     data_model: dict[str, Any],
+    surface_catalog_id: str | None = None,
 ) -> int:
     catalog = load_catalog_spec(version)
     catalog_components = catalog["components"]
@@ -945,11 +1040,14 @@ def _validate_surface_components(
                             f"Component mixin '{bare}' must be '@{bare}' in canonical A2UI v1.0.",
                         )
 
-            # Basic Catalog schema validation when using default catalog (exact canonical URI match)
-            is_custom_catalog = (
-                isinstance(comp.get("@catalogId"), str)
-                and comp["@catalogId"] != canonical_catalog_id
+            # Basic Catalog schema validation when using default catalog (inherits createSurface.catalogId)
+            raw_comp_cat = comp.get("@catalogId")
+            effective_comp_catalog = (
+                raw_comp_cat
+                if isinstance(raw_comp_cat, str) and raw_comp_cat.strip()
+                else surface_catalog_id
             )
+            is_custom_catalog = _is_custom_catalog_id(effective_comp_catalog, canonical_catalog_id)
             if not is_custom_catalog and comp_type in catalog_components:
                 spec = catalog_components[comp_type]
                 for req in spec["required"]:
@@ -1046,19 +1144,15 @@ def _validate_surface_components(
                                 "Each tab item must contain 'title' and 'child'.",
                             )
                         else:
-                            _validate_dynamic_value(
-                                tab["title"],
-                                version=version,
-                                strict=strict,
-                                block_index=block_index,
-                                path=f"{cpath}.tabs[{tidx}].title",
-                                errors=errors,
-                                warnings=warnings,
-                                catalog_functions=catalog_functions,
-                                data_model=data_model,
-                                catalog_function_specs=catalog_function_specs,
-                                catalog_id=canonical_catalog_id,
-                            )
+                            extra_tab = set(tab.keys()) - {"title", "child"}
+                            if extra_tab:
+                                _add_issue(
+                                    errors if strict else warnings,
+                                    "UNKNOWN_TAB_ITEM_PROPERTY",
+                                    block_index,
+                                    f"{cpath}.tabs[{tidx}]",
+                                    f"Unexpected properties on Tabs.tabs[{tidx}]: {sorted(extra_tab)}.",
+                                )
 
                 # Validate ChoicePicker options
                 if comp_type == "ChoicePicker" and isinstance(props.get("options"), list):
@@ -1071,6 +1165,47 @@ def _validate_surface_components(
                                 f"{cpath}.options[{oidx}]",
                                 "Each ChoicePicker option requires 'label' and string 'value'.",
                             )
+                        else:
+                            extra_opt = set(opt.keys()) - {"label", "value"}
+                            if extra_opt:
+                                _add_issue(
+                                    errors if strict else warnings,
+                                    "UNKNOWN_CHOICE_OPTION_PROPERTY",
+                                    block_index,
+                                    f"{cpath}.options[{oidx}]",
+                                    f"Unexpected properties on ChoicePicker.options[{oidx}]: {sorted(extra_opt)}.",
+                                )
+
+                # Validate Icon.name shape (enum string, DataBinding, or {"svgPath": DynamicString})
+                if comp_type == "Icon" and "name" in props and version != "0.8":
+                    iname = props["name"]
+                    if isinstance(iname, dict):
+                        if "svgPath" in iname:
+                            extra_icon = set(iname.keys()) - {"svgPath"}
+                            if extra_icon:
+                                _add_issue(
+                                    errors,
+                                    "INVALID_ICON_NAME",
+                                    block_index,
+                                    f"{cpath}.name",
+                                    f"Icon.name with 'svgPath' must not contain extra properties: {sorted(extra_icon)}.",
+                                )
+                        elif not any(k in iname for k in ("@path", "path", "@call", "call")):
+                            _add_issue(
+                                errors,
+                                "INVALID_ICON_NAME",
+                                block_index,
+                                f"{cpath}.name",
+                                "Icon.name object must be a DataBinding or {'svgPath': DynamicString}.",
+                            )
+                    elif not isinstance(iname, str):
+                        _add_issue(
+                            errors,
+                            "INVALID_ICON_NAME",
+                            block_index,
+                            f"{cpath}.name",
+                            "Icon.name must be an icon name string, DataBinding, or {'svgPath': DynamicString}.",
+                        )
             elif not is_custom_catalog and comp_type not in catalog_components:
                 _add_issue(
                     warnings if not strict else errors,
@@ -1080,7 +1215,130 @@ def _validate_surface_components(
                     f"Component type '{comp_type}' is not in the Basic Catalog v{version}.",
                 )
 
-            # Unconditional security & dynamic checks (even when @catalogId overrides catalog)
+            # Unconditional security & dynamic checks (even when @catalogId or createSurface.catalogId overrides catalog)
+            acc_key = "@accessibility" if "@accessibility" in props else ("accessibility" if "accessibility" in props else None)
+            if acc_key is not None:
+                acc_val = props[acc_key]
+                apath = f"{cpath}.{acc_key}"
+                if not isinstance(acc_val, dict):
+                    _add_issue(
+                        errors,
+                        "INVALID_ACCESSIBILITY",
+                        block_index,
+                        apath,
+                        f"{acc_key} must be an object.",
+                    )
+                else:
+                    extra_acc = set(acc_val.keys()) - {"label", "description", "hidden", "live"}
+                    if extra_acc:
+                        _add_issue(
+                            errors,
+                            "INVALID_ACCESSIBILITY",
+                            block_index,
+                            apath,
+                            f"Unexpected properties on {acc_key}: {sorted(extra_acc)}.",
+                        )
+                    for ak in ("label", "description", "hidden"):
+                        if ak in acc_val:
+                            _validate_dynamic_value(
+                                acc_val[ak],
+                                version=version,
+                                strict=strict,
+                                block_index=block_index,
+                                path=f"{apath}.{ak}",
+                                errors=errors,
+                                warnings=warnings,
+                                catalog_functions=catalog_functions,
+                                data_model=data_model,
+                                catalog_function_specs=catalog_function_specs,
+                                catalog_id=canonical_catalog_id,
+                                effective_catalog_id=effective_comp_catalog,
+                                allow_user_activation=False,
+                            )
+                    if "live" in acc_val:
+                        live_val = acc_val["live"]
+                        if not isinstance(live_val, str) or live_val not in {"off", "polite", "assertive"}:
+                            _add_issue(
+                                errors,
+                                "INVALID_ACCESSIBILITY",
+                                block_index,
+                                f"{apath}.live",
+                                f"{acc_key}.live must be one of ['off', 'polite', 'assertive'].",
+                            )
+
+            if comp_type == "Tabs" and isinstance(props.get("tabs"), list):
+                for tidx, tab in enumerate(props["tabs"]):
+                    if isinstance(tab, dict) and "title" in tab:
+                        _validate_dynamic_value(
+                            tab["title"],
+                            version=version,
+                            strict=strict,
+                            block_index=block_index,
+                            path=f"{cpath}.tabs[{tidx}].title",
+                            errors=errors,
+                            warnings=warnings,
+                            catalog_functions=catalog_functions,
+                            data_model=data_model,
+                            catalog_function_specs=catalog_function_specs,
+                            catalog_id=canonical_catalog_id,
+                            effective_catalog_id=effective_comp_catalog,
+                            allow_user_activation=False,
+                        )
+
+            if comp_type == "ChoicePicker" and isinstance(props.get("options"), list):
+                for oidx, opt in enumerate(props["options"]):
+                    if isinstance(opt, dict) and "label" in opt:
+                        _validate_dynamic_value(
+                            opt["label"],
+                            version=version,
+                            strict=strict,
+                            block_index=block_index,
+                            path=f"{cpath}.options[{oidx}].label",
+                            errors=errors,
+                            warnings=warnings,
+                            catalog_functions=catalog_functions,
+                            data_model=data_model,
+                            catalog_function_specs=catalog_function_specs,
+                            catalog_id=canonical_catalog_id,
+                            effective_catalog_id=effective_comp_catalog,
+                            allow_user_activation=False,
+                        )
+
+            if comp_type == "Icon" and "name" in props:
+                iname = props["name"]
+                if isinstance(iname, dict) and "svgPath" in iname:
+                    _validate_dynamic_value(
+                        iname["svgPath"],
+                        version=version,
+                        strict=strict,
+                        block_index=block_index,
+                        path=f"{cpath}.name.svgPath",
+                        errors=errors,
+                        warnings=warnings,
+                        catalog_functions=catalog_functions,
+                        data_model=data_model,
+                        catalog_function_specs=catalog_function_specs,
+                        catalog_id=canonical_catalog_id,
+                        effective_catalog_id=effective_comp_catalog,
+                        allow_user_activation=False,
+                    )
+                elif isinstance(iname, dict):
+                    _validate_dynamic_value(
+                        iname,
+                        version=version,
+                        strict=strict,
+                        block_index=block_index,
+                        path=f"{cpath}.name",
+                        errors=errors,
+                        warnings=warnings,
+                        catalog_functions=catalog_functions,
+                        data_model=data_model,
+                        catalog_function_specs=catalog_function_specs,
+                        catalog_id=canonical_catalog_id,
+                        effective_catalog_id=effective_comp_catalog,
+                        allow_user_activation=False,
+                    )
+
             checks_val = props.get("@checks") if "@checks" in props else props.get("checks")
             if checks_val is not None:
                 if not is_custom_catalog and comp_type in catalog_components and not catalog_components[comp_type]["checkable"]:
@@ -1131,6 +1389,7 @@ def _validate_surface_components(
                                 data_model=data_model,
                                 catalog_function_specs=catalog_function_specs,
                                 catalog_id=canonical_catalog_id,
+                                effective_catalog_id=effective_comp_catalog,
                             )
 
             for prop_name, pval in props.items():
@@ -1147,6 +1406,7 @@ def _validate_surface_components(
                         data_model=data_model,
                         catalog_function_specs=catalog_function_specs,
                         catalog_id=canonical_catalog_id,
+                        effective_catalog_id=effective_comp_catalog,
                     )
 
             if "action" in props and (comp_type == "Button" or isinstance(props["action"], dict)):
@@ -1162,6 +1422,7 @@ def _validate_surface_components(
                     data_model=data_model,
                     catalog_function_specs=catalog_function_specs,
                     catalog_id=canonical_catalog_id,
+                    effective_catalog_id=effective_comp_catalog,
                 )
 
             if comp_type in _MEDIA_URL_PROPS:
@@ -1292,10 +1553,13 @@ def _validate_surface_components(
         for item_idx, item in enumerate(items_val):
             for tcid in tpl_nodes:
                 t_type, t_props, t_cpath = comp_map[tcid]
-                t_is_custom = (
-                    isinstance(t_props.get("@catalogId"), str)
-                    and t_props["@catalogId"] != canonical_catalog_id
+                raw_t_cat = t_props.get("@catalogId")
+                t_effective_cat = (
+                    raw_t_cat
+                    if isinstance(raw_t_cat, str) and raw_t_cat.strip()
+                    else surface_catalog_id
                 )
+                t_is_custom = _is_custom_catalog_id(t_effective_cat, canonical_catalog_id)
                 media_props = _MEDIA_URL_PROPS.get(t_type, ("url", "posterUrl") if t_is_custom else ())
                 for media_prop in media_props:
                     if media_prop in t_props and isinstance(t_props[media_prop], dict):
@@ -1389,6 +1653,7 @@ def validate_payload(
         deleted_surfaces: set[str] = set()
         ever_created_surfaces: set[str] = set()
         surface_versions: dict[str, str] = {}
+        surface_catalog_ids: dict[str, str | None] = {}
         surface_component_batches: dict[str, list[list[dict[str, Any]]]] = {}
         surface_data_models: dict[str, dict[str, Any]] = {}
         surface_roots: dict[str, str] = {}
@@ -1397,6 +1662,7 @@ def validate_payload(
             nonlocal total_components
             batches = surface_component_batches.pop(sid_to_flush, None)
             dm = surface_data_models.pop(sid_to_flush, {})
+            scat = surface_catalog_ids.pop(sid_to_flush, None)
             if batches is None:
                 return
             sver = surface_versions.get(sid_to_flush, "1.0")
@@ -1412,6 +1678,7 @@ def validate_payload(
                 errors=errors,
                 warnings=warnings,
                 data_model=dm,
+                surface_catalog_id=scat,
             )
 
         for midx, msg in enumerate(messages):
@@ -1484,6 +1751,7 @@ def validate_payload(
                     deleted_surfaces.discard(sid)
                     surface_component_batches.pop(sid, None)
                     surface_data_models.pop(sid, None)
+                    surface_catalog_ids.pop(sid, None)
                     surface_roots[sid] = "root"
                 active_surfaces.add(sid)
                 ever_created_surfaces.add(sid)
@@ -1494,6 +1762,7 @@ def validate_payload(
                     surface_ids.append(sid)
 
                 cat_id = body.get("catalogId")
+                surface_catalog_ids[sid] = cat_id if isinstance(cat_id, str) else None
                 if cat_id == BROKEN_V09_CATALOG_ID:
                     _add_issue(
                         warnings,
@@ -1531,7 +1800,7 @@ def validate_payload(
                         )
                     if "dataModel" in body:
                         if isinstance(body["dataModel"], dict):
-                            surface_data_models[sid] = dict(body["dataModel"])
+                            surface_data_models[sid] = copy.deepcopy(body["dataModel"])
                         else:
                             _add_issue(
                                 errors,
@@ -1637,29 +1906,84 @@ def validate_payload(
                     if body.get("value") is None:
                         surface_data_models[sid] = {}
                     elif isinstance(body.get("value"), dict):
-                        surface_data_models[sid] = dict(body["value"])
+                        surface_data_models[sid] = copy.deepcopy(body["value"])
                 elif isinstance(ptr, str) and ptr.startswith("/") and "value" in body:
                     dm = surface_data_models.setdefault(sid, {})
-                    parts = [p.replace("~1", "/").replace("~0", "~") for p in ptr.lstrip("/").split("/")]
-                    cur: Any = dm
-                    for seg in parts[:-1]:
-                        if isinstance(cur, dict):
-                            nxt = cur.get(seg)
-                            if not isinstance(nxt, dict):
-                                if body["value"] is None:
-                                    cur = None
-                                    break
-                                nxt = {}
-                                cur[seg] = nxt
-                            cur = nxt
-                        else:
-                            cur = None
-                            break
-                    if isinstance(cur, dict):
-                        if body["value"] is None:
-                            cur.pop(parts[-1], None)
-                        else:
-                            cur[parts[-1]] = body["value"]
+                    _mutate_json_pointer(dm, ptr, body["value"])
+
+            elif env_key in {"callRendererFunction", "callAgentFunction"}:
+                extra_fn_keys = set(body.keys()) - {"surfaceId", "functionCallId", "callFunction"}
+                if extra_fn_keys:
+                    _add_issue(
+                        errors if strict else warnings,
+                        "UNEXPECTED_FUNCTION_ENVELOPE_KEY",
+                        bidx,
+                        f"{mpath}.{env_key}",
+                        f"Unexpected {env_key} keys: {sorted(extra_fn_keys)}.",
+                    )
+                fn_call_id = body.get("functionCallId")
+                if not isinstance(fn_call_id, str) or not fn_call_id.strip():
+                    _add_issue(
+                        errors,
+                        "MISSING_FUNCTION_CALL_ID",
+                        bidx,
+                        f"{mpath}.{env_key}.functionCallId",
+                        f"{env_key} requires non-empty string 'functionCallId'.",
+                    )
+                sid_opt = body.get("surfaceId")
+                if "surfaceId" in body and (not isinstance(sid_opt, str) or not sid_opt.strip()):
+                    _add_issue(
+                        errors,
+                        "INVALID_SURFACE_ID",
+                        bidx,
+                        f"{mpath}.{env_key}.surfaceId",
+                        f"{env_key}.surfaceId must be a non-empty string when provided.",
+                    )
+                call_fn = body.get("callFunction")
+                if not isinstance(call_fn, dict):
+                    _add_issue(
+                        errors,
+                        "INVALID_FUNCTION_CALL",
+                        bidx,
+                        f"{mpath}.{env_key}.callFunction",
+                        f"{env_key}.callFunction must be a FunctionCall object.",
+                    )
+                else:
+                    if "@call" not in call_fn and "call" not in call_fn:
+                        _add_issue(
+                            errors,
+                            "INVALID_FUNCTION_CALL",
+                            bidx,
+                            f"{mpath}.{env_key}.callFunction",
+                            f"{env_key}.callFunction requires '@call'.",
+                        )
+                    fn_cat = call_fn.get("catalogId")
+                    if not isinstance(fn_cat, str) or not fn_cat.strip():
+                        _add_issue(
+                            errors,
+                            "MISSING_CATALOG_ID",
+                            bidx,
+                            f"{mpath}.{env_key}.callFunction.catalogId",
+                            f"{env_key}.callFunction requires non-empty string 'catalogId'.",
+                        )
+                    cat_spec = load_catalog_spec(msg_ver)
+                    fn_dm = surface_data_models.get(sid_opt, {}) if isinstance(sid_opt, str) else {}
+                    fn_surf_cat = surface_catalog_ids.get(sid_opt) if isinstance(sid_opt, str) else None
+                    _validate_dynamic_value(
+                        call_fn,
+                        version=msg_ver,
+                        strict=strict,
+                        block_index=bidx,
+                        path=f"{mpath}.{env_key}.callFunction",
+                        errors=errors,
+                        warnings=warnings,
+                        catalog_functions=set(cat_spec["functions"].keys()),
+                        data_model=fn_dm,
+                        catalog_function_specs=cat_spec["functions"],
+                        catalog_id=cat_spec["catalogId"],
+                        effective_catalog_id=fn_surf_cat,
+                        allow_user_activation=False,
+                    )
 
             elif env_key == "dataModelUpdate":
                 sid = body.get("surfaceId")

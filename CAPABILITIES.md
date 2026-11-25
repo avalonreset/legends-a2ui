@@ -10,7 +10,7 @@
    - Optional `--live` HTTPS probe (TLS 1.2+, DNS IP pinning, strict 4-host allowlist) checking latest `@a2ui/react` on npm, `a2ui-core` on PyPI, and `a2ui-project/a2ui` `main` HEAD.
 2. **Strict Multi-Format Validation (`validate`):**
    - Parses single JSON objects, JSON arrays, `{"messages": [...]}` wrappers, streaming JSONL, and Markdown fenced ```` ```a2ui ```` / `a2ui-json` / `a2ui-jsonl` blocks (`--extract-markdown`).
-   - Validates protocol envelopes across v1.0, v0.9.1, v0.9, and v0.8; `createSurface` lifecycle; `id: "root"` requirement; Unicode UAX #31 component IDs via stdlib `unicodedata`; reserved `Surface` rejection; dangling component references; orphan warnings; iterative 3-color DFS cycle detection; `weight` parent placement under `Row`/`Column`; all 18 Basic Catalog components and 14 built-in functions; `Checkable` `@checks` rules; `@path`/`@call` and single-`@` / `@@` escape compliance; media URL and `openUrl` protocol allowlists; ReDoS regex checks; CWE-400 byte/depth/component bounds; and fail-closed secret-token leak refusal.
+   - Validates protocol envelopes across v1.0, v0.9.1, v0.9, and v0.8; `createSurface` lifecycle; `id: "root"` requirement; Unicode UAX #31 component IDs via stdlib `str.isidentifier()`; reserved `Surface` rejection; dangling component references; orphan warnings; iterative 3-color DFS cycle detection; `weight` parent placement under `Row`/`Column`; all 18 Basic Catalog components and 14 built-in functions; `Checkable` `@checks` rules; `@path`/`@call` and single-`@` / `@@` escape compliance; media URL and `openUrl` protocol allowlists; ReDoS regex checks; CWE-400 byte/depth/component bounds; and fail-closed secret-token leak refusal.
 3. **Deterministic Legacy-to-v1.0 Normalization (`normalize`):**
    - Upgrades `v0.8`, `v0.9`, `v0.9.1`, and transitional draft `v1.0` payloads to canonical strict `v1.0`.
    - Context-aware `@path` / `@call` rewriting that keeps `ChildList.path` and `updateDataModel.path` unprefixed (and repairs mistakenly prefixed `ChildList.@path`).
@@ -22,7 +22,7 @@
    - Compiles arbitrary structured JSON (`--input <path|->`) into strict A2UI v1.0 surfaces via `--preset auto|plan-approval|health-deck|data-briefing`.
    - Lets any `cto-legends` module's `--json` output render as an interactive approval card, health deck, or tabbed briefing with zero cross-module coupling.
 6. **Zero-Daemon Offline Static Preview (`preview`):**
-   - Emits a single self-contained, zero-CDN HTML5 `file://` preview under a strict `default-src 'none'` CSP with `<\/` JSON escaping (CWE-79).
+   - Emits a single self-contained, zero-CDN HTML5 `file://` preview under a strict `default-src 'none'` CSP with RFC 8259 `\u003c`/`\u003e`/`\u0026` JSON Unicode escaping (CWE-79).
    - Implements all 18 Basic Catalog components, reactive `dataModel` bindings, `@checks` feedback, safe Markdown rendering, Precision Noir dark and Light theme switching, JSON source toggle, and a live `[A2UI Action: <name>] {...}` Action Event Inspector.
 7. **Preview-First Host Integration Scaffolder (`scaffold`):**
    - Generates TypeScript + Light DOM CSS integration kits for `--target react|web-core|lit` (`precision-noir` or `neutral` theme), including `a2uiParser.ts`, `a2uiSecurity.ts`, `a2uiTheme.css`, `a2uiParser.test.ts`, action bridge/context, and host wrapper (`A2uiBlock.tsx`, `A2uiSurfaceHost.ts`, or `A2uiLitSurface.ts`).

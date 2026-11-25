@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "basic-catalog-reference.md",
-      "sha256": "9d22c38572a2ebc385a5f8dced04fa9e5e498b30e4504d1c83328d936671fe32"
+      "sha256": "0e70fe95d05b5970e391f72c2b67c21c66ae689d0be385d11f1ff726d935d9cf"
     },
     {
       "path": "ecosystem-projection-and-preview.md",
@@ -15,7 +15,7 @@
     },
     {
       "path": "index.md",
-      "sha256": "0b6fffb4304d854b1b4ca31f74fdf0644443fdb7e1269d8258405364f31de4ee"
+      "sha256": "40e1c4604ed86cbec4c3faefe12d4f3da29706792202a1ccbc59d3b62c322da8"
     },
     {
       "path": "react-and-lit-integration.md",
@@ -23,7 +23,7 @@
     },
     {
       "path": "security-and-validation.md",
-      "sha256": "8e9dc55f915488b1018785bb2e093a6ea9385f89ae8e66fe40187c38d1a92773"
+      "sha256": "a681495e03a973d0ba2cf748ae6341113c8c15b73df829a5e1df20ffa15dfecb"
     },
     {
       "path": "sources.md",

@@ -134,10 +134,15 @@ class TestComposeProjectPreviewScaffold(unittest.TestCase):
         self.assertIn("color-scheme: dark;", doc)
         self.assertIn("accent-color: #9e0b1a;", doc)
         self.assertIn("#9e0b1a", doc)
-        # Linear O(N) Markdown link matcher and reactive binding refresh helper
+        # Linear O(N) Markdown link matcher, safe null-proto coercion helpers, multi-pass stash, and relative ChildList setByPointer
         self.assertIn(r"(^|[^\\])\[([^\[\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)", doc)
         self.assertIn("refreshReactiveBindings", doc)
         self.assertIn("sanitizePlainValue", doc)
+        self.assertIn("function toDisplayString(", doc)
+        self.assertIn("function toFiniteNumber(", doc)
+        self.assertIn("Array.isArray(rawVal) ? rawVal.length", doc)
+        self.assertIn("function setByPointer(root, pointer, value, itemCtx)", doc)
+        self.assertIn("pass < 8", doc)
         # All 18 Basic Catalog component handlers exist in runtime JS
         for comp_name in (
             "Text", "Image", "Icon", "Video", "AudioPlayer", "Row", "Column", "List",

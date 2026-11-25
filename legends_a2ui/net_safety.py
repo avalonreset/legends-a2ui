@@ -38,11 +38,19 @@ _DARWIN_SYSTEM_SYMLINKS = frozenset({Path("/var"), Path("/tmp"), Path("/etc")})
 _WINDOWS_RESERVED_DEVICES = frozenset(
     {
         "CON",
+        "CONIN$",
+        "CONOUT$",
         "PRN",
         "AUX",
         "NUL",
         *(f"COM{i}" for i in range(1, 10)),
         *(f"LPT{i}" for i in range(1, 10)),
+        "COM\u00b9",
+        "COM\u00b2",
+        "COM\u00b3",
+        "LPT\u00b9",
+        "LPT\u00b2",
+        "LPT\u00b3",
     }
 )
 _CFA_USER_FOLDERS = (
@@ -56,13 +64,13 @@ _CFA_USER_FOLDERS = (
 
 
 def reject_unsafe_local_path(path: Path | str) -> None:
-    """Refuse UNC paths, extended/device prefixes, and reserved Windows DOS device names."""
+    """Refuse UNC paths, extended/NT device prefixes, NTFS ADS, and reserved Windows DOS device names."""
     raw = str(path)
     if "\x00" in raw:
         raise SafetyError("Refusing path containing NUL byte.")
-    if raw.startswith(("\\\\", "//")):
+    if raw.startswith(("\\\\", "//", "/\\", "\\/")):
         raise SafetyError(f"Refusing UNC or Windows device path: {raw}")
-    if raw.startswith(("\\.\\", "\\?\\")):
+    if raw.startswith(("\\.\\", "\\?\\", "\\??\\", "/??/")):
         raise SafetyError(f"Refusing Windows device namespace path: {raw}")
     try:
         drive = Path(raw).drive
@@ -71,15 +79,17 @@ def reject_unsafe_local_path(path: Path | str) -> None:
     if drive.startswith(("\\\\", "//")):
         raise SafetyError(f"Refusing UNC drive path: {raw}")
 
-    for seg in raw.replace("\\", "/").split("/"):
+    for idx, seg in enumerate(raw.replace("\\", "/").split("/")):
         if not seg:
             continue
-        if len(seg) == 2 and seg[1] == ":" and seg[0].isalpha():
+        if idx == 0 and len(seg) == 2 and seg[1] == ":" and seg[0].isalpha():
             continue
-        seg_no_drive = seg.split(":", 1)[1] if len(seg) >= 2 and seg[1] == ":" else seg
-        if not seg_no_drive:
-            continue
-        base = seg_no_drive.split(".", 1)[0].rstrip(" ").upper()
+        if ":" in seg:
+            raise SafetyError(
+                f"Refusing colon, drive-relative path, or NTFS alternate data stream '{seg}' in path: {raw}"
+            )
+        seg_head = seg.split(":", 1)[0]
+        base = seg_head.split(".", 1)[0].rstrip(" ").upper()
         if base in _WINDOWS_RESERVED_DEVICES:
             raise SafetyError(f"Refusing reserved Windows device name '{seg}' in path: {raw}")
 

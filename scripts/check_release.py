@@ -94,9 +94,10 @@ FORBIDDEN = [
     r"(?i)rccol",
 ]
 INTERNAL_MARKERS = [
-    r"\bStage [1-5]\b",
-    r"\bBT-0[1-9]\b",
-    r"\bC[1-9]-0[1-9]\b",
+    r"(?i)\bStage\s+[0-9][a-z]?\b",
+    r"\bBT-[0-9]{2,}\b",
+    r"\bC[1-9]-[0-9]{2,}\b",
+    r"(?i)\bCarbon\s+Pass\b",
     r"(?i)\bbattle-test\b",
 ]
 FORBIDDEN_FILES = {".pem", ".key", ".p12", ".pfx", ".ps1", ".bat", ".cmd", ".vbs", ".ahk"}
@@ -321,7 +322,7 @@ def check(root: Path = ROOT) -> list[str]:
     if (root / ".git").exists():
         try:
             proc = subprocess.run(
-                ["git", "-C", str(root), "log", "--format=%H %s"],
+                ["git", "-C", str(root), "log", "--format=%H%x20%B"],
                 capture_output=True,
                 text=True,
                 timeout=10,

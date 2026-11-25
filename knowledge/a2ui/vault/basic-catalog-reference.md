@@ -28,7 +28,7 @@ Every v1.0 component object carries:
 | Component | Required Props | Optional Props and Variants | Notes |
 | :--- | :--- | :--- | :--- |
 | **`Text`** | `component`, `text` (`DynamicString`) | `variant`: `"body"` (default), `"caption"`; `weight` | Supports Markdown in `text`. Use `#`..`#####` with `"variant": "body"` for headings (`h1`..`h5` removed in v1.0). |
-| **`Image`** | `component`, `url` (`DynamicString`) | `description` (`DynamicString`), `fit`: `"fill"` (default), `"contain"`, `"cover"`, `"none"`, `"scaleDown"`; `variant`: `"mediumFeature"` (default), `"icon"`, `"avatar"`, `"smallFeature"`, `"largeFeature"`, `"header"`; `weight` | `url` must pass media URL allowlist (`http:`, `https:`, `data:image/*`, or single-slash `/...`). |
+| **`Image`** | `component`, `url` (`DynamicString`) | `description` (`DynamicString`), `fit`: `"fill"` (default), `"contain"`, `"cover"`, `"none"`, `"scaleDown"`; `variant`: `"mediumFeature"` (default), `"icon"`, `"avatar"`, `"smallFeature"`, `"largeFeature"`, `"header"`; `weight` | `url` must pass media URL allowlist (`http:`/`https:` without `@` userinfo, safe raster `data:image/(png\|jpeg\|jpg\|gif\|webp\|avif\|bmp)` blocking `image/svg+xml`, or single-slash `/...`). |
 | **`Icon`** | `component`, `name` | `weight` | `name` accepts any of the 60 standard Material-style icon names (`accountCircle`, `add`, `arrowBack`, `check`, `close`, `error`, `info`, `lock`, `refresh`, `search`, `settings`, `warning`, etc.) or custom SVG path object. |
 | **`Video`** | `component`, `url` (`DynamicString`) | `posterUrl` (`DynamicString`, added in v1.0); `weight` | Both `url` and `posterUrl` must pass the media URL protocol allowlist. |
 | **`AudioPlayer`** | `component`, `url` (`DynamicString`) | `description` (`DynamicString`); `weight` | `url` must pass the media URL protocol allowlist. |
@@ -100,7 +100,7 @@ Rules enforced by `legends-a2ui validate`:
 | `formatCurrency` | `string` | `value`, `currency` | `decimals`, `grouping` | ISO currency formatting |
 | `formatDate` | `string` | `value`, `format` | none | Date/time formatting |
 | `pluralize` | `string` | `value`, `other` | `zero`, `one`, `two`, `few`, `many` | CLDR pluralization |
-| `openUrl` | `void` | `url` | none | `requiresUserActivation: true`; allowlists `https:`, `http:`, `mailto:` only |
+| `openUrl` | `void` | `url` | none | `requiresUserActivation: true`; allowlists `https:`/`http:` (no `@` userinfo) and `mailto:` only |
 | `and` | `boolean` | `values` | none | Logical conjunction |
 | `or` | `boolean` | `values` | none | Logical disjunction |
 | `not` | `boolean` | `value` | none | Logical negation |

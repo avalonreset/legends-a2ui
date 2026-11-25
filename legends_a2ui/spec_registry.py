@@ -255,8 +255,8 @@ def verify_vendor_manifest(vendor_dir: Path | None = None) -> dict[str, Any]:
         if not isinstance(local_path, str) or not local_path or ".." in Path(local_path).parts:
             errors.append(f"Unsafe localPath in vendor manifest: {local_path!r}")
             continue
-        if Path(local_path).is_absolute():
-            errors.append(f"Absolute localPath refused in vendor manifest: {local_path!r}")
+        if Path(local_path).is_absolute() or bool(Path(local_path).drive):
+            errors.append(f"Absolute or drive-prefixed localPath refused in vendor manifest: {local_path!r}")
             continue
         target = vdir / local_path
         try:

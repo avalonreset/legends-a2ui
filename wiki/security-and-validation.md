@@ -11,18 +11,18 @@ Derived from `vendor/a2ui-spec/catalogs/basic/v1/basic_catalog_implementation_gu
 1. **Control-character and whitespace smuggling block:** Rejects any character with code point `< 0x20` or `0x7F` (blocking `\t`, `\r`, `\n` smuggling such as `ht\ttps://` or `/\t/host`).
 2. **Scheme-relative and UNC refusal:** Normalizes `\` to `/` and rejects `//host` and `\\host`.
 3. **Strict scheme allowlist:** Permits ONLY:
-   - `https://` and `http://` with `//` and a non-empty host containing no whitespace (rejects `https:host`).
-   - `data:image/`, `data:audio/`, and `data:video/` (rejects `data:text/html`).
+   - `https://` and `http://` with `//`, a non-empty host containing no whitespace, and no URL userinfo (`@`, rejecting `https://user:pass@host` and `https://a2ui.org@evil.example`).
+   - Safe raster-only `data:image/(png|jpeg|jpg|gif|webp|avif|bmp)`, `data:audio/`, and `data:video/` (blocking `data:image/svg+xml` and `data:text/html`).
    - Single-slash relative paths (`/assets/img.png`, excluding `/\`).
 4. **Denied schemes:** `javascript:`, `vbscript:`, `file:`, `content:`, `blob:`, `ftp:`, and any other unapproved scheme fail with `UNSAFE_MEDIA_URL`.
 
 ### Interactive Links (`openUrl` action function)
 
-1. Same control-character and scheme-relative refusal.
-2. Permits ONLY `https://` (with host), `http://` (with host), and `mailto:` (containing `@`).
+1. Same control-character, scheme-relative, and URL userinfo (`@`) refusal.
+2. Permits ONLY `https://` (with host, no `@` userinfo), `http://` (with host, no `@` userinfo), and `mailto:` (containing `@`).
 3. Rejects `javascript:`, `data:`, `vbscript:`, `file:`, and relative paths with `UNSAFE_OPEN_URL`.
 
-Validator checks inspect both literal strings and `dataModel`-resolved `@path` pointers for media and `openUrl` arguments.
+Validator checks inspect literal strings, `dataModel`-resolved `@path` pointers (including `ChildList` template relative paths and `updateDataModel` mutations across nested objects and arrays), and `formatString` URL expressions.
 
 ## 2. CWE-400 Resource, Graph, and Regex Bounds
 
@@ -37,17 +37,19 @@ Every `validate` and `normalize` call bounds untrusted input before deep process
 ## 3. Fail-Closed Secret-Token Leak Scan
 
 `validate`, `normalize`, `compose`, and `project` scan all strings and keys iteratively before emitting output (`SECRET_LEAK`). Detected credential shapes are refused without echoing the secret value:
-- Stripe live and restricted keys (`sk_live_*`, `rk_live_*`, `whsec_*`)
-- GitHub personal/OAuth/app tokens (`ghp_*`, `gho_*`, `ghu_*`, `ghs_*`, `ghr_*`)
-- PEM private key headers (`BEGIN ... PRIVATE KEY`)
-- AWS access key IDs (`AKIA*`) and `AWS_SECRET_ACCESS_KEY` assignments
+- Stripe live, restricted, and webhook keys (`sk_live_*`, `rk_live_*`, `whsec_*`)
+- GitHub personal/OAuth/app tokens and fine-grained PATs (`ghp_*`, `gho_*`, `ghu_*`, `ghs_*`, `ghr_*`, `github_pat_*`)
+- OpenAI and Anthropic API keys (`sk-proj-*`, `sk-svcacct-*`, `sk-ant-*`)
+- PEM private key headers (`BEGIN ... PRIVATE KEY`, including `RSA`, `OPENSSH`, `EC`, `DSA`, `ENCRYPTED`, and `PGP`)
+- AWS access key IDs (`AKIA*`, temporary `ASIA*`) and `AWS_SECRET_ACCESS_KEY` assignments
+- Slack tokens (`xox[baprs]-*`) and Google API keys (`AIza*`)
 - Bearer JWT headers and raw three-segment JWT strings
 
 ## 4. Static HTML Preview Hardening (CWE-79 & CSP)
 
 `legends-a2ui preview` produces a single self-contained HTML5 file with:
 - **Strict Content Security Policy:** `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src https: http: data:; media-src https: http: data:;` (zero external scripts, fonts, CDNs, or XHR/fetch destinations).
-- **Safe JSON embedding:** Serializes with `ensure_ascii=True` and escapes `</` as `<\/` and `<!--` as `<\!--` inside `<script type="application/json" id="a2ui-payload">`, blocking script-tag breakout.
+- **Safe JSON embedding:** Serializes with `ensure_ascii=True` and `allow_nan=False`, escaping `<`, `>`, and `&` with RFC 8259 JSON Unicode escapes (`\u003c`, `\u003e`, `\u0026`) inside `<script type="application/json" id="a2ui-payload">` to block script-tag breakout while keeping embedded JSON strictly RFC 8259 compliant.
 - **Safe Markdown subset:** HTML-escapes all raw tags in `Text` before applying heading, list, code, bold, italic, and `isSafeOpenUrl`-filtered link formatting.
 
 ## 5. Filesystem, Network, and EDR Laws 1-6

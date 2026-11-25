@@ -408,6 +408,7 @@ _PREVIEW_JS = r"""
   let showingSource = false;
   const actionLogs = [];
   let reactiveUpdaters = [];
+  let pickerSeq = 0;
   const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
   function hasOwn(obj, key) {
@@ -425,6 +426,29 @@ _PREVIEW_JS = r"""
     return out;
   }
 
+  function toDisplayString(v) {
+    if (v === null || v === undefined) return "";
+    if (typeof v === "string") return v;
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    if (typeof v === "object") {
+      try {
+        return JSON.stringify(v);
+      } catch (_err) {
+        return "";
+      }
+    }
+    return "";
+  }
+
+  function toFiniteNumber(v) {
+    if (typeof v === "number") return Number.isFinite(v) ? v : NaN;
+    if (typeof v === "string" && v.trim() !== "") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : NaN;
+    }
+    return NaN;
+  }
+
   function refreshReactiveBindings() {
     for (const fn of reactiveUpdaters) {
       try { fn(); } catch (_err) {}
@@ -432,7 +456,7 @@ _PREVIEW_JS = r"""
   }
 
   function escapeHtml(str) {
-    return String(str)
+    return toDisplayString(str)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
@@ -482,7 +506,7 @@ _PREVIEW_JS = r"""
   }
 
   function renderSafeMarkdown(rawText) {
-    const escaped = escapeHtml(rawText || "");
+    const escaped = escapeHtml(rawText === null || rawText === undefined ? "" : rawText);
     const lines = escaped.split(/\r?\n/);
     const out = [];
     let inList = false;
@@ -494,7 +518,7 @@ _PREVIEW_JS = r"""
         tokens.push(frag);
         return key;
       }
-      let s = line;
+      let s = line.replace(/[\uE000\uE001]/g, "");
       s = s.replace(/`([^`]+)`/g, function (_m, code) {
         return stash("<code>" + code + "</code>");
       });
@@ -506,9 +530,11 @@ _PREVIEW_JS = r"""
       });
       s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
       s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-      s = s.replace(/\uE000(\d+)\uE001/g, function (_m, idx) {
-        return tokens[Number(idx)] || "";
-      });
+      for (let pass = 0; pass < 8 && /\uE000\d+\uE001/.test(s); pass += 1) {
+        s = s.replace(/\uE000(\d+)\uE001/g, function (_m, idx) {
+          return tokens[Number(idx)] || "";
+        });
+      }
       return s;
     }
 
@@ -558,30 +584,55 @@ _PREVIEW_JS = r"""
     return cur;
   }
 
-  function setByPointer(root, pointer, value) {
-    if (typeof pointer !== "string" || !pointer.startsWith("/")) return;
-    if (pointer === "/") return;
-    const parts = pointer.slice(1).split("/").map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+  function setByPointer(root, pointer, value, itemCtx) {
+    if (typeof pointer !== "string" || !pointer) return;
+    let cur;
+    let parts;
+    if (pointer.startsWith("/")) {
+      if (pointer === "/") return;
+      cur = root;
+      parts = pointer.slice(1).split("/").map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+    } else {
+      if (!itemCtx || typeof itemCtx !== "object") return;
+      cur = itemCtx;
+      parts = pointer.split("/").map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+    }
     if (parts.some((p) => FORBIDDEN_KEYS.has(p))) return;
-    let cur = root;
     for (let i = 0; i < parts.length - 1; i += 1) {
       const key = parts[i];
-      if (!hasOwn(cur, key) || !cur[key] || typeof cur[key] !== "object") {
-        if (value === null) return;
-        cur[key] = Object.create(null);
+      if (Array.isArray(cur)) {
+        if (!/^\d+$/.test(key)) return;
+        const idx = Number(key);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return;
+        if (!cur[idx] || typeof cur[idx] !== "object") {
+          if (value === null) return;
+          cur[idx] = Object.create(null);
+        }
+        cur = cur[idx];
+      } else {
+        if (!hasOwn(cur, key) || !cur[key] || typeof cur[key] !== "object") {
+          if (value === null) return;
+          cur[key] = Object.create(null);
+        }
+        cur = cur[key];
       }
-      cur = cur[key];
     }
     const lastKey = parts[parts.length - 1];
-    if (value === null) {
-      if (Array.isArray(cur)) {
-        const idx = Number(lastKey);
-        if (Number.isInteger(idx) && idx >= 0 && idx < cur.length) cur.splice(idx, 1);
-      } else if (cur && typeof cur === "object" && hasOwn(cur, lastKey)) {
-        delete cur[lastKey];
+    if (Array.isArray(cur)) {
+      if (!/^\d+$/.test(lastKey)) return;
+      const idx = Number(lastKey);
+      if (!Number.isInteger(idx) || idx < 0) return;
+      if (value === null) {
+        if (idx < cur.length) cur.splice(idx, 1);
+      } else {
+        cur[idx] = sanitizePlainValue(value);
       }
     } else if (cur && typeof cur === "object") {
-      cur[lastKey] = sanitizePlainValue(value);
+      if (value === null) {
+        if (hasOwn(cur, lastKey)) delete cur[lastKey];
+      } else {
+        cur[lastKey] = sanitizePlainValue(value);
+      }
     }
   }
 
@@ -596,25 +647,29 @@ _PREVIEW_JS = r"""
         if (fn === "formatString" && typeof args.value === "string") {
           return args.value.replace(/\$\{([^}]+)\}/g, (_m, expr) => {
             const resolved = getByPointer(dataModel, expr.trim(), itemCtx);
-            return resolved === undefined || resolved === null ? "" : String(resolved);
+            return toDisplayString(resolved);
           });
         }
         if (fn === "required") {
           const v = resolveDynamic(args.value, dataModel, itemCtx);
-          return v !== undefined && v !== null && String(v).trim() !== "";
+          if (v === undefined || v === null) return false;
+          if (Array.isArray(v)) return v.length > 0;
+          if (typeof v === "object") return Object.keys(v).length > 0;
+          return toDisplayString(v).trim() !== "";
         }
         if (fn === "email") {
-          const v = String(resolveDynamic(args.value, dataModel, itemCtx) || "");
+          const v = toDisplayString(resolveDynamic(args.value, dataModel, itemCtx));
           return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
         }
         if (fn === "length") {
-          const v = String(resolveDynamic(args.value, dataModel, itemCtx) || "");
-          if (typeof args.min === "number" && v.length < args.min) return false;
-          if (typeof args.max === "number" && v.length > args.max) return false;
+          const rawVal = resolveDynamic(args.value, dataModel, itemCtx);
+          const len = Array.isArray(rawVal) ? rawVal.length : toDisplayString(rawVal).length;
+          if (typeof args.min === "number" && len < args.min) return false;
+          if (typeof args.max === "number" && len > args.max) return false;
           return true;
         }
         if (fn === "numeric") {
-          const v = Number(resolveDynamic(args.value, dataModel, itemCtx));
+          const v = toFiniteNumber(resolveDynamic(args.value, dataModel, itemCtx));
           if (Number.isNaN(v)) return false;
           if (typeof args.min === "number" && v < args.min) return false;
           if (typeof args.max === "number" && v > args.max) return false;
@@ -622,7 +677,7 @@ _PREVIEW_JS = r"""
         }
         if (fn === "regex" && typeof args.pattern === "string") {
           try {
-            const v = String(resolveDynamic(args.value, dataModel, itemCtx) || "");
+            const v = toDisplayString(resolveDynamic(args.value, dataModel, itemCtx));
             return new RegExp(args.pattern, "u").test(v);
           } catch (_err) {
             return false;
@@ -790,7 +845,7 @@ _PREVIEW_JS = r"""
       el.className = "a2ui-text " + (comp.variant === "caption" ? "caption" : "body");
       function updateText() {
         const val = resolveDynamic(comp.text, surface.dataModel, itemCtx);
-        el.innerHTML = renderSafeMarkdown(val === undefined ? "" : String(val));
+        el.innerHTML = renderSafeMarkdown(toDisplayString(val));
       }
       updateText();
       if (comp.text && typeof comp.text === "object") {
@@ -818,7 +873,7 @@ _PREVIEW_JS = r"""
       const img = document.createElement("img");
       img.className = "a2ui-media";
       img.src = url;
-      img.alt = String(resolveDynamic(comp.description, dm, itemCtx) || "");
+      img.alt = toDisplayString(resolveDynamic(comp.description, dm, itemCtx));
       if (comp.fit) img.style.objectFit = comp.fit === "scaleDown" ? "scale-down" : comp.fit;
       return applyWeight(img);
     }
@@ -855,7 +910,7 @@ _PREVIEW_JS = r"""
       }
       if (comp.description) {
         const lbl = document.createElement("label");
-        lbl.textContent = String(resolveDynamic(comp.description, dm, itemCtx) || "");
+        lbl.textContent = toDisplayString(resolveDynamic(comp.description, dm, itemCtx));
         wrap.appendChild(lbl);
       }
       const aud = document.createElement("audio");
@@ -875,7 +930,7 @@ _PREVIEW_JS = r"""
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "a2ui-tab-btn" + (idx === activeIdx ? " active" : "");
-        btn.textContent = String(resolveDynamic(tab.title, dm, itemCtx) || "Tab");
+        btn.textContent = toDisplayString(resolveDynamic(tab.title, dm, itemCtx)) || "Tab";
         btn.addEventListener("click", () => {
           surface.tabState[compId] = idx;
           renderAll();
@@ -930,14 +985,14 @@ _PREVIEW_JS = r"""
           const resolvedCtx = {};
           const rawCtx = act.event.context || {};
           for (const k of Object.keys(rawCtx)) {
-            resolvedCtx[k] = resolveDynamic(rawCtx[k], dm, itemCtx);
+            resolvedCtx[k] = resolveDynamic(rawCtx[k], surface.dataModel, itemCtx);
           }
           logAction(surface.id, act.event.name || "action", comp.id, resolvedCtx);
         } else if (act.functionCall) {
           const fn = act.functionCall["@call"];
           const args = act.functionCall.args || {};
           if (fn === "openUrl") {
-            const targetUrl = String(resolveDynamic(args.url, dm, itemCtx) || "");
+            const targetUrl = toDisplayString(resolveDynamic(args.url, surface.dataModel, itemCtx));
             if (isSafeOpenUrl(targetUrl)) {
               logAction(surface.id, "openUrl", comp.id, { url: targetUrl });
             } else {
@@ -955,7 +1010,7 @@ _PREVIEW_JS = r"""
       const wrap = document.createElement("div");
       wrap.className = "a2ui-field";
       const lbl = document.createElement("label");
-      lbl.textContent = String(resolveDynamic(comp.label, dm, itemCtx) || "");
+      lbl.textContent = toDisplayString(resolveDynamic(comp.label, dm, itemCtx));
       wrap.appendChild(lbl);
       const isLong = comp.variant === "longText";
       const input = document.createElement(isLong ? "textarea" : "input");
@@ -964,13 +1019,13 @@ _PREVIEW_JS = r"""
         input.type = comp.variant === "obscured" ? "password" : comp.variant === "number" ? "number" : "text";
       }
       if (comp.placeholder) {
-        input.placeholder = String(resolveDynamic(comp.placeholder, dm, itemCtx) || "");
+        input.placeholder = toDisplayString(resolveDynamic(comp.placeholder, dm, itemCtx));
       }
       const curVal = resolveDynamic(comp.value, dm, itemCtx);
-      input.value = curVal === undefined || curVal === null ? "" : String(curVal);
+      input.value = toDisplayString(curVal);
       input.addEventListener("input", (e) => {
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(surface.dataModel, comp.value["@path"], e.target.value);
+          setByPointer(surface.dataModel, comp.value["@path"], e.target.value, itemCtx);
           refreshReactiveBindings();
         }
       });
@@ -989,12 +1044,12 @@ _PREVIEW_JS = r"""
       cb.checked = Boolean(resolveDynamic(comp.value, dm, itemCtx));
       cb.addEventListener("change", (e) => {
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(surface.dataModel, comp.value["@path"], e.target.checked);
+          setByPointer(surface.dataModel, comp.value["@path"], e.target.checked, itemCtx);
           refreshReactiveBindings();
         }
       });
       const txt = document.createElement("span");
-      txt.textContent = String(resolveDynamic(comp.label, dm, itemCtx) || "");
+      txt.textContent = toDisplayString(resolveDynamic(comp.label, dm, itemCtx));
       lbl.appendChild(cb);
       lbl.appendChild(txt);
       wrap.appendChild(lbl);
@@ -1007,21 +1062,21 @@ _PREVIEW_JS = r"""
       wrap.className = "a2ui-field";
       if (comp.label) {
         const lbl = document.createElement("label");
-        lbl.textContent = String(resolveDynamic(comp.label, dm, itemCtx) || "");
+        lbl.textContent = toDisplayString(resolveDynamic(comp.label, dm, itemCtx));
         wrap.appendChild(lbl);
       }
       let filterText = "";
       const optionsBox = document.createElement("div");
       optionsBox.className = comp.displayStyle === "chips" ? "a2ui-chips" : "a2ui-column";
       const multi = comp.variant === "multipleSelection";
+      const pickerGroupName = "cp_" + compId + "_" + (++pickerSeq);
 
       function drawOptions() {
         optionsBox.innerHTML = "";
-        const selected = Array.isArray(resolveDynamic(comp.value, surface.dataModel, itemCtx))
-          ? resolveDynamic(comp.value, surface.dataModel, itemCtx)
-          : [];
+        const rawSel = resolveDynamic(comp.value, surface.dataModel, itemCtx);
+        const selected = Array.isArray(rawSel) ? rawSel : [];
         for (const opt of comp.options || []) {
-          const optLabel = String(resolveDynamic(opt.label, surface.dataModel, itemCtx) || opt.value);
+          const optLabel = toDisplayString(resolveDynamic(opt.label, surface.dataModel, itemCtx)) || toDisplayString(opt.value);
           if (filterText && !optLabel.toLowerCase().includes(filterText)) continue;
           const isSel = selected.includes(opt.value);
           if (comp.displayStyle === "chips") {
@@ -1034,7 +1089,7 @@ _PREVIEW_JS = r"""
                 ? (isSel ? selected.filter((x) => x !== opt.value) : [...selected, opt.value])
                 : [opt.value];
               if (comp.value && typeof comp.value["@path"] === "string") {
-                setByPointer(surface.dataModel, comp.value["@path"], next);
+                setByPointer(surface.dataModel, comp.value["@path"], next, itemCtx);
               }
               drawOptions();
               refreshReactiveBindings();
@@ -1045,14 +1100,14 @@ _PREVIEW_JS = r"""
             rowLbl.className = "a2ui-checkbox";
             const inp = document.createElement("input");
             inp.type = multi ? "checkbox" : "radio";
-            inp.name = "cp_" + compId;
+            inp.name = pickerGroupName;
             inp.checked = isSel;
             inp.addEventListener("change", () => {
               const next = multi
                 ? (inp.checked ? [...selected, opt.value] : selected.filter((x) => x !== opt.value))
                 : [opt.value];
               if (comp.value && typeof comp.value["@path"] === "string") {
-                setByPointer(surface.dataModel, comp.value["@path"], next);
+                setByPointer(surface.dataModel, comp.value["@path"], next, itemCtx);
               }
               drawOptions();
               refreshReactiveBindings();
@@ -1088,9 +1143,10 @@ _PREVIEW_JS = r"""
       wrap.className = "a2ui-field";
       const min = typeof comp.min === "number" ? comp.min : 0;
       const max = typeof comp.max === "number" ? comp.max : 100;
-      const cur = Number(resolveDynamic(comp.value, dm, itemCtx) ?? min);
+      const rawCur = toFiniteNumber(resolveDynamic(comp.value, dm, itemCtx));
+      const cur = Number.isNaN(rawCur) ? min : rawCur;
       const lbl = document.createElement("label");
-      const baseText = String(resolveDynamic(comp.label, dm, itemCtx) || "Value");
+      const baseText = toDisplayString(resolveDynamic(comp.label, dm, itemCtx)) || "Value";
       lbl.textContent = baseText + ": " + cur;
       const range = document.createElement("input");
       range.type = "range";
@@ -1101,10 +1157,11 @@ _PREVIEW_JS = r"""
       }
       range.value = String(cur);
       range.addEventListener("input", (e) => {
-        const num = Number(e.target.value);
+        const num = toFiniteNumber(e.target.value);
+        if (Number.isNaN(num)) return;
         lbl.textContent = baseText + ": " + num;
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(surface.dataModel, comp.value["@path"], num);
+          setByPointer(surface.dataModel, comp.value["@path"], num, itemCtx);
           refreshReactiveBindings();
         }
       });
@@ -1119,7 +1176,7 @@ _PREVIEW_JS = r"""
       wrap.className = "a2ui-field";
       if (comp.label) {
         const lbl = document.createElement("label");
-        lbl.textContent = String(resolveDynamic(comp.label, dm, itemCtx) || "");
+        lbl.textContent = toDisplayString(resolveDynamic(comp.label, dm, itemCtx));
         wrap.appendChild(lbl);
       }
       const inp = document.createElement("input");
@@ -1128,10 +1185,10 @@ _PREVIEW_JS = r"""
       else if (comp.enableTime) inp.type = "time";
       else inp.type = "date";
       const cur = resolveDynamic(comp.value, dm, itemCtx);
-      inp.value = cur ? String(cur) : "";
+      inp.value = toDisplayString(cur);
       inp.addEventListener("change", (e) => {
         if (comp.value && typeof comp.value["@path"] === "string") {
-          setByPointer(surface.dataModel, comp.value["@path"], e.target.value);
+          setByPointer(surface.dataModel, comp.value["@path"], e.target.value, itemCtx);
           refreshReactiveBindings();
         }
       });
