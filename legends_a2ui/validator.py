@@ -16,6 +16,7 @@ from legends_a2ui.spec_registry import (
     CANONICAL_V08_CATALOG_ID,
     CANONICAL_V09_CATALOG_ID,
     CANONICAL_V1_CATALOG_ID,
+    _MAX_DATA_MEDIA_URL_LEN,
     _URL_CTRL_CHAR_RE,
     is_valid_uax31_id,
     load_catalog_spec,
@@ -186,71 +187,75 @@ def _mutate_json_pointer(
     pointer: str,
     value: Any,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
-) -> tuple[str, int | None]:
+) -> tuple[str, int | None, bool]:
     """Apply an RFC 6901 JSON Pointer mutation across nested dicts and lists (None deletes).
 
-    Returns (effective_pointer, popped_idx) where trailing '/-' appends resolve to their
-    concrete numeric index and list element deletions map to the parent list pointer with
-    the integer index that was popped.
+    Returns (effective_pointer, popped_idx, changed) where trailing '/-' appends resolve to
+    their concrete numeric index, list element deletions map to the parent list pointer with
+    the integer index that was popped, and changed is False for genuine no-op mutations.
     """
     if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
-        return (pointer if isinstance(pointer, str) else "/", None)
+        return (pointer if isinstance(pointer, str) else "/", None, False)
     if pointer.count("/") > max_segments:
-        return (pointer, None)
+        return (pointer, None, False)
     canon_pointer = _canonicalize_json_pointer(pointer, max_segments=max_segments)
     raw_parts = canon_pointer[1:].split("/")
     parts = [p.replace("~1", "/").replace("~0", "~") for p in raw_parts]
     if not parts:
-        return (canon_pointer, None)
+        return (canon_pointer, None, False)
     cur: Any = root
     for seg in parts[:-1]:
         if isinstance(cur, dict):
             nxt = cur.get(seg)
             if not isinstance(nxt, (dict, list)):
                 if value is None:
-                    return (canon_pointer, None)
+                    return (canon_pointer, None, False)
                 nxt = {}
                 cur[seg] = nxt
             cur = nxt
         elif isinstance(cur, list):
             idx = _parse_rfc6901_array_index(seg)
             if idx is None or idx >= len(cur):
-                return (canon_pointer, None)
+                return (canon_pointer, None, False)
             nxt = cur[idx]
             if not isinstance(nxt, (dict, list)):
                 if value is None:
-                    return (canon_pointer, None)
+                    return (canon_pointer, None, False)
                 nxt = {}
                 cur[idx] = nxt
             cur = nxt
         else:
-            return (canon_pointer, None)
+            return (canon_pointer, None, False)
     last = parts[-1]
     parent_ptr = "" if len(raw_parts) == 1 else "/" + "/".join(raw_parts[:-1])
     if isinstance(cur, dict):
         if value is None:
+            if last not in cur:
+                return (canon_pointer, None, False)
             cur.pop(last, None)
-        else:
-            cur[last] = value
-        return (canon_pointer, None)
+            return (canon_pointer, None, True)
+        cur[last] = value
+        return (canon_pointer, None, True)
     if isinstance(cur, list):
         idx = _parse_rfc6901_array_index(last)
         if idx is not None:
             if value is None:
                 if idx < len(cur):
                     cur.pop(idx)
-                    return (parent_ptr or "/", idx)
-            else:
-                if idx < len(cur):
-                    cur[idx] = value
-                elif idx == len(cur):
-                    cur.append(value)
-            return (canon_pointer, None)
+                    return (parent_ptr or "/", idx, True)
+                return (canon_pointer, None, False)
+            if idx < len(cur):
+                cur[idx] = value
+                return (canon_pointer, None, True)
+            if idx == len(cur):
+                cur.append(value)
+                return (canon_pointer, None, True)
+            return (canon_pointer, None, False)
         if last == "-" and value is not None:
             new_idx = len(cur)
             cur.append(value)
-            return (f"{parent_ptr}/{new_idx}", None)
-    return (canon_pointer, None)
+            return (f"{parent_ptr}/{new_idx}", None, True)
+    return (canon_pointer, None, False)
 
 
 def _convert_v08_typed_value(entry: dict[str, Any]) -> Any:
@@ -504,6 +509,72 @@ _MAX_FORMAT_URL_NON_DATA_LEN = 16_384
 _MAX_FORMAT_URL_DATA_LEN = 262_144
 _SAFE_URL_CACHE_MAX = 4096
 _SAFE_URL_CACHE_MAX_ITEM_LEN = 2048
+_SAFE_URL_CACHE_MAX_CHARS = 4_194_304
+
+
+class _BoundedUrlCache:
+    """Bounded safe/unsafe URL cache capped by entry count and cumulative character budget."""
+
+    __slots__ = ("_items", "_chars", "_unsafe", "_unsafe_chars", "max_entries", "max_chars", "max_item_len")
+
+    def __init__(
+        self,
+        max_entries: int = _SAFE_URL_CACHE_MAX,
+        max_chars: int = _SAFE_URL_CACHE_MAX_CHARS,
+        max_item_len: int = _MAX_DATA_MEDIA_URL_LEN,
+    ) -> None:
+        self._items: set[str] = set()
+        self._chars: int = 0
+        self._unsafe: dict[str, str | None] = {}
+        self._unsafe_chars: int = 0
+        self.max_entries = max_entries
+        self.max_chars = max_chars
+        self.max_item_len = max_item_len
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def chars(self) -> int:
+        return self._chars
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._chars = 0
+        self._unsafe.clear()
+        self._unsafe_chars = 0
+
+    def add(self, url: str) -> None:
+        ulen = len(url)
+        if ulen > self.max_item_len or ulen > self.max_chars:
+            return
+        if url in self._items:
+            return
+        if len(self._items) >= self.max_entries or self._chars + ulen > self.max_chars:
+            self._items.clear()
+            self._chars = 0
+        self._items.add(url)
+        self._chars += ulen
+
+    def lookup_unsafe(self, url: str) -> tuple[bool, str | None]:
+        if url in self._unsafe:
+            return True, self._unsafe[url]
+        return False, None
+
+    def add_unsafe(self, url: str, reason: str | None) -> None:
+        ulen = len(url)
+        if ulen > self.max_item_len or ulen > self.max_chars:
+            return
+        if url in self._unsafe:
+            return
+        if len(self._unsafe) >= self.max_entries or self._unsafe_chars + ulen > self.max_chars:
+            self._unsafe.clear()
+            self._unsafe_chars = 0
+        self._unsafe[url] = reason
+        self._unsafe_chars += ulen
 
 
 def _is_pointer_too_deep(ptr: str, max_segments: int) -> bool:
@@ -513,9 +584,14 @@ def _is_pointer_too_deep(ptr: str, max_segments: int) -> bool:
     return len(ptr) >= max_segments and ptr.count("/") >= max_segments
 
 
-def _cache_safe_url(safe_url_cache: set[str] | None, candidate_url: str) -> None:
-    """Insert a verified safe URL into cache only when its length is within cache item cap."""
-    if safe_url_cache is not None and len(candidate_url) <= _SAFE_URL_CACHE_MAX_ITEM_LEN:
+def _cache_safe_url(safe_url_cache: _BoundedUrlCache | set[str] | None, candidate_url: str) -> None:
+    """Insert a verified safe URL into cache subject to entry-count and character-budget caps."""
+    if safe_url_cache is None:
+        return
+    if isinstance(safe_url_cache, _BoundedUrlCache):
+        safe_url_cache.add(candidate_url)
+        return
+    if len(candidate_url) <= _MAX_DATA_MEDIA_URL_LEN:
         if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
             safe_url_cache.clear()
         safe_url_cache.add(candidate_url)
@@ -533,7 +609,7 @@ def _parse_format_string_template(
     if _URL_CTRL_CHAR_RE.search(tpl):
         return ("err_ctrl", (), (), False, "", 1, "")
     if "${" not in tpl:
-        return ("static", (tpl,), (), bool(tpl.strip()), tpl, 1, tpl)
+        return ("static", (tpl,), (), bool(tpl.strip()), tpl, 1 + (len(tpl) // 1024), tpl)
     if r"\${" in tpl:
         return ("err_esc", (), (), False, "", 1, "")
     parts: list[str] = []
@@ -562,21 +638,88 @@ def _parse_format_string_template(
     return ("ok", parts_t, exprs_t, bool(parts_t[0].strip()), "placeholder".join(parts_t), eval_cost, empty_single)
 
 
+def _charge_url_eval_kb(
+    candidate_len: int,
+    *,
+    errors: list[dict[str, Any]] | None,
+    block_index: int,
+    path: str,
+    eval_counter: list[int] | None,
+    max_evals: int | None,
+    budget_exceeded: list[bool] | None,
+) -> bool:
+    """Charge candidate_len // 1024 against eval_counter before scanning; return False if exceeded."""
+    if eval_counter is None or max_evals is None:
+        return True
+    if budget_exceeded is not None and budget_exceeded[0]:
+        return False
+    extra_kb = candidate_len // 1024
+    if extra_kb <= 0:
+        return True
+    if eval_counter[0] + extra_kb > max_evals:
+        if budget_exceeded is None or not budget_exceeded[0]:
+            if budget_exceeded is not None:
+                budget_exceeded[0] = True
+            if errors is not None:
+                _add_issue(
+                    errors,
+                    "MAX_TEMPLATE_EVALS_EXCEEDED",
+                    block_index,
+                    path,
+                    f"Payload URL slot evaluations exceeded limit ({max_evals}).",
+                )
+        return False
+    eval_counter[0] += extra_kb
+    return True
+
+
 def _check_url_with_cache(
-    candidate_url: str,
+    candidate_url: Any,
     validator_fn: Any,
-    safe_url_cache: set[str] | None,
+    safe_url_cache: _BoundedUrlCache | set[str] | None,
     uncached_counter: list[int] | None,
-) -> tuple[bool, str | None]:
-    """Validate candidate_url using validator_fn with optional bounded non-freezing safe-URL memoization."""
-    if safe_url_cache is not None and candidate_url in safe_url_cache:
-        return True, None
+    *,
+    errors: list[dict[str, Any]] | None = None,
+    block_index: int = 0,
+    path: str = "",
+    eval_counter: list[int] | None = None,
+    max_evals: int | None = None,
+    budget_exceeded: list[bool] | None = None,
+) -> tuple[bool, str | None, bool]:
+    """Validate candidate_url with bounded URL memoization and payload-wide KB budget enforcement.
+
+    Returns (ok, reason, budget_hit). When budget_hit is True, MAX_TEMPLATE_EVALS_EXCEEDED has
+    already been recorded (once) and the caller must return without emitting a spurious UNSAFE_* issue.
+    """
+    is_str = type(candidate_url) is str
+    if is_str and safe_url_cache is not None and candidate_url in safe_url_cache:
+        return True, None, False
+    if is_str:
+        if not _charge_url_eval_kb(
+            len(candidate_url),
+            errors=errors,
+            block_index=block_index,
+            path=path,
+            eval_counter=eval_counter,
+            max_evals=max_evals,
+            budget_exceeded=budget_exceeded,
+        ):
+            return False, None, True
+        if isinstance(safe_url_cache, _BoundedUrlCache):
+            hit_unsafe, cached_reason = safe_url_cache.lookup_unsafe(candidate_url)
+            if hit_unsafe:
+                return False, cached_reason, False
+    elif budget_exceeded is not None and budget_exceeded[0]:
+        return False, None, True
     if uncached_counter is not None:
         uncached_counter[0] += 1
     ok_u, reason_u = validator_fn(candidate_url)
-    if ok_u:
-        _cache_safe_url(safe_url_cache, candidate_url)
-    return ok_u, reason_u
+    if is_str:
+        if ok_u:
+            _cache_safe_url(safe_url_cache, candidate_url)
+        elif isinstance(safe_url_cache, _BoundedUrlCache):
+            safe_url_cache.add_unsafe(candidate_url, reason_u)
+    return ok_u, reason_u, False
 
 
 def _validate_url_function_call(
@@ -592,7 +735,7 @@ def _validate_url_function_call(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
-    safe_url_cache: set[str] | None = None,
+    safe_url_cache: _BoundedUrlCache | set[str] | None = None,
     uncached_counter: list[int] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
     eval_counter: list[int] | None = None,
@@ -645,7 +788,20 @@ def _validate_url_function_call(
             )
             return
         if status == "static":
-            ok, reason = _check_url_with_cache(tpl, validator_fn, safe_url_cache, uncached_counter)
+            ok, reason, budget_hit = _check_url_with_cache(
+                tpl,
+                validator_fn,
+                safe_url_cache,
+                uncached_counter,
+                errors=errors,
+                block_index=block_index,
+                path=path,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
+            )
+            if budget_hit:
+                return
             if not ok:
                 _add_issue(errors, code, block_index, path, reason or f"Unsafe {kind} URL in formatString.")
             return
@@ -682,25 +838,15 @@ def _validate_url_function_call(
         max_interp_len = _MAX_FORMAT_URL_DATA_LEN if is_data_media_tpl else _MAX_FORMAT_URL_NON_DATA_LEN
 
         def _charge_interp_evals(interp_len: int) -> bool:
-            if eval_counter is None or max_evals is None:
-                return True
-            extra_kb = interp_len // 1024
-            if extra_kb <= 0:
-                return True
-            if eval_counter[0] + extra_kb > max_evals:
-                if budget_exceeded is None or not budget_exceeded[0]:
-                    if budget_exceeded is not None:
-                        budget_exceeded[0] = True
-                    _add_issue(
-                        errors,
-                        "MAX_TEMPLATE_EVALS_EXCEEDED",
-                        block_index,
-                        path,
-                        f"Payload URL slot evaluations exceeded limit ({max_evals}).",
-                    )
-                return False
-            eval_counter[0] += extra_kb
-            return True
+            return _charge_url_eval_kb(
+                interp_len,
+                errors=errors,
+                block_index=block_index,
+                path=path,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
+            )
 
         # Interpolate resolvable placeholders in a single pass with strict depth, scalar, length, and budget bounds.
         if len(exprs) == 1:
@@ -833,18 +979,55 @@ def _validate_url_function_call(
 
         if not prefix_nonempty:
             if all_resolved:
-                ok, reason = _check_url_with_cache(resolved_str, validator_fn, safe_url_cache, uncached_counter)
+                ok, reason, budget_hit = _check_url_with_cache(
+                    resolved_str,
+                    validator_fn,
+                    safe_url_cache,
+                    uncached_counter,
+                    errors=errors,
+                    block_index=block_index,
+                    path=path,
+                    eval_counter=eval_counter,
+                    max_evals=max_evals,
+                    budget_exceeded=budget_exceeded,
+                )
+                if budget_hit:
+                    return
                 if not ok:
                     _add_issue(errors, code, block_index, path, reason or f"Unsafe resolved {kind} URL.")
             elif is_historical_snapshot:
                 if any_resolved:
-                    ok, reason = _check_url_with_cache(resolved_str, validator_fn, safe_url_cache, uncached_counter)
+                    ok, reason, budget_hit = _check_url_with_cache(
+                        resolved_str,
+                        validator_fn,
+                        safe_url_cache,
+                        uncached_counter,
+                        errors=errors,
+                        block_index=block_index,
+                        path=path,
+                        eval_counter=eval_counter,
+                        max_evals=max_evals,
+                        budget_exceeded=budget_exceeded,
+                    )
+                    if budget_hit:
+                        return
                     if not ok:
                         _add_issue(errors, code, block_index, path, reason or f"Unsafe resolved {kind} URL.")
                     elif empty_unresolved_str != resolved_str:
-                        ok_emp, reason_emp = _check_url_with_cache(
-                            empty_unresolved_str, validator_fn, safe_url_cache, uncached_counter
+                        ok_emp, reason_emp, budget_hit_emp = _check_url_with_cache(
+                            empty_unresolved_str,
+                            validator_fn,
+                            safe_url_cache,
+                            uncached_counter,
+                            errors=errors,
+                            block_index=block_index,
+                            path=path,
+                            eval_counter=eval_counter,
+                            max_evals=max_evals,
+                            budget_exceeded=budget_exceeded,
                         )
+                        if budget_hit_emp:
+                            return
                         if not ok_emp:
                             _add_issue(
                                 errors,
@@ -864,20 +1047,57 @@ def _validate_url_function_call(
             return
 
         # Validate placeholder, resolved, and empty-unresolved candidate strings unconditionally
-        ok_tpl, reason_tpl = _check_url_with_cache(placeholder_str, validator_fn, safe_url_cache, uncached_counter)
+        ok_tpl, reason_tpl, budget_hit_tpl = _check_url_with_cache(
+            placeholder_str,
+            validator_fn,
+            safe_url_cache,
+            uncached_counter,
+            errors=errors,
+            block_index=block_index,
+            path=path,
+            eval_counter=eval_counter,
+            max_evals=max_evals,
+            budget_exceeded=budget_exceeded,
+        )
+        if budget_hit_tpl:
+            return
         if not ok_tpl:
             _add_issue(errors, code, block_index, path, reason_tpl or f"Unsafe {kind} URL template in formatString.")
             return
         if is_superseded:
             return
-        ok_res, reason_res = _check_url_with_cache(resolved_str, validator_fn, safe_url_cache, uncached_counter)
+        ok_res, reason_res, budget_hit_res = _check_url_with_cache(
+            resolved_str,
+            validator_fn,
+            safe_url_cache,
+            uncached_counter,
+            errors=errors,
+            block_index=block_index,
+            path=path,
+            eval_counter=eval_counter,
+            max_evals=max_evals,
+            budget_exceeded=budget_exceeded,
+        )
+        if budget_hit_res:
+            return
         if not ok_res:
             _add_issue(errors, code, block_index, path, reason_res or f"Unsafe resolved {kind} URL.")
             return
         if empty_unresolved_str != resolved_str:
-            ok_emp, reason_emp = _check_url_with_cache(
-                empty_unresolved_str, validator_fn, safe_url_cache, uncached_counter
+            ok_emp, reason_emp, budget_hit_emp = _check_url_with_cache(
+                empty_unresolved_str,
+                validator_fn,
+                safe_url_cache,
+                uncached_counter,
+                errors=errors,
+                block_index=block_index,
+                path=path,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
             )
+            if budget_hit_emp:
+                return
             if not ok_emp:
                 _add_issue(
                     errors,
@@ -962,7 +1182,8 @@ def _validate_dynamic_value(
     is_superseded: bool = False,
     template_validated_url_paths: frozenset[str] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
-    safe_open_urls: set[str] | None = None,
+    safe_open_urls: _BoundedUrlCache | set[str] | None = None,
+    uncached_counter: list[int] | None = None,
     eval_counter: list[int] | None = None,
     max_evals: int | None = None,
     budget_exceeded: list[bool] | None = None,
@@ -989,6 +1210,11 @@ def _validate_dynamic_value(
                 is_superseded=is_superseded,
                 template_validated_url_paths=template_validated_url_paths,
                 max_segments=max_segments,
+                safe_open_urls=safe_open_urls,
+                uncached_counter=uncached_counter,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
             )
         return
 
@@ -1132,6 +1358,7 @@ def _validate_dynamic_value(
                     ),
                     is_superseded=is_superseded,
                     safe_url_cache=safe_open_urls,
+                    uncached_counter=uncached_counter,
                     max_segments=max_segments,
                     eval_counter=eval_counter,
                     max_evals=max_evals,
@@ -1157,6 +1384,11 @@ def _validate_dynamic_value(
                     is_superseded=is_superseded,
                     template_validated_url_paths=template_validated_url_paths,
                     max_segments=max_segments,
+                    safe_open_urls=safe_open_urls,
+                    uncached_counter=uncached_counter,
+                    eval_counter=eval_counter,
+                    max_evals=max_evals,
+                    budget_exceeded=budget_exceeded,
                 )
 
     # v1.0 canonical FunctionCall
@@ -1230,7 +1462,13 @@ def _validate_dynamic_value(
             item_ctx=item_ctx,
             is_historical_snapshot=is_historical_snapshot,
             is_superseded=is_superseded,
+            template_validated_url_paths=template_validated_url_paths,
             max_segments=max_segments,
+            safe_open_urls=safe_open_urls,
+            uncached_counter=uncached_counter,
+            eval_counter=eval_counter,
+            max_evals=max_evals,
+            budget_exceeded=budget_exceeded,
         )
 
 
@@ -1246,7 +1484,7 @@ def _validate_open_url_arg(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
-    safe_url_cache: set[str] | None = None,
+    safe_url_cache: _BoundedUrlCache | set[str] | None = None,
     uncached_counter: list[int] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
     eval_counter: list[int] | None = None,
@@ -1303,14 +1541,19 @@ def _validate_open_url_arg(
         else:
             _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, "openUrl target must be a URL string, DataBinding, or safe formatString call.")
             return
-    if safe_url_cache is not None and type(candidate) is str and candidate in safe_url_cache:
-        return
-    if uncached_counter is not None:
-        uncached_counter[0] += 1
-    ok, reason = validate_open_url(candidate)
-    if ok:
-        if type(candidate) is str:
-            _cache_safe_url(safe_url_cache, candidate)
+    ok, reason, budget_hit = _check_url_with_cache(
+        candidate,
+        validate_open_url,
+        safe_url_cache,
+        uncached_counter,
+        errors=errors,
+        block_index=block_index,
+        path=path,
+        eval_counter=eval_counter,
+        max_evals=max_evals,
+        budget_exceeded=budget_exceeded,
+    )
+    if budget_hit or ok:
         return
     _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, reason or "Unsafe openUrl target.")
 
@@ -1328,7 +1571,7 @@ def _validate_media_prop(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
-    safe_url_cache: set[str] | None = None,
+    safe_url_cache: _BoundedUrlCache | set[str] | None = None,
     uncached_counter: list[int] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
     eval_counter: list[int] | None = None,
@@ -1351,20 +1594,22 @@ def _validate_media_prop(
                 return
             if "literalString" in val:
                 lit_val = val["literalString"]
-                lit_ok = False
-                if safe_url_cache is not None and type(lit_val) is str and lit_val in safe_url_cache:
-                    lit_ok = True
-                else:
-                    if uncached_counter is not None:
-                        uncached_counter[0] += 1
-                    ok_lit, reason_lit = validate_media_url(lit_val)
-                    if ok_lit:
-                        lit_ok = True
-                        if type(lit_val) is str:
-                            _cache_safe_url(safe_url_cache, lit_val)
-                    else:
-                        _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason_lit or "Unsafe media URL.")
-                if not lit_ok:
+                ok_lit, reason_lit, budget_hit = _check_url_with_cache(
+                    lit_val,
+                    validate_media_url,
+                    safe_url_cache,
+                    uncached_counter,
+                    errors=errors,
+                    block_index=block_index,
+                    path=path,
+                    eval_counter=eval_counter,
+                    max_evals=max_evals,
+                    budget_exceeded=budget_exceeded,
+                )
+                if budget_hit:
+                    return
+                if not ok_lit:
+                    _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason_lit or "Unsafe media URL.")
                     return
                 if "path" not in val:
                     return
@@ -1444,14 +1689,19 @@ def _validate_media_prop(
             else:
                 _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, "Media URL must be a string, DataBinding, or safe formatString call.")
                 return
-    if safe_url_cache is not None and type(candidate) is str and candidate in safe_url_cache:
-        return
-    if uncached_counter is not None:
-        uncached_counter[0] += 1
-    ok, reason = validate_media_url(candidate)
-    if ok:
-        if type(candidate) is str:
-            _cache_safe_url(safe_url_cache, candidate)
+    ok, reason, budget_hit = _check_url_with_cache(
+        candidate,
+        validate_media_url,
+        safe_url_cache,
+        uncached_counter,
+        errors=errors,
+        block_index=block_index,
+        path=path,
+        eval_counter=eval_counter,
+        max_evals=max_evals,
+        budget_exceeded=budget_exceeded,
+    )
+    if budget_hit or ok:
         return
     _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason or "Unsafe media URL.")
 
@@ -1507,7 +1757,8 @@ def _validate_action(
     is_superseded: bool = False,
     template_validated_url_paths: frozenset[str] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
-    safe_open_urls: set[str] | None = None,
+    safe_open_urls: _BoundedUrlCache | set[str] | None = None,
+    uncached_counter: list[int] | None = None,
     eval_counter: list[int] | None = None,
     max_evals: int | None = None,
     budget_exceeded: list[bool] | None = None,
@@ -1565,6 +1816,12 @@ def _validate_action(
                 item_ctx=item_ctx,
                 is_historical_snapshot=is_historical_snapshot,
                 is_superseded=is_superseded,
+                max_segments=max_segments,
+                safe_open_urls=safe_open_urls,
+                uncached_counter=uncached_counter,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
             )
         if "context" in ev:
             if not isinstance(ev["context"], dict):
@@ -1588,6 +1845,12 @@ def _validate_action(
                         item_ctx=item_ctx,
                         is_historical_snapshot=is_historical_snapshot,
                         is_superseded=is_superseded,
+                        max_segments=max_segments,
+                        safe_open_urls=safe_open_urls,
+                        uncached_counter=uncached_counter,
+                        eval_counter=eval_counter,
+                        max_evals=max_evals,
+                        budget_exceeded=budget_exceeded,
                     )
     else:
         fn_call = action["functionCall"]
@@ -1617,6 +1880,7 @@ def _validate_action(
             template_validated_url_paths=template_validated_url_paths,
             max_segments=max_segments,
             safe_open_urls=safe_open_urls,
+            uncached_counter=uncached_counter,
             eval_counter=eval_counter,
             max_evals=max_evals,
             budget_exceeded=budget_exceeded,
@@ -1728,8 +1992,9 @@ def _validate_surface_components(
     surface_catalog_id: str | None = None,
     template_validated_url_paths: frozenset[str] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
-    safe_media_urls: set[str] | None = None,
-    safe_open_urls: set[str] | None = None,
+    safe_media_urls: _BoundedUrlCache | set[str] | None = None,
+    safe_open_urls: _BoundedUrlCache | set[str] | None = None,
+    uncached_counter: list[int] | None = None,
     eval_counter: list[int] | None = None,
     max_evals: int | None = None,
     budget_exceeded: list[bool] | None = None,
@@ -2148,6 +2413,12 @@ def _validate_surface_components(
                                 allow_user_activation=False,
                                 is_historical_snapshot=comp_hist,
                                 is_superseded=is_superseded,
+                                max_segments=max_segments,
+                                safe_open_urls=safe_open_urls,
+                                uncached_counter=uncached_counter,
+                                eval_counter=eval_counter,
+                                max_evals=max_evals,
+                                budget_exceeded=budget_exceeded,
                             )
                     if "live" in acc_val:
                         live_val = acc_val["live"]
@@ -2179,6 +2450,12 @@ def _validate_surface_components(
                             allow_user_activation=False,
                             is_historical_snapshot=comp_hist,
                             is_superseded=is_superseded,
+                            max_segments=max_segments,
+                            safe_open_urls=safe_open_urls,
+                            uncached_counter=uncached_counter,
+                            eval_counter=eval_counter,
+                            max_evals=max_evals,
+                            budget_exceeded=budget_exceeded,
                         )
 
             if comp_type == "ChoicePicker" and isinstance(props.get("options"), list):
@@ -2200,6 +2477,12 @@ def _validate_surface_components(
                             allow_user_activation=False,
                             is_historical_snapshot=comp_hist,
                             is_superseded=is_superseded,
+                            max_segments=max_segments,
+                            safe_open_urls=safe_open_urls,
+                            uncached_counter=uncached_counter,
+                            eval_counter=eval_counter,
+                            max_evals=max_evals,
+                            budget_exceeded=budget_exceeded,
                         )
 
             if comp_type == "Icon" and "name" in props:
@@ -2221,6 +2504,12 @@ def _validate_surface_components(
                         allow_user_activation=False,
                         is_historical_snapshot=comp_hist,
                         is_superseded=is_superseded,
+                        max_segments=max_segments,
+                        safe_open_urls=safe_open_urls,
+                        uncached_counter=uncached_counter,
+                        eval_counter=eval_counter,
+                        max_evals=max_evals,
+                        budget_exceeded=budget_exceeded,
                     )
                 elif isinstance(iname, dict):
                     _validate_dynamic_value(
@@ -2239,6 +2528,12 @@ def _validate_surface_components(
                         allow_user_activation=False,
                         is_historical_snapshot=comp_hist,
                         is_superseded=is_superseded,
+                        max_segments=max_segments,
+                        safe_open_urls=safe_open_urls,
+                        uncached_counter=uncached_counter,
+                        eval_counter=eval_counter,
+                        max_evals=max_evals,
+                        budget_exceeded=budget_exceeded,
                     )
 
             checks_val = props.get("@checks") if "@checks" in props else props.get("checks")
@@ -2294,6 +2589,12 @@ def _validate_surface_components(
                                 effective_catalog_id=effective_comp_catalog,
                                 is_historical_snapshot=comp_hist,
                                 is_superseded=is_superseded,
+                                max_segments=max_segments,
+                                safe_open_urls=safe_open_urls,
+                                uncached_counter=uncached_counter,
+                                eval_counter=eval_counter,
+                                max_evals=max_evals,
+                                budget_exceeded=budget_exceeded,
                             )
 
             for prop_name, pval in props.items():
@@ -2313,6 +2614,12 @@ def _validate_surface_components(
                         effective_catalog_id=effective_comp_catalog,
                         is_historical_snapshot=comp_hist,
                         is_superseded=is_superseded,
+                        max_segments=max_segments,
+                        safe_open_urls=safe_open_urls,
+                        uncached_counter=uncached_counter,
+                        eval_counter=eval_counter,
+                        max_evals=max_evals,
+                        budget_exceeded=budget_exceeded,
                     )
 
             if "action" in props and (comp_type == "Button" or isinstance(props["action"], dict)):
@@ -2334,6 +2641,7 @@ def _validate_surface_components(
                     template_validated_url_paths=template_validated_url_paths,
                     max_segments=max_segments,
                     safe_open_urls=safe_open_urls,
+                    uncached_counter=uncached_counter,
                     eval_counter=eval_counter,
                     max_evals=max_evals,
                     budget_exceeded=budget_exceeded,
@@ -2359,6 +2667,7 @@ def _validate_surface_components(
                             ),
                             is_superseded=is_superseded,
                             safe_url_cache=safe_media_urls,
+                            uncached_counter=uncached_counter,
                             max_segments=max_segments,
                             eval_counter=eval_counter,
                             max_evals=max_evals,
@@ -2384,6 +2693,7 @@ def _validate_surface_components(
                             ),
                             is_superseded=is_superseded,
                             safe_url_cache=safe_media_urls,
+                            uncached_counter=uncached_counter,
                             max_segments=max_segments,
                             eval_counter=eval_counter,
                             max_evals=max_evals,
@@ -2512,8 +2822,8 @@ def validate_payload(
     payload_tpl_abs_eval_count: list[int] = [0]
     payload_budget_exceeded = False
     payload_budget_flag: list[bool] = [False]
-    safe_media_urls: set[str] = set()
-    safe_open_urls: set[str] = set()
+    safe_media_urls = _BoundedUrlCache()
+    safe_open_urls = _BoundedUrlCache()
 
     for block in parsed["blocks"]:
         bidx = block["blockIndex"]
@@ -2563,6 +2873,17 @@ def validate_payload(
                 ],
             ],
         ] = {}
+        surface_tpl_rel_index_cache: dict[
+            str,
+            dict[
+                str,
+                tuple[
+                    dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+                    dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+                    list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+                ],
+            ],
+        ] = {}
 
         def _clear_surface_stream_state(sid_clear: str) -> None:
             surface_active_comp_map.pop(sid_clear, None)
@@ -2575,6 +2896,7 @@ def validate_payload(
             surface_seen_warnings.pop(sid_clear, None)
             surface_total_comp_entries.pop(sid_clear, None)
             surface_tpl_summary_cache.pop(sid_clear, None)
+            surface_tpl_rel_index_cache.pop(sid_clear, None)
 
         def _emit_surface_issues(
             sid_emit: str,
@@ -2701,17 +3023,33 @@ def validate_payload(
                         if not found:
                             return True
                         if type(resolved) is str:
-                            if resolved in cache:
-                                return True
-                            payload_uncached_url_checks[0] += 1
-                            ok_u, _reason_u = (
-                                validate_media_url(resolved)
-                                if kind == "media"
-                                else validate_open_url(resolved)
+                            target_path = (
+                                f"{comp_cpath}[item:{item_idx}]{slot_suffix}"
+                                if item_idx is not None
+                                else slot_path
                             )
+                            validator_fn = validate_media_url if kind == "media" else validate_open_url
+                            ok_u, reason_u, budget_hit = _check_url_with_cache(
+                                resolved,
+                                validator_fn,
+                                cache,
+                                payload_uncached_url_checks,
+                                errors=tmp_errors,
+                                block_index=bidx,
+                                path=target_path,
+                                eval_counter=payload_url_slot_evals,
+                                max_evals=max_surface_url_evals,
+                                budget_exceeded=payload_budget_flag,
+                            )
+                            if budget_hit:
+                                payload_budget_exceeded = True
+                                return False
                             if ok_u:
-                                _cache_safe_url(cache, resolved)
                                 return True
+                            code_u = "UNSAFE_MEDIA_URL" if kind == "media" else "UNSAFE_OPEN_URL"
+                            default_msg = "Unsafe media URL." if kind == "media" else "Unsafe openUrl target."
+                            _add_issue(tmp_errors, code_u, bidx, target_path, reason_u or default_msg)
+                            return True
             target_path = f"{comp_cpath}[item:{item_idx}]{slot_suffix}" if item_idx is not None else slot_path
             if kind == "media":
                 _validate_media_prop(
@@ -3192,6 +3530,7 @@ def validate_payload(
 
             surface_ptr_index_dirty.add(sid_ing)
             surface_tpl_summary_cache.pop(sid_ing, None)
+            surface_tpl_rel_index_cache.pop(sid_ing, None)
             if not updated_cids:
                 _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
@@ -3607,7 +3946,94 @@ def validate_payload(
                                 checked_target_idx = target_idx
                                 item = items_val[target_idx]
                                 if not has_nested_rel:
-                                    for slot in rel_slots:
+                                    item_sub_ptr = (
+                                        "/" + rest.split("/", 1)[1] if ("/" in rest and seg != "-") else None
+                                    )
+                                    if item_sub_ptr is None or item_sub_ptr in {"", "/"}:
+                                        target_rel_slots = rel_slots
+                                    else:
+                                        surf_rel_idx = surface_tpl_rel_index_cache.setdefault(sid_upd, {})
+                                        rel_idx_entry = surf_rel_idx.get(tpl_root_id)
+                                        if rel_idx_entry is None:
+                                            rel_exact: dict[
+                                                str,
+                                                list[
+                                                    tuple[
+                                                        str,
+                                                        str,
+                                                        Any,
+                                                        frozenset[str],
+                                                        frozenset[str],
+                                                        str,
+                                                        str,
+                                                    ]
+                                                ],
+                                            ] = {}
+                                            rel_prefix: dict[
+                                                str,
+                                                list[
+                                                    tuple[
+                                                        str,
+                                                        str,
+                                                        Any,
+                                                        frozenset[str],
+                                                        frozenset[str],
+                                                        str,
+                                                        str,
+                                                    ]
+                                                ],
+                                            ] = {}
+                                            rel_abs: list[
+                                                tuple[str, str, Any, frozenset[str], frozenset[str], str, str]
+                                            ] = []
+                                            for rslot in rel_slots:
+                                                if rslot[3]:
+                                                    rel_abs.append(rslot)
+                                                seen_ranc: set[str] = set()
+                                                for rp in rslot[4]:
+                                                    rptr = f"/{rp}"
+                                                    rel_exact.setdefault(rptr, []).append(rslot)
+                                                    for ranc in _pointer_ancestors(
+                                                        rptr, max_segments=max_ptr_segments
+                                                    ):
+                                                        if ranc not in seen_ranc:
+                                                            seen_ranc.add(ranc)
+                                                            rel_prefix.setdefault(ranc, []).append(rslot)
+                                            rel_idx_entry = (rel_exact, rel_prefix, rel_abs)
+                                            surf_rel_idx[tpl_root_id] = rel_idx_entry
+                                        rel_exact, rel_prefix, rel_abs = rel_idx_entry
+                                        target_rel_slots = []
+                                        seen_rel_ids: set[int] = set()
+                                        for rbucket in (
+                                            rel_exact.get(item_sub_ptr, ()),
+                                            rel_prefix.get(item_sub_ptr, ()),
+                                        ):
+                                            for rslot in rbucket:
+                                                r_id = id(rslot)
+                                                if r_id not in seen_rel_ids:
+                                                    seen_rel_ids.add(r_id)
+                                                    target_rel_slots.append(rslot)
+                                        for ranc in _pointer_ancestors(
+                                            item_sub_ptr, max_segments=max_ptr_segments
+                                        ):
+                                            if ranc == item_sub_ptr:
+                                                continue
+                                            for rslot in rel_exact.get(ranc, ()):
+                                                r_id = id(rslot)
+                                                if r_id not in seen_rel_ids:
+                                                    seen_rel_ids.add(r_id)
+                                                    target_rel_slots.append(rslot)
+                                        for rslot in rel_abs:
+                                            r_id = id(rslot)
+                                            if r_id not in seen_rel_ids and any(
+                                                _pointer_affected_by_update(
+                                                    ap, ptr, popped_idx, max_segments=max_ptr_segments
+                                                )
+                                                for ap in rslot[3]
+                                            ):
+                                                seen_rel_ids.add(r_id)
+                                                target_rel_slots.append(rslot)
+                                    for slot in target_rel_slots:
                                         if not _validate_single_url_slot(
                                             sid_upd,
                                             slot,
@@ -3994,6 +4420,7 @@ def validate_payload(
                 max_segments=max_ptr_segments,
                 safe_media_urls=safe_media_urls,
                 safe_open_urls=safe_open_urls,
+                uncached_counter=payload_uncached_url_checks,
                 eval_counter=payload_url_slot_evals,
                 max_evals=max_surface_url_evals,
                 budget_exceeded=payload_budget_flag,
@@ -4288,16 +4715,14 @@ def validate_payload(
                             )
                         else:
                             dm = surface_data_models.setdefault(sid, {})
-                            effective_ptr, popped_idx = _mutate_json_pointer(
+                            effective_ptr, popped_idx, mutated = _mutate_json_pointer(
                                 dm, ptr, val_obj, max_segments=max_ptr_segments
                             )
-                            mutated = True
                     else:
                         dm = surface_data_models.setdefault(sid, {})
-                        effective_ptr, popped_idx = _mutate_json_pointer(
+                        effective_ptr, popped_idx, mutated = _mutate_json_pointer(
                             dm, ptr, None, max_segments=max_ptr_segments
                         )
-                        mutated = True
                 if mutated and isinstance(effective_ptr, str):
                     _validate_streaming_data_update(sid, effective_ptr, popped_idx=popped_idx)
 
@@ -4397,7 +4822,14 @@ def validate_payload(
                         effective_catalog_id=fn_surf_cat,
                         allow_user_activation=False,
                         max_segments=max_ptr_segments,
+                        safe_open_urls=safe_open_urls,
+                        uncached_counter=payload_uncached_url_checks,
+                        eval_counter=payload_url_slot_evals,
+                        max_evals=max_surface_url_evals,
+                        budget_exceeded=payload_budget_flag,
                     )
+                    if payload_budget_flag[0]:
+                        payload_budget_exceeded = True
 
             elif env_key in {"agentFunctionResponse", "rendererFunctionResponse"}:
                 extra_resp_keys = set(body.keys()) - {"functionCallId", "value", "error"}
@@ -4504,10 +4936,9 @@ def validate_payload(
                             v08_merged_keys = list(conv_val.keys())
                         elif ptr_is_abs:
                             dm = surface_data_models.setdefault(sid, {})
-                            effective_ptr, popped_idx = _mutate_json_pointer(
+                            effective_ptr, popped_idx, mutated = _mutate_json_pointer(
                                 dm, ptr, conv_val, max_segments=max_ptr_segments
                             )
-                            mutated = True
                     elif "value" in body:
                         val_obj = body["value"]
                         if ptr in {"", "/"}:
@@ -4545,16 +4976,14 @@ def validate_payload(
                                     )
                                 else:
                                     dm = surface_data_models.setdefault(sid, {})
-                                    effective_ptr, popped_idx = _mutate_json_pointer(
+                                    effective_ptr, popped_idx, mutated = _mutate_json_pointer(
                                         dm, ptr, val_obj, max_segments=max_ptr_segments
                                     )
-                                    mutated = True
                             else:
                                 dm = surface_data_models.setdefault(sid, {})
-                                effective_ptr, popped_idx = _mutate_json_pointer(
+                                effective_ptr, popped_idx, mutated = _mutate_json_pointer(
                                     dm, ptr, None, max_segments=max_ptr_segments
                                 )
-                                mutated = True
                     if v08_merged_keys is not None:
                         for merged_k in v08_merged_keys:
                             if payload_budget_exceeded:

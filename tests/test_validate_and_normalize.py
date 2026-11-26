@@ -3319,16 +3319,26 @@ class TestValidateAndNormalize(unittest.TestCase):
 
     def test_interpolated_url_length_cap_container_rejection_and_cache_bounds(self) -> None:
         import time
-        from legends_a2ui.validator import _SAFE_URL_CACHE_MAX_ITEM_LEN, _cache_safe_url
+        from legends_a2ui.spec_registry import _MAX_DATA_MEDIA_URL_LEN
+        from legends_a2ui.validator import (
+            _SAFE_URL_CACHE_MAX_CHARS,
+            _SAFE_URL_CACHE_MAX_ITEM_LEN,
+            _BoundedUrlCache,
+            _cache_safe_url,
+        )
 
-        # 1. Cache entry length cap keeps safe URL cache bounded
-        cache: set[str] = set()
+        # 1. Bounded URL cache enforces cumulative character budget and max item length
+        cache = _BoundedUrlCache()
         short_url = "https://example.com/" + ("a" * 100)
-        long_url = "https://example.com/" + ("a" * (_SAFE_URL_CACHE_MAX_ITEM_LEN + 100))
+        medium_data_url = "data:image/png;base64," + ("A" * (_SAFE_URL_CACHE_MAX_ITEM_LEN + 100))
+        oversize_url = "data:image/png;base64," + ("A" * (_MAX_DATA_MEDIA_URL_LEN + 10))
         _cache_safe_url(cache, short_url)
-        _cache_safe_url(cache, long_url)
+        _cache_safe_url(cache, medium_data_url)
+        _cache_safe_url(cache, oversize_url)
         self.assertIn(short_url, cache)
-        self.assertNotIn(long_url, cache)
+        self.assertIn(medium_data_url, cache)
+        self.assertNotIn(oversize_url, cache)
+        self.assertLessEqual(cache.chars, _SAFE_URL_CACHE_MAX_CHARS)
 
         # 2. Multi-placeholder formatString referencing a large string fails closed before join
         multi_amp = json.dumps(
@@ -3706,6 +3716,215 @@ class TestValidateAndNormalize(unittest.TestCase):
         res_rel = validate_payload(rel_deep, version="1.0", strict=True)
         self.assertFalse(res_rel["ok"])
         self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_rel["errors"]})
+
+    def test_bounded_url_cache_kilobyte_budget_and_streaming_rescan_skips(self) -> None:
+        import time
+        from legends_a2ui.spec_registry import _MAX_DATA_MEDIA_URL_LEN
+        from legends_a2ui.validator import (
+            _SAFE_URL_CACHE_MAX_CHARS,
+            _BoundedUrlCache,
+            _mutate_json_pointer,
+        )
+
+        # 1. _BoundedUrlCache enforces cumulative 4 MiB char budget and resets cleanly on overflow
+        cache = _BoundedUrlCache()
+        urls_800k = [f"data:image/png;base64,{idx}" + ("A" * 800_000) for idx in range(6)]
+        for u in urls_800k[:5]:
+            cache.add(u)
+        self.assertEqual(len(cache), 5)
+        self.assertLessEqual(cache.chars, _SAFE_URL_CACHE_MAX_CHARS)
+        # 6th 800 KB entry exceeds 4 MiB cumulative cap and resets the cache cleanly
+        cache.add(urls_800k[5])
+        self.assertEqual(len(cache), 1)
+        self.assertIn(urls_800k[5], cache)
+        self.assertNotIn(urls_800k[0], cache)
+        self.assertEqual(cache.chars, len(urls_800k[5]))
+        # Entries above _MAX_DATA_MEDIA_URL_LEN are never inserted
+        cache.add("data:image/png;base64," + ("A" * (_MAX_DATA_MEDIA_URL_LEN + 1)))
+        self.assertEqual(len(cache), 1)
+
+        # 2. _mutate_json_pointer reports changed=False on genuine no-ops and True on real mutations
+        dm_mut: dict[str, Any] = {"img": "data:image/png;base64,AA", "arr": ["x"]}
+        _, _, ch_scalar_del = _mutate_json_pointer(dm_mut, "/img/a", None)
+        self.assertFalse(ch_scalar_del)
+        _, _, ch_missing_del = _mutate_json_pointer(dm_mut, "/missing", None)
+        self.assertFalse(ch_missing_del)
+        _, _, ch_oob_del = _mutate_json_pointer(dm_mut, "/arr/5", None)
+        self.assertFalse(ch_oob_del)
+        _, _, ch_oob_set = _mutate_json_pointer(dm_mut, "/arr/5", "y")
+        self.assertFalse(ch_oob_set)
+        _, _, ch_deep_del = _mutate_json_pointer(dm_mut, "/a" * 100, None)
+        self.assertFalse(ch_deep_del)
+        _, _, ch_real_set = _mutate_json_pointer(dm_mut, "/arr/1", "y")
+        self.assertTrue(ch_real_set)
+        _, popped, ch_real_del = _mutate_json_pointer(dm_mut, "/arr/0", None)
+        self.assertTrue(ch_real_del)
+        self.assertEqual(popped, 0)
+
+        # 3. Valid 800 KB data: media URL with ChildList relative @path and sibling updates passes fast
+        valid_data_url = "data:image/png;base64," + ("A" * 800_000)
+        comps_rel = [
+            {"id": "root", "component": "List", "children": {"componentId": "row", "path": "/items"}},
+            {"id": "row", "component": "Column", "children": [f"i{k}" for k in range(498)]},
+        ] + [{"id": f"i{k}", "component": "Image", "url": {"@path": "u"}} for k in range(498)]
+        msgs_rel = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_rel_data",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_rel,
+                    "dataModel": {"items": [{"u": valid_data_url, "n": 0}]},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_rel_data", "path": "/items/0/n", "value": i}}
+            for i in range(1, 60)
+        ]
+        raw_rel = json.dumps(msgs_rel, separators=(",", ":"))
+        t0 = time.perf_counter()
+        res_rel_ok = validate_payload(raw_rel, version="1.0", strict=True)
+        dt_rel = time.perf_counter() - t0
+        self.assertTrue(res_rel_ok["ok"], res_rel_ok["errors"])
+        self.assertLess(dt_rel, 0.5)
+
+        # 4. Self-item absolute+relative overlap inside ChildList is still caught when sibling field mutates
+        self_overlap = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_self_ov",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/items"}},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "/${/items/0/n}${u}"}},
+                        },
+                    ],
+                    "dataModel": {"items": [{"n": "safe", "u": "/evil.example/x.png"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "s_self_ov", "path": "/items/0/n", "value": ""},
+            },
+        ]
+        res_self_ov = validate_payload(json.dumps(self_overlap), version="1.0", strict=True)
+        self.assertFalse(res_self_ov["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_self_ov["errors"]})
+
+        # 5. Valid 800 KB data: media URL with direct @path and 2,500 no-op descendant deletes passes fast
+        comps_dir = [{"id": "root", "component": "Column", "children": [f"i{k}" for k in range(499)]}] + [
+            {"id": f"i{k}", "component": "Image", "url": {"@path": "/img"}} for k in range(499)
+        ]
+        msgs_dir = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_dir,
+                    "dataModel": {"img": valid_data_url},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s", "path": "/img/a", "value": None}}
+            for _ in range(2500)
+        ]
+        raw_dir = json.dumps(msgs_dir, separators=(",", ":"))
+        t1 = time.perf_counter()
+        res_dir_ok = validate_payload(raw_dir, version="1.0", strict=True)
+        dt_dir = time.perf_counter() - t1
+        self.assertTrue(res_dir_ok["ok"], res_dir_ok["errors"])
+        self.assertLess(dt_dir, 0.5)
+
+        # 6. Unsafe 800 KB data: media URL with trailing NUL fails closed fast under KB budget
+        unsafe_data_url = valid_data_url + "\x00"
+        msgs_unsafe_rel = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_unsafe_rel",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_rel,
+                    "dataModel": {"items": [{"u": unsafe_data_url, "n": 0}]},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_unsafe_rel", "path": "/items/0/n", "value": i}}
+            for i in range(1, 60)
+        ]
+        t2 = time.perf_counter()
+        res_unsafe_rel = validate_payload(json.dumps(msgs_unsafe_rel, separators=(",", ":")), version="1.0", strict=True)
+        dt_unsafe_rel = time.perf_counter() - t2
+        self.assertFalse(res_unsafe_rel["ok"])
+        unsafe_codes = {e["code"] for e in res_unsafe_rel["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", unsafe_codes)
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", unsafe_codes)
+        self.assertLess(dt_unsafe_rel, 0.5)
+
+        # 7. Distinct unsafe data: URLs mutated directly across 499 Images fail closed fast under KB budget
+        msgs_unsafe_dir = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_unsafe_dir",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_dir,
+                    "dataModel": {"img": "data:image/png;base64," + ("A" * 60_000) + "\x00"},
+                },
+            }
+        ] + [
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "s_unsafe_dir",
+                    "path": "/img",
+                    "value": f"data:image/png;base64,{idx}" + ("B" * 60_000) + "\x00",
+                },
+            }
+            for idx in range(10)
+        ]
+        t3 = time.perf_counter()
+        res_unsafe_dir = validate_payload(json.dumps(msgs_unsafe_dir, separators=(",", ":")), version="1.0", strict=True)
+        dt_unsafe_dir = time.perf_counter() - t3
+        self.assertFalse(res_unsafe_dir["ok"])
+        dir_codes = {e["code"] for e in res_unsafe_dir["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", dir_codes)
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", dir_codes)
+        self.assertLess(dt_unsafe_dir, 0.5)
+
+        # 8. Static formatString media URL charges KB budget on cache miss
+        static_fmt_comps = [{"id": "root", "component": "Column", "children": [f"i{k}" for k in range(250)]}] + [
+            {
+                "id": f"i{k}",
+                "component": "Image",
+                "url": {
+                    "@call": "formatString",
+                    "args": {"value": f"data:image/svg+xml,{k}," + ("A" * 2_000)},
+                },
+            }
+            for k in range(250)
+        ]
+        static_fmt_payload = json.dumps(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_static_fmt",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": static_fmt_comps,
+                },
+            },
+            separators=(",", ":"),
+        )
+        t4 = time.perf_counter()
+        res_sfmt = validate_payload(static_fmt_payload, version="1.0", strict=True)
+        dt_sfmt = time.perf_counter() - t4
+        self.assertFalse(res_sfmt["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_sfmt["errors"]})
+        self.assertLess(dt_sfmt, 0.5)
 
 
 if __name__ == "__main__":
