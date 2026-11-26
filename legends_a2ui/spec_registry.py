@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 from typing import Any
 from urllib.parse import urlsplit
@@ -454,7 +454,13 @@ def verify_vendor_manifest(vendor_dir: Path | None = None) -> dict[str, Any]:
         if not isinstance(local_path, str) or not local_path or ".." in Path(local_path).parts:
             errors.append(f"Unsafe localPath in vendor manifest: {local_path!r}")
             continue
-        if Path(local_path).is_absolute() or bool(Path(local_path).drive):
+        win_path = PureWindowsPath(local_path)
+        if (
+            Path(local_path).is_absolute()
+            or bool(Path(local_path).drive)
+            or win_path.is_absolute()
+            or bool(win_path.drive)
+        ):
             errors.append(f"Absolute or drive-prefixed localPath refused in vendor manifest: {local_path!r}")
             continue
         target = vdir / local_path

@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -87,13 +87,18 @@ def check_knowledge_pack(pack_path: Path | None = None) -> dict[str, Any]:
     for item in files:
         rel = item.get("path", "")
         rel_path = Path(rel) if isinstance(rel, str) else None
+        win_rel_path = PureWindowsPath(rel) if isinstance(rel, str) else None
         if (
             not isinstance(rel, str)
             or not rel
             or rel_path is None
+            or win_rel_path is None
             or rel_path.is_absolute()
             or bool(rel_path.drive)
+            or win_rel_path.is_absolute()
+            or bool(win_rel_path.drive)
             or ".." in rel_path.parts
+            or ".." in win_rel_path.parts
         ):
             errors.append(f"Unsafe pack file path: {rel!r}")
             continue
