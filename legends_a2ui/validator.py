@@ -138,9 +138,11 @@ def _parse_rfc6901_array_index(seg: str) -> int | None:
     return int(seg)
 
 
-def _canonicalize_json_pointer(ptr: str) -> str:
+def _canonicalize_json_pointer(ptr: str, max_segments: int = DEFAULT_MAX_DEPTH + 4) -> str:
     """Canonicalize an RFC 6901 JSON Pointer (absolute or relative) so '~' and '~0' map identically."""
     if not isinstance(ptr, str) or ptr in {"", "/"} or "~" not in ptr:
+        return ptr
+    if len(ptr) > max_segments and ptr.count("/") > max_segments:
         return ptr
     if ptr.startswith("/"):
         return "/" + "/".join(
@@ -153,25 +155,32 @@ def _canonicalize_json_pointer(ptr: str) -> str:
     )
 
 
-def _child_index_under(parent_ptr: str, target_ptr: str) -> int | None:
+def _child_index_under(
+    parent_ptr: str, target_ptr: str, max_segments: int = DEFAULT_MAX_DEPTH + 4
+) -> int | None:
     """Extract the immediate child array index of target_ptr under parent_ptr, if valid."""
     if not isinstance(target_ptr, str) or not target_ptr.startswith("/"):
         return None
-    parent_ptr = _canonicalize_json_pointer(parent_ptr)
-    target_ptr = _canonicalize_json_pointer(target_ptr)
+    parent_ptr = _canonicalize_json_pointer(parent_ptr, max_segments=max_segments)
+    target_ptr = _canonicalize_json_pointer(target_ptr, max_segments=max_segments)
     if parent_ptr in {"", "/"}:
         rest = target_ptr[1:]
     else:
-        prefix = f"{parent_ptr}/"
-        if not target_ptr.startswith(prefix):
+        plen = len(parent_ptr)
+        if len(target_ptr) <= plen or not target_ptr.startswith(parent_ptr) or target_ptr[plen] != "/":
             return None
-        rest = target_ptr[len(prefix) :]
+        rest = target_ptr[plen + 1 :]
     if not rest:
         return None
     return _parse_rfc6901_array_index(rest.split("/", 1)[0])
 
 
-def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> tuple[str, int | None]:
+def _mutate_json_pointer(
+    root: dict[str, Any],
+    pointer: str,
+    value: Any,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
+) -> tuple[str, int | None]:
     """Apply an RFC 6901 JSON Pointer mutation across nested dicts and lists (None deletes).
 
     Returns (effective_pointer, popped_idx) where trailing '/-' appends resolve to their
@@ -180,7 +189,9 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> tupl
     """
     if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
         return (pointer if isinstance(pointer, str) else "/", None)
-    canon_pointer = _canonicalize_json_pointer(pointer)
+    if pointer.count("/") > max_segments:
+        return (pointer, None)
+    canon_pointer = _canonicalize_json_pointer(pointer, max_segments=max_segments)
     raw_parts = canon_pointer[1:].split("/")
     parts = [p.replace("~1", "/").replace("~0", "~") for p in raw_parts]
     if not parts:
@@ -261,44 +272,81 @@ def _convert_v08_contents(contents: list[Any]) -> dict[str, Any]:
     return out
 
 
-def _pointer_ancestors(pointer: str) -> list[str]:
-    """Return all non-root ancestor prefixes of an RFC 6901 pointer, including itself."""
+def _pointer_ancestors(pointer: str, max_segments: int = DEFAULT_MAX_DEPTH + 4) -> list[str]:
+    """Return up to max_segments non-root ancestor prefixes of an RFC 6901 pointer, including itself."""
     if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
         return []
-    pointer = _canonicalize_json_pointer(pointer)
-    parts = pointer[1:].split("/")
-    ancestors: list[str] = []
+    if pointer.count("/") <= max_segments:
+        pointer = _canonicalize_json_pointer(pointer, max_segments=max_segments)
+        ancestors: list[str] = []
+        pos = 1
+        n = len(pointer)
+        while pos <= n:
+            slash = pointer.find("/", pos)
+            if slash == -1:
+                if pointer != "/":
+                    ancestors.append(pointer)
+                break
+            prefix = pointer[:slash]
+            if prefix != "/":
+                ancestors.append(prefix)
+            pos = slash + 1
+        return ancestors
+    ancestors = []
+    pos = 1
     cur = ""
-    for seg in parts:
+    n = len(pointer)
+    for _ in range(max_segments):
+        if pos > n:
+            break
+        slash = pointer.find("/", pos)
+        seg = pointer[pos:] if slash == -1 else pointer[pos:slash]
+        if "~" in seg:
+            seg = seg.replace("~1", "/").replace("~0", "~").replace("~", "~0").replace("/", "~1")
         cur = f"{cur}/{seg}"
         if cur != "/":
             ancestors.append(cur)
+        if slash == -1:
+            break
+        pos = slash + 1
     return ancestors
 
 
-def _pointers_overlap(p1: str, p2: str) -> bool:
+def _pointers_overlap(p1: str, p2: str, max_segments: int = DEFAULT_MAX_DEPTH + 4) -> bool:
     """Return True when two RFC 6901 JSON Pointers are identical or ancestor/descendant."""
-    p1 = _canonicalize_json_pointer(p1)
-    p2 = _canonicalize_json_pointer(p2)
+    p1 = _canonicalize_json_pointer(p1, max_segments=max_segments)
+    p2 = _canonicalize_json_pointer(p2, max_segments=max_segments)
     if p1 in {"", "/"} or p2 in {"", "/"}:
         return True
-    return p1 == p2 or p1.startswith(p2 + "/") or p2.startswith(p1 + "/")
+    if p1 == p2:
+        return True
+    l1, l2 = len(p1), len(p2)
+    if l1 > l2:
+        return p1.startswith(p2) and p1[l2] == "/"
+    if l2 > l1:
+        return p2.startswith(p1) and p2[l1] == "/"
+    return False
 
 
 def _pointer_affected_by_update(
-    target_ptr: str, update_ptr: str, popped_idx: int | None
+    target_ptr: str,
+    update_ptr: str,
+    popped_idx: int | None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
 ) -> bool:
     """Return True when target_ptr overlaps update_ptr and is not an unshifted sibling before popped_idx."""
-    if not _pointers_overlap(target_ptr, update_ptr):
+    if not _pointers_overlap(target_ptr, update_ptr, max_segments=max_segments):
         return False
     if popped_idx is not None:
-        cidx = _child_index_under(update_ptr, target_ptr)
+        cidx = _child_index_under(update_ptr, target_ptr, max_segments=max_segments)
         if cidx is not None and cidx < popped_idx:
             return False
     return True
 
 
-def _extract_url_slot_pointers(val: Any) -> tuple[frozenset[str], frozenset[str]]:
+def _extract_url_slot_pointers(
+    val: Any, max_segments: int = DEFAULT_MAX_DEPTH + 4
+) -> tuple[frozenset[str], frozenset[str]]:
     """Extract (absolute_pointers, relative_pointers) referenced by a URL slot value."""
     if not isinstance(val, dict):
         return frozenset(), frozenset()
@@ -308,16 +356,18 @@ def _extract_url_slot_pointers(val: Any) -> tuple[frozenset[str], frozenset[str]
         fn_name = val.get("@call") if "@call" in val else val.get("call")
         args = val.get("args")
         if fn_name == "formatString" and isinstance(args, dict) and isinstance(args.get("value"), str):
-            for match in _FORMAT_EXPR_RE.finditer(args["value"]):
-                expr = _canonicalize_json_pointer(match.group(1))
-                if expr.startswith("/"):
-                    abs_ptrs.add(expr)
-                elif expr:
-                    rel_ptrs.add(expr)
+            status, _parts, exprs, _pfx_ne, _ph, _cost, _emp = _parse_format_string_template(args["value"])
+            if status == "ok":
+                for raw_expr in exprs:
+                    expr = _canonicalize_json_pointer(raw_expr, max_segments=max_segments)
+                    if expr.startswith("/"):
+                        abs_ptrs.add(expr)
+                    elif expr:
+                        rel_ptrs.add(expr)
     else:
         ptr = val.get("@path") if "@path" in val else val.get("path")
         if isinstance(ptr, str) and ptr:
-            canon = _canonicalize_json_pointer(ptr)
+            canon = _canonicalize_json_pointer(ptr, max_segments=max_segments)
             if canon.startswith("/"):
                 abs_ptrs.add(canon)
             else:
@@ -362,13 +412,29 @@ def _detect_message_version(msg: dict[str, Any]) -> str:
     return "1.0"
 
 
-def _resolve_json_pointer(data: Any, pointer: str) -> tuple[bool, Any]:
+def _resolve_json_pointer(
+    data: Any, pointer: str, max_segments: int = DEFAULT_MAX_DEPTH + 4
+) -> tuple[bool, Any]:
     """Resolve an RFC 6901 JSON Pointer inside a surface dataModel."""
     if not isinstance(pointer, str):
         return False, None
     if pointer in {"", "/"}:
         return True, data
     if not pointer.startswith("/"):
+        return False, None
+    if pointer.find("/", 1) == -1 and "~" not in pointer:
+        seg = pointer[1:]
+        if isinstance(data, dict):
+            if seg in data:
+                return True, data[seg]
+            return False, None
+        if isinstance(data, list):
+            idx = _parse_rfc6901_array_index(seg)
+            if idx is None or idx >= len(data):
+                return False, None
+            return True, data[idx]
+        return False, None
+    if len(pointer) > max_segments and pointer.count("/") > max_segments:
         return False, None
     cur = data
     for raw_seg in pointer[1:].split("/"):
@@ -386,13 +452,16 @@ def _resolve_json_pointer(data: Any, pointer: str) -> tuple[bool, Any]:
 
 
 def _resolve_pointer_with_context(
-    data_model: dict[str, Any], pointer: str, item_ctx: Any = None
+    data_model: dict[str, Any],
+    pointer: str,
+    item_ctx: Any = None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
 ) -> tuple[bool, Any]:
     """Resolve absolute pointers against data_model or relative pointers against item_ctx."""
     if not isinstance(pointer, str) or not pointer:
         return False, None
     if pointer.startswith("/"):
-        return _resolve_json_pointer(data_model, pointer)
+        return _resolve_json_pointer(data_model, pointer, max_segments)
     if item_ctx is None:
         return False, None
     if "/" not in pointer and "~" not in pointer:
@@ -405,6 +474,8 @@ def _resolve_pointer_with_context(
             if idx is None or idx >= len(item_ctx):
                 return False, None
             return True, item_ctx[idx]
+        return False, None
+    if len(pointer) >= max_segments and pointer.count("/") >= max_segments:
         return False, None
     cur = item_ctx
     for raw_seg in pointer.split("/"):
@@ -422,19 +493,24 @@ def _resolve_pointer_with_context(
 
 
 _FORMAT_EXPR_RE = re.compile(r"\$\{([^}]+)\}")
+_MAX_FORMAT_URL_PLACEHOLDERS = 64
+_MAX_FORMAT_URL_NON_DATA_LEN = 16_384
+_SAFE_URL_CACHE_MAX = 4096
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=4096)
 def _parse_format_string_template(
     tpl: str,
-) -> tuple[str, tuple[str, ...], tuple[str, ...], bool, str]:
+) -> tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str]:
     """Parse and validate a formatString URL template once into literal segments and pointer expressions."""
+    if len(tpl) > _MAX_FORMAT_URL_NON_DATA_LEN and not tpl[:16].lstrip().lower().startswith("data:"):
+        return ("err_too_long", (), (), False, "", 1, "")
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in tpl):
-        return ("err_ctrl", (), (), False, "")
+        return ("err_ctrl", (), (), False, "", 1, "")
     if "${" not in tpl:
-        return ("static", (tpl,), (), bool(tpl.strip()), tpl)
+        return ("static", (tpl,), (), bool(tpl.strip()), tpl, 1, tpl)
     if r"\${" in tpl:
-        return ("err_esc", (), (), False, "")
+        return ("err_esc", (), (), False, "", 1, "")
     parts: list[str] = []
     exprs: list[str] = []
     pos = 0
@@ -443,18 +519,22 @@ def _parse_format_string_template(
         if start == -1:
             parts.append(tpl[pos:])
             break
+        if len(exprs) >= _MAX_FORMAT_URL_PLACEHOLDERS:
+            return ("err_too_many_exprs", (), (), False, "", 1, "")
         end = tpl.find("}", start + 2)
         if end == -1:
-            return ("err_unclosed", (), (), False, "")
+            return ("err_unclosed", (), (), False, "", 1, "")
         inner = tpl[start + 2 : end]
         if not _SIMPLE_FORMAT_PTR_RE.fullmatch(inner):
-            return ("err_expr", (inner,), (), False, "")
+            return ("err_expr", (inner,), (), False, "", 1, "")
         parts.append(tpl[pos:start])
         exprs.append(inner)
         pos = end + 1
     parts_t = tuple(parts)
     exprs_t = tuple(exprs)
-    return ("ok", parts_t, exprs_t, bool(parts_t[0].strip()), "placeholder".join(parts_t))
+    eval_cost = max(1, len(exprs_t)) + (len(tpl) // 1024)
+    empty_single = f"{parts_t[0]}{parts_t[1]}" if len(exprs_t) == 1 else ""
+    return ("ok", parts_t, exprs_t, bool(parts_t[0].strip()), "placeholder".join(parts_t), eval_cost, empty_single)
 
 
 def _check_url_with_cache(
@@ -463,13 +543,15 @@ def _check_url_with_cache(
     safe_url_cache: set[str] | None,
     uncached_counter: list[int] | None,
 ) -> tuple[bool, str | None]:
-    """Validate candidate_url using validator_fn with optional bounded safe-URL memoization."""
+    """Validate candidate_url using validator_fn with optional bounded non-freezing safe-URL memoization."""
     if safe_url_cache is not None and candidate_url in safe_url_cache:
         return True, None
     if uncached_counter is not None:
         uncached_counter[0] += 1
     ok_u, reason_u = validator_fn(candidate_url)
-    if ok_u and safe_url_cache is not None and len(safe_url_cache) < 2048:
+    if ok_u and safe_url_cache is not None:
+        if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
+            safe_url_cache.clear()
         safe_url_cache.add(candidate_url)
     return ok_u, reason_u
 
@@ -489,6 +571,7 @@ def _validate_url_function_call(
     is_superseded: bool = False,
     safe_url_cache: set[str] | None = None,
     uncached_counter: list[int] | None = None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
 ) -> None:
     fn_name = fn_obj.get("@call") if "@call" in fn_obj else fn_obj.get("call")
     args = fn_obj.get("args") if isinstance(fn_obj.get("args"), dict) else {}
@@ -507,7 +590,25 @@ def _validate_url_function_call(
             )
             return
 
-        status, parts, exprs, prefix_nonempty, placeholder_str = _parse_format_string_template(tpl)
+        status, parts, exprs, prefix_nonempty, placeholder_str, _cost, _emp = _parse_format_string_template(tpl)
+        if status == "err_too_long":
+            _add_issue(
+                errors,
+                code,
+                block_index,
+                path,
+                f"formatString {kind} URL template exceeds maximum length ({_MAX_FORMAT_URL_NON_DATA_LEN} characters).",
+            )
+            return
+        if status == "err_too_many_exprs":
+            _add_issue(
+                errors,
+                code,
+                block_index,
+                path,
+                f"formatString {kind} URL template exceeds maximum placeholder count ({_MAX_FORMAT_URL_PLACEHOLDERS}).",
+            )
+            return
         if status == "err_ctrl":
             _add_issue(
                 errors,
@@ -553,7 +654,9 @@ def _validate_url_function_call(
 
         # Interpolate resolvable placeholders in a single pass and validate placeholder, resolved, and empty-unresolved forms.
         if len(exprs) == 1:
-            found, val = _resolve_pointer_with_context(data_model, exprs[0], item_ctx)
+            found, val = _resolve_pointer_with_context(
+                data_model, exprs[0], item_ctx, max_segments=max_segments
+            )
             if found:
                 all_resolved = True
                 any_resolved = True
@@ -571,7 +674,9 @@ def _validate_url_function_call(
             res_chunks: list[str] = [parts[0]]
             emp_chunks: list[str] = [parts[0]]
             for idx_e, expr in enumerate(exprs):
-                found, val = _resolve_pointer_with_context(data_model, expr, item_ctx)
+                found, val = _resolve_pointer_with_context(
+                    data_model, expr, item_ctx, max_segments=max_segments
+                )
                 if found:
                     any_resolved = True
                     s_val = "" if val is None else str(val)
@@ -715,6 +820,8 @@ def _validate_dynamic_value(
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
     template_validated_url_paths: frozenset[str] | None = None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
+    safe_open_urls: set[str] | None = None,
 ) -> None:
     """Validate DynamicValue, DataBinding (@path), FunctionCall (@call), arrays, and single-@ escape."""
     if isinstance(val, list):
@@ -737,6 +844,7 @@ def _validate_dynamic_value(
                 is_historical_snapshot=is_historical_snapshot,
                 is_superseded=is_superseded,
                 template_validated_url_paths=template_validated_url_paths,
+                max_segments=max_segments,
             )
         return
 
@@ -879,6 +987,8 @@ def _validate_dynamic_value(
                         and open_url_path in template_validated_url_paths
                     ),
                     is_superseded=is_superseded,
+                    safe_url_cache=safe_open_urls,
+                    max_segments=max_segments,
                 )
             for ak, av in args.items():
                 _validate_dynamic_value(
@@ -899,6 +1009,7 @@ def _validate_dynamic_value(
                     is_historical_snapshot=is_historical_snapshot,
                     is_superseded=is_superseded,
                     template_validated_url_paths=template_validated_url_paths,
+                    max_segments=max_segments,
                 )
 
     # v1.0 canonical FunctionCall
@@ -972,6 +1083,7 @@ def _validate_dynamic_value(
             item_ctx=item_ctx,
             is_historical_snapshot=is_historical_snapshot,
             is_superseded=is_superseded,
+            max_segments=max_segments,
         )
 
 
@@ -989,6 +1101,7 @@ def _validate_open_url_arg(
     is_superseded: bool = False,
     safe_url_cache: set[str] | None = None,
     uncached_counter: list[int] | None = None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = raw_url_val
@@ -1008,14 +1121,22 @@ def _validate_open_url_arg(
                 is_superseded=is_superseded,
                 safe_url_cache=safe_url_cache,
                 uncached_counter=uncached_counter,
+                max_segments=max_segments,
             )
             return
-        ptr = raw_url_val.get("@path") if "@path" in raw_url_val else raw_url_val.get("path")
-        if isinstance(ptr, str):
-            found, resolved = _resolve_pointer_with_context(data_model, ptr, item_ctx)
-            if found:
-                candidate = resolved
+        keys = set(raw_url_val.keys())
+        if keys in ({"@path"}, {"path"}):
+            ptr = raw_url_val.get("@path") if "@path" in raw_url_val else raw_url_val.get("path")
+            if isinstance(ptr, str) and ptr:
+                found, resolved = _resolve_pointer_with_context(
+                    data_model, ptr, item_ctx, max_segments=max_segments
+                )
+                if found:
+                    candidate = resolved
+                else:
+                    return
             else:
+                _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, "openUrl DataBinding path must be a non-empty string.")
                 return
         else:
             _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, "openUrl target must be a URL string, DataBinding, or safe formatString call.")
@@ -1026,7 +1147,9 @@ def _validate_open_url_arg(
         uncached_counter[0] += 1
     ok, reason = validate_open_url(candidate)
     if ok:
-        if safe_url_cache is not None and type(candidate) is str and len(safe_url_cache) < 2048:
+        if safe_url_cache is not None and type(candidate) is str:
+            if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
+                safe_url_cache.clear()
             safe_url_cache.add(candidate)
         return
     _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, reason or "Unsafe openUrl target.")
@@ -1039,6 +1162,7 @@ def _validate_media_prop(
     errors: list[dict[str, Any]],
     data_model: dict[str, Any],
     *,
+    version: str = "1.0",
     strict: bool = True,
     warnings: list[dict[str, Any]] | None = None,
     item_ctx: Any = None,
@@ -1046,12 +1170,53 @@ def _validate_media_prop(
     is_superseded: bool = False,
     safe_url_cache: set[str] | None = None,
     uncached_counter: list[int] | None = None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = val
     if isinstance(val, dict):
-        if "literalString" in val:
-            candidate = val["literalString"]
+        if version == "0.8":
+            keys = set(val.keys())
+            if not keys or not keys.issubset({"literalString", "path"}):
+                _add_issue(
+                    errors,
+                    "UNSAFE_MEDIA_URL",
+                    block_index,
+                    path,
+                    "v0.8 media URL object must contain only 'literalString' and/or 'path'.",
+                )
+                return
+            if "literalString" in val:
+                lit_val = val["literalString"]
+                lit_ok = False
+                if safe_url_cache is not None and type(lit_val) is str and lit_val in safe_url_cache:
+                    lit_ok = True
+                else:
+                    if uncached_counter is not None:
+                        uncached_counter[0] += 1
+                    ok_lit, reason_lit = validate_media_url(lit_val)
+                    if ok_lit:
+                        lit_ok = True
+                        if safe_url_cache is not None and type(lit_val) is str:
+                            if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
+                                safe_url_cache.clear()
+                            safe_url_cache.add(lit_val)
+                    else:
+                        _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason_lit or "Unsafe media URL.")
+                if not lit_ok:
+                    return
+                if "path" not in val:
+                    return
+            ptr = val.get("path")
+            if not isinstance(ptr, str) or not ptr:
+                _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, "v0.8 media URL 'path' must be a non-empty string.")
+                return
+            found, resolved = _resolve_pointer_with_context(
+                data_model, ptr, item_ctx, max_segments=max_segments
+            )
+            if not found:
+                return
+            candidate = resolved
         elif "@call" in val or "call" in val:
             _validate_url_function_call(
                 val,
@@ -1067,15 +1232,32 @@ def _validate_media_prop(
                 is_superseded=is_superseded,
                 safe_url_cache=safe_url_cache,
                 uncached_counter=uncached_counter,
+                max_segments=max_segments,
+            )
+            return
+        elif "literalString" in val:
+            _add_issue(
+                errors,
+                "UNSAFE_MEDIA_URL",
+                block_index,
+                path,
+                f"Legacy 'literalString' wrapper is not valid for media URLs in A2UI v{version}.",
             )
             return
         else:
-            ptr = val.get("@path") if "@path" in val else val.get("path")
-            if isinstance(ptr, str):
-                found, resolved = _resolve_pointer_with_context(data_model, ptr, item_ctx)
-                if found:
-                    candidate = resolved
+            keys = set(val.keys())
+            if keys in ({"@path"}, {"path"}):
+                ptr = val.get("@path") if "@path" in val else val.get("path")
+                if isinstance(ptr, str) and ptr:
+                    found, resolved = _resolve_pointer_with_context(
+                        data_model, ptr, item_ctx, max_segments=max_segments
+                    )
+                    if found:
+                        candidate = resolved
+                    else:
+                        return
                 else:
+                    _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, "Media URL DataBinding path must be a non-empty string.")
                     return
             else:
                 _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, "Media URL must be a string, DataBinding, or safe formatString call.")
@@ -1086,7 +1268,9 @@ def _validate_media_prop(
         uncached_counter[0] += 1
     ok, reason = validate_media_url(candidate)
     if ok:
-        if safe_url_cache is not None and type(candidate) is str and len(safe_url_cache) < 2048:
+        if safe_url_cache is not None and type(candidate) is str:
+            if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
+                safe_url_cache.clear()
             safe_url_cache.add(candidate)
         return
     _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason or "Unsafe media URL.")
@@ -1142,6 +1326,8 @@ def _validate_action(
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
     template_validated_url_paths: frozenset[str] | None = None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
+    safe_open_urls: set[str] | None = None,
 ) -> None:
     if not isinstance(action, dict):
         _add_issue(errors, "INVALID_ACTION", block_index, path, "Button action must be an object.")
@@ -1246,6 +1432,8 @@ def _validate_action(
             is_historical_snapshot=is_historical_snapshot,
             is_superseded=is_superseded,
             template_validated_url_paths=template_validated_url_paths,
+            max_segments=max_segments,
+            safe_open_urls=safe_open_urls,
         )
 
 
@@ -1353,6 +1541,9 @@ def _validate_surface_components(
     data_model: dict[str, Any],
     surface_catalog_id: str | None = None,
     template_validated_url_paths: frozenset[str] | None = None,
+    max_segments: int = DEFAULT_MAX_DEPTH + 4,
+    safe_media_urls: set[str] | None = None,
+    safe_open_urls: set[str] | None = None,
 ) -> int:
     catalog = load_catalog_spec(version)
     catalog_components = catalog["components"]
@@ -1952,6 +2143,8 @@ def _validate_surface_components(
                     is_historical_snapshot=comp_hist,
                     is_superseded=is_superseded,
                     template_validated_url_paths=template_validated_url_paths,
+                    max_segments=max_segments,
+                    safe_open_urls=safe_open_urls,
                 )
 
             if comp_type in _MEDIA_URL_PROPS:
@@ -1964,6 +2157,7 @@ def _validate_surface_components(
                             media_path,
                             errors,
                             comp_dm,
+                            version=version,
                             strict=strict,
                             warnings=warnings,
                             is_historical_snapshot=comp_hist
@@ -1972,6 +2166,8 @@ def _validate_surface_components(
                                 and media_path in template_validated_url_paths
                             ),
                             is_superseded=is_superseded,
+                            safe_url_cache=safe_media_urls,
+                            max_segments=max_segments,
                         )
             elif is_custom_catalog:
                 for media_prop in ("url", "posterUrl"):
@@ -1983,6 +2179,7 @@ def _validate_surface_components(
                             media_path,
                             errors,
                             comp_dm,
+                            version=version,
                             strict=strict,
                             warnings=warnings,
                             is_historical_snapshot=comp_hist
@@ -1991,6 +2188,8 @@ def _validate_surface_components(
                                 and media_path in template_validated_url_paths
                             ),
                             is_superseded=is_superseded,
+                            safe_url_cache=safe_media_urls,
+                            max_segments=max_segments,
                         )
 
     # Check root presence
@@ -2106,6 +2305,16 @@ def validate_payload(
     total_messages = 0
 
     req_ver = version.strip().lower().lstrip("v") if version != "auto" else "auto"
+    max_ptr_segments = max_depth + 4
+    max_surface_url_evals = max(100_000, max_bytes // 8)
+    max_surface_uncached_url_checks = max(30_000, max_bytes // 35)
+    payload_url_slot_evals = 0
+    payload_uncached_url_checks: list[int] = [0]
+    payload_tpl_rescan_evals: list[int] = [0]
+    payload_tpl_abs_eval_count: list[int] = [0]
+    payload_budget_exceeded = False
+    safe_media_urls: set[str] = set()
+    safe_open_urls: set[str] = set()
 
     for block in parsed["blocks"]:
         bidx = block["blockIndex"]
@@ -2144,13 +2353,6 @@ def validate_payload(
         surface_seen_errors: dict[str, set[tuple[str, int, str, str]]] = {}
         surface_seen_warnings: dict[str, set[tuple[str, int, str, str]]] = {}
         surface_total_comp_entries: dict[str, int] = {}
-        surface_tpl_abs_eval_count: dict[str, int] = {}
-        surface_tpl_rescan_evals: dict[str, int] = {}
-        max_surface_url_evals = max(100_000, max_bytes // 8)
-        max_surface_uncached_url_checks = max(30_000, max_bytes // 35)
-        surface_url_slot_evals: dict[str, int] = {}
-        surface_uncached_url_checks: dict[str, list[int]] = {}
-        surface_url_slot_cap_hit: set[str] = set()
         surface_tpl_summary_cache: dict[
             str,
             dict[
@@ -2173,11 +2375,6 @@ def validate_payload(
             surface_seen_errors.pop(sid_clear, None)
             surface_seen_warnings.pop(sid_clear, None)
             surface_total_comp_entries.pop(sid_clear, None)
-            surface_tpl_abs_eval_count.pop(sid_clear, None)
-            surface_tpl_rescan_evals.pop(sid_clear, None)
-            surface_url_slot_evals.pop(sid_clear, None)
-            surface_uncached_url_checks.pop(sid_clear, None)
-            surface_url_slot_cap_hit.discard(sid_clear)
             surface_tpl_summary_cache.pop(sid_clear, None)
 
         def _emit_surface_issues(
@@ -2192,9 +2389,6 @@ def validate_payload(
                 s_warn = surface_seen_warnings.setdefault(sid_emit, set())
                 _append_unique_issues(warnings, tmp_warnings, s_warn)
 
-        safe_media_urls: set[str] = set()
-        safe_open_urls: set[str] = set()
-
         def _validate_single_url_slot(
             sid_slot: str,
             slot: tuple[str, str, Any, frozenset[str], frozenset[str], str, str],
@@ -2206,59 +2400,86 @@ def validate_payload(
             item_idx: int | None = None,
             is_historical_snapshot: bool = True,
         ) -> bool:
-            cur_evals = surface_url_slot_evals.get(sid_slot, 0)
-            uncached_ctr = surface_uncached_url_checks.get(sid_slot)
-            if uncached_ctr is None:
-                uncached_ctr = [0]
-                surface_uncached_url_checks[sid_slot] = uncached_ctr
-            if cur_evals >= max_surface_url_evals or uncached_ctr[0] >= max_surface_uncached_url_checks:
-                if sid_slot not in surface_url_slot_cap_hit:
-                    surface_url_slot_cap_hit.add(sid_slot)
+            nonlocal payload_url_slot_evals, payload_budget_exceeded
+            if (
+                payload_budget_exceeded
+                or payload_url_slot_evals >= max_surface_url_evals
+                or payload_uncached_url_checks[0] >= max_surface_uncached_url_checks
+            ):
+                if not payload_budget_exceeded:
+                    payload_budget_exceeded = True
                     _add_issue(
                         tmp_errors,
                         "MAX_TEMPLATE_EVALS_EXCEEDED",
                         bidx,
                         f"surface:{sid_slot}",
-                        f"Surface URL slot evaluations exceeded limit ({max_surface_url_evals}).",
+                        f"Payload URL slot evaluations exceeded limit ({max_surface_url_evals}).",
                     )
                 return False
-            surface_url_slot_evals[sid_slot] = cur_evals + 1
 
             kind, slot_path, raw_val, _abs_p, _rel_p, comp_cpath, slot_suffix = slot
             cache = safe_media_urls if kind == "media" else safe_open_urls
-            if isinstance(raw_val, dict):
-                if "@call" in raw_val or "call" in raw_val:
-                    fn_name = raw_val.get("@call") if "@call" in raw_val else raw_val.get("call")
-                    if fn_name == "formatString":
-                        args_d = raw_val.get("args")
-                        if isinstance(args_d, dict):
-                            tpl_s = args_d.get("value")
-                            if isinstance(tpl_s, str):
-                                st, pts, exs, pfx_ne, ph_s = _parse_format_string_template(tpl_s)
-                                if st == "ok" and pfx_ne and len(exs) == 1 and ph_s in cache:
-                                    f_ex, v_ex = _resolve_pointer_with_context(dm, exs[0], item_ctx)
-                                    if f_ex:
-                                        r_str = f"{pts[0]}{'' if v_ex is None else v_ex}{pts[1]}"
-                                        if r_str in cache:
-                                            return True
-                elif "literalString" not in raw_val:
+            eval_cost = 1
+            parsed_fmt: tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str] | None = None
+            if isinstance(raw_val, dict) and ("@call" in raw_val or "call" in raw_val):
+                fn_name = raw_val.get("@call") if "@call" in raw_val else raw_val.get("call")
+                if fn_name == "formatString":
+                    args_d = raw_val.get("args")
+                    if isinstance(args_d, dict):
+                        tpl_s = args_d.get("value")
+                        if isinstance(tpl_s, str):
+                            parsed_fmt = _parse_format_string_template(tpl_s)
+                            eval_cost = parsed_fmt[5]
+
+            if payload_url_slot_evals + eval_cost > max_surface_url_evals:
+                if not payload_budget_exceeded:
+                    payload_budget_exceeded = True
+                    _add_issue(
+                        tmp_errors,
+                        "MAX_TEMPLATE_EVALS_EXCEEDED",
+                        bidx,
+                        f"surface:{sid_slot}",
+                        f"Payload URL slot evaluations exceeded limit ({max_surface_url_evals}).",
+                    )
+                return False
+            payload_url_slot_evals += eval_cost
+
+            if parsed_fmt is not None:
+                st, pts, exs, pfx_ne, ph_s, _cost, emp_s = parsed_fmt
+                if st == "ok" and pfx_ne and len(exs) == 1 and ph_s in cache:
+                    f_ex, v_ex = _resolve_pointer_with_context(dm, exs[0], item_ctx, max_ptr_segments)
+                    if f_ex:
+                        r_str = f"{pts[0]}{'' if v_ex is None else v_ex}{pts[1]}"
+                        if r_str in cache:
+                            return True
+                    elif emp_s in cache:
+                        return True
+            elif isinstance(raw_val, dict) and not ("@call" in raw_val or "call" in raw_val):
+                sver = surface_versions.get(sid_slot, "1.0")
+                is_simple_binding = len(raw_val) == 1 and (
+                    ("path" in raw_val)
+                    if (kind == "media" and sver == "0.8")
+                    else ("@path" in raw_val or "path" in raw_val)
+                )
+                if is_simple_binding:
                     ptr = raw_val.get("@path") if "@path" in raw_val else raw_val.get("path")
-                    if isinstance(ptr, str):
-                        found, resolved = _resolve_pointer_with_context(dm, ptr, item_ctx)
+                    if isinstance(ptr, str) and ptr:
+                        found, resolved = _resolve_pointer_with_context(dm, ptr, item_ctx, max_ptr_segments)
                         if not found:
                             return True
                         if type(resolved) is str:
                             if resolved in cache:
                                 return True
-                            uncached_ctr[0] += 1
+                            payload_uncached_url_checks[0] += 1
                             ok_u, _reason_u = (
                                 validate_media_url(resolved)
                                 if kind == "media"
                                 else validate_open_url(resolved)
                             )
                             if ok_u:
-                                if len(cache) < 2048:
-                                    cache.add(resolved)
+                                if len(cache) >= _SAFE_URL_CACHE_MAX:
+                                    cache.clear()
+                                cache.add(resolved)
                                 return True
             target_path = f"{comp_cpath}[item:{item_idx}]{slot_suffix}" if item_idx is not None else slot_path
             if kind == "media":
@@ -2268,12 +2489,14 @@ def validate_payload(
                     target_path,
                     tmp_errors,
                     dm,
+                    version=surface_versions.get(sid_slot, "1.0"),
                     strict=strict,
                     warnings=tmp_warnings,
                     item_ctx=item_ctx,
                     is_historical_snapshot=is_historical_snapshot,
                     safe_url_cache=cache,
-                    uncached_counter=uncached_ctr,
+                    uncached_counter=payload_uncached_url_checks,
+                    max_segments=max_ptr_segments,
                 )
             else:
                 _validate_open_url_arg(
@@ -2287,7 +2510,8 @@ def validate_payload(
                     item_ctx=item_ctx,
                     is_historical_snapshot=is_historical_snapshot,
                     safe_url_cache=cache,
-                    uncached_counter=uncached_ctr,
+                    uncached_counter=payload_uncached_url_checks,
+                    max_segments=max_ptr_segments,
                 )
             return True
 
@@ -2315,7 +2539,7 @@ def validate_payload(
                             exact_map.setdefault("/", []).append(slot)
                         else:
                             exact_map.setdefault(ap, []).append(slot)
-                            for anc in _pointer_ancestors(ap):
+                            for anc in _pointer_ancestors(ap, max_segments=max_ptr_segments):
                                 if anc not in seen_anc:
                                     seen_anc.add(anc)
                                     prefix_map.setdefault(anc, []).append(slot)
@@ -2505,7 +2729,9 @@ def validate_payload(
                 if only_prefixless and not _is_prefixless_format_string_url(slot[2]):
                     continue
                 if abs_overlap_ptr is not None and not any(
-                    _pointer_affected_by_update(ap, abs_overlap_ptr, abs_overlap_popped_idx)
+                    _pointer_affected_by_update(
+                        ap, abs_overlap_ptr, abs_overlap_popped_idx, max_segments=max_ptr_segments
+                    )
                     for ap in slot[3]
                 ):
                     continue
@@ -2537,75 +2763,73 @@ def validate_payload(
             if nested_rel_children:
                 local_budget = eval_budget
                 local_limit = eval_limit
-                owns_budget = False
                 if local_budget is None:
-                    local_budget = [surface_tpl_abs_eval_count.get(sid_tpl, 0)]
+                    local_budget = payload_tpl_abs_eval_count
                     local_limit = _MAX_TEMPLATE_ABS_RESCAN_EVALS
-                    owns_budget = True
-                try:
-                    for inner_tpl_id, inner_list_ptr in nested_rel_children:
-                        if inner_tpl_id in next_visited:
-                            continue
-                        has_inner_slots = tree_has_slots_cache.get(inner_tpl_id)
-                        if has_inner_slots is None:
-                            _inodes, irel, _inest = _collect_template_tree_summary(sid_tpl, inner_tpl_id)
-                            if target_slot_ids is not None:
-                                irel = [s for s in irel if id(s) in target_slot_ids]
-                            if only_prefixless:
-                                has_inner_slots = any(_is_prefixless_format_string_url(s[2]) for s in irel)
-                            elif abs_overlap_ptr is not None:
-                                has_inner_slots = any(
-                                    any(
-                                        _pointer_affected_by_update(ap, abs_overlap_ptr, abs_overlap_popped_idx)
-                                        for ap in s[3]
+                for inner_tpl_id, inner_list_ptr in nested_rel_children:
+                    if inner_tpl_id in next_visited:
+                        continue
+                    has_inner_slots = tree_has_slots_cache.get(inner_tpl_id)
+                    if has_inner_slots is None:
+                        _inodes, irel, _inest = _collect_template_tree_summary(sid_tpl, inner_tpl_id)
+                        if target_slot_ids is not None:
+                            irel = [s for s in irel if id(s) in target_slot_ids]
+                        if only_prefixless:
+                            has_inner_slots = any(_is_prefixless_format_string_url(s[2]) for s in irel)
+                        elif abs_overlap_ptr is not None:
+                            has_inner_slots = any(
+                                any(
+                                    _pointer_affected_by_update(
+                                        ap, abs_overlap_ptr, abs_overlap_popped_idx, max_segments=max_ptr_segments
                                     )
-                                    for s in irel
+                                    for ap in s[3]
                                 )
-                            else:
-                                has_inner_slots = bool(irel)
-                            tree_has_slots_cache[inner_tpl_id] = has_inner_slots
-                        if not has_inner_slots:
-                            continue
-                        found_inner, inner_items = _resolve_pointer_with_context(dm, inner_list_ptr, item_ctx)
-                        if not found_inner or not isinstance(inner_items, list):
-                            continue
-                        for inner_idx, inner_item in enumerate(inner_items):
-                            if local_budget[0] >= local_limit:
-                                _add_issue(
-                                    tmp_errors,
-                                    "MAX_TEMPLATE_EVALS_EXCEEDED",
-                                    bidx,
-                                    f"surface:{sid_tpl}",
-                                    f"Template URL re-evaluation exceeded limit ({local_limit}).",
-                                )
-                                return True
-                            before = local_budget[0]
-                            if _validate_template_item_urls(
-                                sid_tpl,
-                                inner_tpl_id,
-                                dm,
-                                inner_item,
-                                inner_idx,
+                                for s in irel
+                            )
+                        else:
+                            has_inner_slots = bool(irel)
+                        tree_has_slots_cache[inner_tpl_id] = has_inner_slots
+                    if not has_inner_slots:
+                        continue
+                    found_inner, inner_items = _resolve_pointer_with_context(
+                        dm, inner_list_ptr, item_ctx, max_segments=max_ptr_segments
+                    )
+                    if not found_inner or not isinstance(inner_items, list):
+                        continue
+                    for inner_idx, inner_item in enumerate(inner_items):
+                        if local_budget[0] >= local_limit:
+                            _add_issue(
                                 tmp_errors,
-                                tmp_warnings,
-                                is_historical_snapshot=is_historical_snapshot,
-                                only_prefixless=only_prefixless,
-                                abs_overlap_ptr=abs_overlap_ptr,
-                                abs_overlap_popped_idx=abs_overlap_popped_idx,
-                                target_slot_ids=target_slot_ids,
-                                evaluated_slot_ids=evaluated_slot_ids,
-                                visited_tpls=next_visited,
-                                eval_budget=local_budget,
-                                eval_limit=local_limit,
-                                scope_cache=scope_cache,
-                                tree_has_slots_cache=tree_has_slots_cache,
-                            ):
-                                return True
-                            if local_budget[0] == before:
-                                local_budget[0] += 1
-                finally:
-                    if owns_budget:
-                        surface_tpl_abs_eval_count[sid_tpl] = local_budget[0]
+                                "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                bidx,
+                                f"surface:{sid_tpl}",
+                                f"Template URL re-evaluation exceeded limit ({local_limit}).",
+                            )
+                            return True
+                        before = local_budget[0]
+                        if _validate_template_item_urls(
+                            sid_tpl,
+                            inner_tpl_id,
+                            dm,
+                            inner_item,
+                            inner_idx,
+                            tmp_errors,
+                            tmp_warnings,
+                            is_historical_snapshot=is_historical_snapshot,
+                            only_prefixless=only_prefixless,
+                            abs_overlap_ptr=abs_overlap_ptr,
+                            abs_overlap_popped_idx=abs_overlap_popped_idx,
+                            target_slot_ids=target_slot_ids,
+                            evaluated_slot_ids=evaluated_slot_ids,
+                            visited_tpls=next_visited,
+                            eval_budget=local_budget,
+                            eval_limit=local_limit,
+                            scope_cache=scope_cache,
+                            tree_has_slots_cache=tree_has_slots_cache,
+                        ):
+                            return True
+                        if local_budget[0] == before:
+                            local_budget[0] += 1
             return False
 
         def _ingest_component_batch(sid_ing: str, b_idx: int, comps: list[dict[str, Any]]) -> None:
@@ -2663,9 +2887,15 @@ def validate_payload(
                     if sver == "0.8" and isinstance(ch.get("template"), dict):
                         tpl = ch["template"]
                         if isinstance(tpl.get("componentId"), str) and isinstance(tpl.get("dataBinding"), str):
-                            tpl_binding = (tpl["componentId"], _canonicalize_json_pointer(tpl["dataBinding"]))
+                            tpl_binding = (
+                                tpl["componentId"],
+                                _canonicalize_json_pointer(tpl["dataBinding"], max_segments=max_ptr_segments),
+                            )
                     elif isinstance(ch.get("componentId"), str) and isinstance(ch.get("path"), str):
-                        tpl_binding = (ch["componentId"], _canonicalize_json_pointer(ch["path"]))
+                        tpl_binding = (
+                            ch["componentId"],
+                            _canonicalize_json_pointer(ch["path"], max_segments=max_ptr_segments),
+                        )
                 parsed_incoming.append((cid, c_type, c_props, cpath, new_adj, tpl_binding))
 
             # Snapshot lightweight pre-batch graph state only when replacing existing components
@@ -2701,12 +2931,12 @@ def validate_payload(
                 for media_prop in media_props:
                     if media_prop in c_props:
                         val_obj = c_props[media_prop]
-                        abs_p, rel_p = _extract_url_slot_pointers(val_obj)
+                        abs_p, rel_p = _extract_url_slot_pointers(val_obj, max_segments=max_ptr_segments)
                         comp_slots.append(
                             ("media", f"{cpath}.{media_prop}", val_obj, abs_p, rel_p, cpath, f".{media_prop}")
                         )
                 for url_path, url_val in _iter_open_url_slots(c_props, cpath):
-                    abs_p, rel_p = _extract_url_slot_pointers(url_val)
+                    abs_p, rel_p = _extract_url_slot_pointers(url_val, max_segments=max_ptr_segments)
                     suffix = url_path[len(cpath) :] if url_path.startswith(cpath) else url_path
                     comp_slots.append(("openUrl", url_path, url_val, abs_p, rel_p, cpath, suffix))
 
@@ -2726,7 +2956,7 @@ def validate_payload(
                 _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
 
-            if sid_ing in surface_url_slot_cap_hit:
+            if payload_budget_exceeded:
                 _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
 
@@ -2795,7 +3025,7 @@ def validate_payload(
                                 replaced_rel_slots.extend(old_pfx_rel_by_cid.get(rcid, ()))
 
                             evaluated_slot_ids: set[int] = set()
-                            pre_rescan_budget = [surface_tpl_rescan_evals.get(sid_ing, 0)]
+                            pre_rescan_budget = payload_tpl_rescan_evals
                             pre_cap_hit = False
 
                             def _validate_chain_items(
@@ -2807,10 +3037,12 @@ def validate_payload(
                                 ],
                             ) -> bool:
                                 if depth == 0:
-                                    found_l, items_l = _resolve_json_pointer(dm, chain_ptrs[0])
+                                    found_l, items_l = _resolve_json_pointer(
+                                        dm, chain_ptrs[0], max_segments=max_ptr_segments
+                                    )
                                 else:
                                     found_l, items_l = _resolve_pointer_with_context(
-                                        dm, chain_ptrs[depth], cur_ctx
+                                        dm, chain_ptrs[depth], cur_ctx, max_segments=max_ptr_segments
                                     )
                                 if not found_l or not isinstance(items_l, list) or not items_l:
                                     return False
@@ -2861,7 +3093,6 @@ def validate_payload(
                                 if _validate_chain_items(chain_ptrs, 0, None, chain_slots):
                                     pre_cap_hit = True
                                     break
-                            surface_tpl_rescan_evals[sid_ing] = pre_rescan_budget[0]
                             if not pre_cap_hit:
                                 for out_slot in replaced_rel_slots:
                                     if id(out_slot) not in evaluated_slot_ids:
@@ -2875,7 +3106,7 @@ def validate_payload(
                                         ):
                                             break
 
-            if sid_ing in surface_url_slot_cap_hit:
+            if payload_budget_exceeded:
                 _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
 
@@ -2891,12 +3122,12 @@ def validate_payload(
                 if direct_eager_cap:
                     break
 
-            if direct_eager_cap or sid_ing in surface_url_slot_cap_hit:
+            if direct_eager_cap or payload_budget_exceeded:
                 _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
 
             # Eagerly validate any affected absolute ChildList template (including nested relative ChildLists)
-            rescan_budget = [surface_tpl_rescan_evals.get(sid_ing, 0)] if b_idx > 0 else None
+            rescan_budget = payload_tpl_rescan_evals if b_idx > 0 else None
             seen_tpl_pairs_ing: set[tuple[str, str]] = set()
             ing_tpl_cap = False
             for owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
@@ -2911,7 +3142,7 @@ def validate_payload(
                 if tpl_pair in seen_tpl_pairs_ing:
                     continue
                 seen_tpl_pairs_ing.add(tpl_pair)
-                found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                found_list, items_val = _resolve_json_pointer(dm, list_ptr, max_segments=max_ptr_segments)
                 if not found_list or not isinstance(items_val, list):
                     continue
                 if not has_nested_rel:
@@ -3010,13 +3241,11 @@ def validate_payload(
                                 scope_cache=sc_ing,
                                 tree_has_slots_cache=tc_ing,
                             ):
-                                if sid_ing in surface_url_slot_cap_hit:
+                                if payload_budget_exceeded:
                                     ing_tpl_cap = True
                                 break
-                if ing_tpl_cap or sid_ing in surface_url_slot_cap_hit:
+                if ing_tpl_cap or payload_budget_exceeded:
                     break
-            if rescan_budget is not None:
-                surface_tpl_rescan_evals[sid_ing] = rescan_budget[0]
 
             _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
 
@@ -3024,10 +3253,10 @@ def validate_payload(
             sid_upd: str, ptr: str, *, popped_idx: int | None = None
         ) -> None:
             comp_map = surface_active_comp_map.get(sid_upd)
-            if not comp_map or sid_upd in surface_url_slot_cap_hit:
+            if not comp_map or payload_budget_exceeded:
                 return
             if isinstance(ptr, str):
-                ptr = _canonicalize_json_pointer(ptr)
+                ptr = _canonicalize_json_pointer(ptr, max_segments=max_ptr_segments)
             dm = surface_data_models.get(sid_upd, {})
             tmp_errors: list[dict[str, Any]] = []
             tmp_warnings: list[dict[str, Any]] = []
@@ -3043,7 +3272,10 @@ def validate_payload(
                             slot
                             for slot in all_dyn
                             if any(
-                                _pointer_affected_by_update(ap, ptr, popped_idx) for ap in slot[3]
+                                _pointer_affected_by_update(
+                                    ap, ptr, popped_idx, max_segments=max_ptr_segments
+                                )
+                                for ap in slot[3]
                             )
                         ]
                 else:
@@ -3051,13 +3283,16 @@ def validate_payload(
                     seen_slot_ids: set[int] = set()
                     prefix_bucket = prefix_map.get(ptr, ())
                     if popped_idx is not None and prefix_bucket:
+                        plen = len(ptr)
                         prefix_bucket = [
                             slot
                             for slot in prefix_bucket
                             if any(
-                                _pointer_affected_by_update(ap, ptr, popped_idx)
+                                _pointer_affected_by_update(
+                                    ap, ptr, popped_idx, max_segments=max_ptr_segments
+                                )
                                 for ap in slot[3]
-                                if ap.startswith(ptr + "/")
+                                if len(ap) > plen and ap.startswith(ptr) and ap[plen] == "/"
                             )
                         ]
                     for bucket in (exact_map.get("/", ()), exact_map.get(ptr, ()), prefix_bucket):
@@ -3066,7 +3301,7 @@ def validate_payload(
                             if sid_obj not in seen_slot_ids:
                                 seen_slot_ids.add(sid_obj)
                                 affected_slots.append(slot)
-                    for anc in _pointer_ancestors(ptr):
+                    for anc in _pointer_ancestors(ptr, max_segments=max_ptr_segments):
                         if anc == ptr:
                             continue
                         for slot in exact_map.get(anc, ()):
@@ -3080,7 +3315,7 @@ def validate_payload(
                     ):
                         break
 
-            if sid_upd in surface_url_slot_cap_hit:
+            if payload_budget_exceeded:
                 _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
                 return
 
@@ -3112,7 +3347,9 @@ def validate_payload(
                     surf_cap_hit = False
 
                     if is_single_item_target:
-                        found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                        found_list, items_val = _resolve_json_pointer(
+                            dm, list_ptr, max_segments=max_ptr_segments
+                        )
                         list_resolved = True
                         if found_list and isinstance(items_val, list):
                             rest = ptr[len(list_prefix) :]
@@ -3154,17 +3391,20 @@ def validate_payload(
                                         tmp_warnings,
                                         is_historical_snapshot=True,
                                     ):
-                                        if sid_upd in surface_url_slot_cap_hit:
+                                        if payload_budget_exceeded:
                                             surf_cap_hit = True
                     else:
                         is_shifted_descendant = (
                             isinstance(ptr, str)
                             and ptr not in {"", "/"}
-                            and list_ptr.startswith(ptr + "/")
+                            and len(list_ptr) > len(ptr)
+                            and list_ptr.startswith(ptr)
+                            and list_ptr[len(ptr)] == "/"
                             and (
                                 popped_idx is None
                                 or (
-                                    (child_idx := _child_index_under(ptr, list_ptr)) is None
+                                    (child_idx := _child_index_under(ptr, list_ptr, max_segments=max_ptr_segments))
+                                    is None
                                     or child_idx >= popped_idx
                                 )
                             )
@@ -3175,11 +3415,13 @@ def validate_payload(
                             or is_shifted_descendant
                         )
                         if is_full_list_target:
-                            found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                            found_list, items_val = _resolve_json_pointer(
+                                dm, list_ptr, max_segments=max_ptr_segments
+                            )
                             list_resolved = True
                             if found_list and isinstance(items_val, list):
                                 if popped_idx is not None:
-                                    rescan_budget = [surface_tpl_rescan_evals.get(sid_upd, 0)]
+                                    rescan_budget = payload_tpl_rescan_evals
                                     if not has_nested_rel:
                                         cap_hit = False
                                         for item_idx, item in enumerate(items_val):
@@ -3238,12 +3480,11 @@ def validate_payload(
                                                 scope_cache=sc_pop,
                                                 tree_has_slots_cache=tc_pop,
                                             ):
-                                                if sid_upd in surface_url_slot_cap_hit:
+                                                if payload_budget_exceeded:
                                                     surf_cap_hit = True
                                                 break
                                             if rescan_budget[0] == before:
                                                 rescan_budget[0] += 1
-                                    surface_tpl_rescan_evals[sid_upd] = rescan_budget[0]
                                 elif not has_nested_rel:
                                     for item_idx, item in enumerate(items_val):
                                         for slot in rel_slots:
@@ -3277,11 +3518,11 @@ def validate_payload(
                                             scope_cache=sc_full,
                                             tree_has_slots_cache=tc_full,
                                         ):
-                                            if sid_upd in surface_url_slot_cap_hit:
+                                            if payload_budget_exceeded:
                                                 surf_cap_hit = True
                                             break
 
-                    if surf_cap_hit or sid_upd in surface_url_slot_cap_hit:
+                    if surf_cap_hit or payload_budget_exceeded:
                         break
 
                     # Check cross-item absolute pointer overlaps independently of is_single_item_target
@@ -3290,12 +3531,17 @@ def validate_payload(
                             slot
                             for slot in rel_slots
                             if any(
-                                _pointer_affected_by_update(ap, ptr, popped_idx) for ap in slot[3]
+                                _pointer_affected_by_update(
+                                    ap, ptr, popped_idx, max_segments=max_ptr_segments
+                                )
+                                for ap in slot[3]
                             )
                         ]
                         if abs_overlap_slots:
                             if not list_resolved:
-                                found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                                found_list, items_val = _resolve_json_pointer(
+                                    dm, list_ptr, max_segments=max_ptr_segments
+                                )
                             if not found_list or not isinstance(items_val, list):
                                 continue
                             # Always run O(1) absolute check with item_ctx=None first
@@ -3311,9 +3557,9 @@ def validate_payload(
                                 ):
                                     surf_cap_hit = True
                                     break
-                            if surf_cap_hit or sid_upd in surface_url_slot_cap_hit:
+                            if surf_cap_hit or payload_budget_exceeded:
                                 break
-                            budget = [surface_tpl_abs_eval_count.get(sid_upd, 0)]
+                            budget = payload_tpl_abs_eval_count
                             if not has_nested_rel:
                                 cap_hit = False
                                 for item_idx, item in enumerate(items_val):
@@ -3378,13 +3624,12 @@ def validate_payload(
                                         scope_cache=sc_abs,
                                         tree_has_slots_cache=tc_abs,
                                     ):
-                                        if sid_upd in surface_url_slot_cap_hit:
+                                        if payload_budget_exceeded:
                                             surf_cap_hit = True
                                         break
                                     if budget[0] == before:
                                         budget[0] += 1
-                            surface_tpl_abs_eval_count[sid_upd] = budget[0]
-                            if surf_cap_hit or sid_upd in surface_url_slot_cap_hit:
+                            if surf_cap_hit or payload_budget_exceeded:
                                 break
 
             _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
@@ -3403,7 +3648,7 @@ def validate_payload(
             final_tpl_errors: list[dict[str, Any]] = []
             final_tpl_warnings: list[dict[str, Any]] = []
             flushed_tpl_slot_ids: set[int] = set()
-            if sid_to_flush not in surface_url_slot_cap_hit:
+            if not payload_budget_exceeded:
                 seen_tpl_pairs_fl: set[tuple[str, str]] = set()
                 fl_cap_hit = False
                 for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
@@ -3417,7 +3662,9 @@ def validate_payload(
                     prefixless_slots = [s for s in rel_slots if _is_prefixless_format_string_url(s[2])]
                     if not prefixless_slots:
                         continue
-                    found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                    found_list, items_val = _resolve_json_pointer(
+                        dm, list_ptr, max_segments=max_ptr_segments
+                    )
                     if not found_list or not isinstance(items_val, list):
                         continue
                     if not has_nested_rel:
@@ -3456,10 +3703,10 @@ def validate_payload(
                                 scope_cache=sc_fl,
                                 tree_has_slots_cache=tc_fl,
                             ):
-                                if sid_to_flush in surface_url_slot_cap_hit:
+                                if payload_budget_exceeded:
                                     fl_cap_hit = True
                                 break
-                    if fl_cap_hit or sid_to_flush in surface_url_slot_cap_hit:
+                    if fl_cap_hit or payload_budget_exceeded:
                         break
             _emit_surface_issues(sid_to_flush, final_tpl_errors, final_tpl_warnings)
 
@@ -3504,6 +3751,9 @@ def validate_payload(
                 data_model=dm,
                 surface_catalog_id=scat,
                 template_validated_url_paths=template_only_validated_paths,
+                max_segments=max_ptr_segments,
+                safe_media_urls=safe_media_urls,
+                safe_open_urls=safe_open_urls,
             )
             _emit_surface_issues(sid_to_flush, flush_errors, flush_warnings)
             _clear_surface_stream_state(sid_to_flush)
@@ -3765,7 +4015,9 @@ def validate_payload(
                         mutated = True
                 elif isinstance(ptr, str) and ptr.startswith("/") and "value" in body:
                     dm = surface_data_models.setdefault(sid, {})
-                    effective_ptr, popped_idx = _mutate_json_pointer(dm, ptr, body["value"])
+                    effective_ptr, popped_idx = _mutate_json_pointer(
+                        dm, ptr, body["value"], max_segments=max_ptr_segments
+                    )
                     mutated = True
                 if mutated and isinstance(effective_ptr, str):
                     _validate_streaming_data_update(sid, effective_ptr, popped_idx=popped_idx)
@@ -3865,6 +4117,7 @@ def validate_payload(
                         catalog_id=cat_spec["catalogId"],
                         effective_catalog_id=fn_surf_cat,
                         allow_user_activation=False,
+                        max_segments=max_ptr_segments,
                     )
 
             elif env_key in {"agentFunctionResponse", "rendererFunctionResponse"}:
@@ -3954,7 +4207,9 @@ def validate_payload(
                             v08_merged_keys = list(conv_val.keys())
                         elif isinstance(ptr, str) and ptr.startswith("/"):
                             dm = surface_data_models.setdefault(sid, {})
-                            effective_ptr, popped_idx = _mutate_json_pointer(dm, ptr, conv_val)
+                            effective_ptr, popped_idx = _mutate_json_pointer(
+                                dm, ptr, conv_val, max_segments=max_ptr_segments
+                            )
                             mutated = True
                     elif "value" in body:
                         if ptr in {"", "/"}:
@@ -3966,11 +4221,13 @@ def validate_payload(
                                 mutated = True
                         elif isinstance(ptr, str) and ptr.startswith("/"):
                             dm = surface_data_models.setdefault(sid, {})
-                            effective_ptr, popped_idx = _mutate_json_pointer(dm, ptr, body["value"])
+                            effective_ptr, popped_idx = _mutate_json_pointer(
+                                dm, ptr, body["value"], max_segments=max_ptr_segments
+                            )
                             mutated = True
                     if v08_merged_keys is not None:
                         for merged_k in v08_merged_keys:
-                            if sid in surface_url_slot_cap_hit:
+                            if payload_budget_exceeded:
                                 break
                             key_ptr = "/" + merged_k.replace("~", "~0").replace("/", "~1")
                             _validate_streaming_data_update(sid, key_ptr, popped_idx=None)

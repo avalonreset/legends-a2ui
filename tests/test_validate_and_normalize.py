@@ -2932,6 +2932,391 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertFalse(res_lost["ok"])
         self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_lost["errors"]})
 
+    def test_payload_wide_url_budget_formatstring_complexity_and_pointer_depth_bounds(self) -> None:
+        """Payload-wide URL budgets, formatString complexity/cost caps, and bounded pointer depth prevent DoS."""
+        # 1a. Multi-surface warmup + fan-out shares one payload-wide budget and non-freezing cache
+        surf_comps = (
+            [
+                {"id": "root", "component": "List", "children": {"componentId": "tpl", "path": "/items"}},
+                {"id": "tpl", "component": "Column", "children": [f"v{k}" for k in range(12)]},
+            ]
+            + [
+                {
+                    "id": f"v{k}",
+                    "component": "Video",
+                    "url": {"@call": "formatString", "args": {"value": "https://z.co/${u}"}},
+                    "posterUrl": {"@call": "formatString", "args": {"value": "https://z.co/${u}"}},
+                }
+                for k in range(12)
+            ]
+        )
+        warmup_msg = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "warm",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "List", "children": {"componentId": "img", "path": "/items"}},
+                    {"id": "img", "component": "Image", "url": {"@path": "u"}},
+                ],
+                "dataModel": {"items": [{"u": f"https://w.co/{k}"} for k in range(2050)]},
+            },
+        }
+        multi_surf = [warmup_msg] + [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": f"s{i}",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": surf_comps,
+                    "dataModel": {"items": [0] * 624},
+                },
+            }
+            for i in range(30)
+        ]
+        raw_multi = json.dumps(multi_surf, separators=(",", ":"))
+        t0 = time.perf_counter()
+        res_multi = validate_payload(raw_multi, version="1.0", strict=True)
+        dt_multi = time.perf_counter() - t0
+        self.assertFalse(res_multi["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_multi["errors"]})
+        self.assertLess(dt_multi, 0.45)
+
+        # 1b. Repeated createSurface + deleteSurface cycles on the same surfaceId never reset the budget
+        cycle_msgs: list[dict] = [warmup_msg]
+        for _ in range(30):
+            cycle_msgs.append(
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": surf_comps,
+                        "dataModel": {"items": [0] * 624},
+                    },
+                }
+            )
+            cycle_msgs.append({"version": "1.0", "deleteSurface": {"surfaceId": "s"}})
+        raw_cycle = json.dumps(cycle_msgs, separators=(",", ":"))
+        t1 = time.perf_counter()
+        res_cycle = validate_payload(raw_cycle, version="1.0", strict=True)
+        dt_cycle = time.perf_counter() - t1
+        self.assertFalse(res_cycle["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_cycle["errors"]})
+        self.assertLess(dt_cycle, 0.45)
+
+        # 1c. Multiple Markdown fences share the same payload-wide budget
+        md_blocks = [f"```a2ui\n{json.dumps(warmup_msg, separators=(',', ':'))}\n```"] + [
+            "```a2ui\n"
+            + json.dumps(
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": f"mb{i}",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": surf_comps,
+                        "dataModel": {"items": [0] * 624},
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n```"
+            for i in range(15)
+        ]
+        res_md = validate_payload("\n".join(md_blocks), extract_markdown=True, version="1.0", strict=True)
+        self.assertFalse(res_md["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_md["errors"]})
+
+        # 2a. Multi-placeholder formatString exceeding 64 placeholders fails closed immediately
+        many_ph = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fmt_many",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "img", "path": "/items"}},
+                        {
+                            "id": "img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "https://z.co/" + "${u}" * 4000}},
+                        },
+                    ],
+                    "dataModel": {"items": [0] * 3000},
+                },
+            }
+        ]
+        t2 = time.perf_counter()
+        res_many = validate_payload(json.dumps(many_ph, separators=(",", ":")), version="1.0", strict=True)
+        dt_many = time.perf_counter() - t2
+        self.assertFalse(res_many["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_many["errors"]})
+        self.assertLess(dt_many, 0.25)
+
+        # 2b. Non-data formatString exceeding 16384 chars fails closed immediately
+        long_fmt = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "fmt_long",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": "https://z.co/" + ("a" * 16_500) + "${/u}"}},
+                    }
+                ],
+                "dataModel": {"u": "ok"},
+            },
+        }
+        res_long = validate_payload(json.dumps(long_fmt), version="1.0", strict=True)
+        self.assertFalse(res_long["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_long["errors"]})
+
+        # 2c. 64-placeholder formatString charges proportional cost per item and trips payload budget fast
+        boundary_ph = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fmt_64",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "img", "path": "/items"}},
+                        {
+                            "id": "img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "https://z.co/" + "${u}" * 64}},
+                        },
+                    ],
+                    "dataModel": {"items": [0] * 5000},
+                },
+            }
+        ]
+        t3 = time.perf_counter()
+        res_b64 = validate_payload(json.dumps(boundary_ph, separators=(",", ":")), version="1.0", strict=True)
+        dt_b64 = time.perf_counter() - t3
+        self.assertFalse(res_b64["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_b64["errors"]})
+        self.assertLess(dt_b64, 0.25)
+
+        # 3. Deep JSON Pointer (25k and 500k segments) stays bounded in time and memory
+        deep_ptr = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "deep_ptr",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Image", "url": {"@path": "/x"}}],
+                    "dataModel": {"x": "https://example.com/ok.png"},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "deep_ptr", "path": "/a" * 25_000, "value": None},
+            },
+        ]
+        t4 = time.perf_counter()
+        res_deep = validate_payload(json.dumps(deep_ptr, separators=(",", ":")), version="1.0", strict=True)
+        dt_deep = time.perf_counter() - t4
+        self.assertTrue(res_deep["ok"], res_deep["errors"])
+        self.assertLess(dt_deep, 0.25)
+
+    def test_v08_vs_v10_literalstring_media_url_validation_and_normalization(self) -> None:
+        """v0.8 literalString+path validates both seed and bound path; v1.0 rejects legacy literalString wrappers."""
+        # 1. v0.8 Image.url with safe literalString and unsafe bound /evil fails closed in non-strict and strict modes
+        v08_evil_path = json.dumps(
+            [
+                {"beginRendering": {"surfaceId": "s8_evil", "root": "root"}},
+                {
+                    "surfaceUpdate": {
+                        "surfaceId": "s8_evil",
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": {
+                                    "Image": {
+                                        "url": {
+                                            "literalString": "https://example.com/placeholder.png",
+                                            "path": "/evil",
+                                        }
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                },
+                {
+                    "dataModelUpdate": {
+                        "surfaceId": "s8_evil",
+                        "path": "/",
+                        "contents": [{"key": "evil", "valueString": "javascript:alert(1)"}],
+                    }
+                },
+            ]
+        )
+        for strict_mode in (False, True):
+            res_v8 = validate_payload(v08_evil_path, version="0.8", strict=strict_mode)
+            self.assertFalse(res_v8["ok"])
+            self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_v8["errors"]})
+
+        # 2. v0.8 template child with literalString + relative path catches unsafe item URL via streaming update
+        v08_tpl_evil = json.dumps(
+            [
+                {"beginRendering": {"surfaceId": "s8_tpl", "root": "root"}},
+                {
+                    "surfaceUpdate": {
+                        "surfaceId": "s8_tpl",
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": {
+                                    "List": {"children": {"template": {"componentId": "row", "dataBinding": "/items"}}}
+                                },
+                            },
+                            {
+                                "id": "row",
+                                "component": {
+                                    "Image": {
+                                        "url": {
+                                            "literalString": "https://example.com/placeholder.png",
+                                            "path": "u",
+                                        }
+                                    }
+                                },
+                            },
+                        ],
+                    }
+                },
+                {
+                    "dataModelUpdate": {
+                        "surfaceId": "s8_tpl",
+                        "path": "/",
+                        "contents": [
+                            {
+                                "key": "items",
+                                "valueArray": [{"valueMap": [{"key": "u", "valueString": "javascript:alert(1)"}]}],
+                            }
+                        ],
+                    }
+                },
+            ]
+        )
+        res_v8_tpl = validate_payload(v08_tpl_evil, version="0.8", strict=False)
+        self.assertFalse(res_v8_tpl["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_v8_tpl["errors"]})
+
+        # 3. v0.8 valid literalString + safe bound path passes validate and normalize
+        v08_both_safe = json.dumps(
+            [
+                {"beginRendering": {"surfaceId": "s8_ok", "root": "root"}},
+                {
+                    "surfaceUpdate": {
+                        "surfaceId": "s8_ok",
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": {
+                                    "Image": {
+                                        "url": {
+                                            "literalString": "https://example.com/placeholder.png",
+                                            "path": "/live",
+                                        }
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                },
+                {
+                    "dataModelUpdate": {
+                        "surfaceId": "s8_ok",
+                        "path": "/",
+                        "contents": [{"key": "live", "valueString": "https://example.com/live.png"}],
+                    }
+                },
+            ]
+        )
+        self.assertTrue(validate_payload(v08_both_safe, version="0.8", strict=False)["ok"])
+        self.assertTrue(normalize_payload(v08_both_safe)["ok"])
+
+        # 4. v0.8 empty dict or unknown keys on media URL fail closed
+        for bad_url in ({}, {"literalString": "https://example.com/ok.png", "extra": 1}, {"literalString": "https://example.com/ok.png", "path": ""}):
+            v08_bad_shape = json.dumps(
+                [
+                    {"beginRendering": {"surfaceId": "s8_bad", "root": "root"}},
+                    {
+                        "surfaceUpdate": {
+                            "surfaceId": "s8_bad",
+                            "components": [{"id": "root", "component": {"Image": {"url": bad_url}}}],
+                        }
+                    },
+                ]
+            )
+            res_bs = validate_payload(v08_bad_shape, version="0.8", strict=False)
+            self.assertFalse(res_bs["ok"])
+            self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_bs["errors"]})
+
+        # 5. v1.0 refuses legacy literalString wrapper (with or without path) in strict and non-strict modes
+        for legacy_url in (
+            {"literalString": "https://example.com/ok.png", "path": "/evil"},
+            {"literalString": "https://example.com/ok.png"},
+        ):
+            v10_legacy = json.dumps(
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s10_leg",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [{"id": "root", "component": "Image", "url": legacy_url}],
+                        "dataModel": {"evil": "javascript:alert(1)"},
+                    },
+                }
+            )
+            res_v10 = validate_payload(v10_legacy, version="1.0", strict=True)
+            self.assertFalse(res_v10["ok"])
+            self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_v10["errors"]})
+
+        # 6. normalize_payload and render_preview_html fail closed on unsafe v0.8 literalString seed even with safe path
+        from legends_a2ui.preview_html import render_preview_html
+
+        v08_unsafe_seed = json.dumps(
+            [
+                {"beginRendering": {"surfaceId": "s8_seed", "root": "root"}},
+                {
+                    "surfaceUpdate": {
+                        "surfaceId": "s8_seed",
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": {
+                                    "Image": {
+                                        "url": {
+                                            "literalString": "javascript:alert(1)",
+                                            "path": "/safe",
+                                        }
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                },
+                {
+                    "dataModelUpdate": {
+                        "surfaceId": "s8_seed",
+                        "path": "/",
+                        "contents": [{"key": "safe", "valueString": "https://example.com/ok.png"}],
+                    }
+                },
+            ]
+        )
+        res_norm = normalize_payload(v08_unsafe_seed)
+        self.assertFalse(res_norm["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_norm["validation"]["errors"]})
+
+        res_prev = render_preview_html(v08_unsafe_seed)
+        self.assertFalse(res_prev["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_prev["validation"]["errors"]})
+
 
 if __name__ == "__main__":
     unittest.main()

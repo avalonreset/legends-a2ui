@@ -14,6 +14,8 @@ from legends_a2ui.spec_registry import (
     is_valid_uax31_id,
     sanitize_uax31_id,
     scan_for_secrets,
+    validate_media_url,
+    validate_open_url,
 )
 from legends_a2ui.validator import validate_payload
 
@@ -192,7 +194,11 @@ def _upgrade_checks(raw_checks: Any, changes: list[str]) -> list[dict[str, Any]]
     return upgraded
 
 
-def _normalize_component(raw_comp: dict[str, Any], changes: list[str]) -> dict[str, Any]:
+def _normalize_component(
+    raw_comp: dict[str, Any],
+    changes: list[str],
+    pre_errors: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     comp = copy.deepcopy(raw_comp)
 
     # Flatten v0.8 nested {"id": ..., "component": {"Text": {...}}}
@@ -335,6 +341,41 @@ def _normalize_component(raw_comp: dict[str, Any], changes: list[str]) -> dict[s
                 "path": ch["@path"],
             }
             changes.append("repaired ChildList.@path -> unprefixed path")
+
+    # Validate v0.8 literalString seed URLs before upgrading dynamic properties so unsafe seeds are never dropped silently
+    if pre_errors is not None:
+        cid_label = str(comp.get("id") or "unknown")
+        for media_prop in ("url", "posterUrl"):
+            raw_media = comp.get(media_prop)
+            if isinstance(raw_media, dict) and "literalString" in raw_media and isinstance(raw_media.get("path"), str):
+                ok_seed, reason_seed = validate_media_url(raw_media["literalString"])
+                if not ok_seed:
+                    pre_errors.append(
+                        {
+                            "code": "UNSAFE_MEDIA_URL",
+                            "blockIndex": 0,
+                            "path": f"component:{cid_label}.{media_prop}",
+                            "message": reason_seed or "Unsafe media URL in v0.8 literalString seed.",
+                        }
+                    )
+        raw_action = comp.get("action")
+        if isinstance(raw_action, dict) and isinstance(raw_action.get("functionCall"), dict):
+            fn_obj = raw_action["functionCall"]
+            fn_name = fn_obj.get("@call") if "@call" in fn_obj else fn_obj.get("call")
+            fn_args = fn_obj.get("args")
+            if fn_name == "openUrl" and isinstance(fn_args, dict):
+                raw_open = fn_args.get("url")
+                if isinstance(raw_open, dict) and "literalString" in raw_open and isinstance(raw_open.get("path"), str):
+                    ok_open, reason_open = validate_open_url(raw_open["literalString"])
+                    if not ok_open:
+                        pre_errors.append(
+                            {
+                                "code": "UNSAFE_OPEN_URL",
+                                "blockIndex": 0,
+                                "path": f"component:{cid_label}.action.functionCall.args.url",
+                                "message": reason_open or "Unsafe openUrl target in literalString seed.",
+                            }
+                        )
 
     # Upgrade dynamic properties
     for dprop in ("text", "url", "posterUrl", "description", "label", "value", "placeholder", "min", "max"):
@@ -492,6 +533,7 @@ def normalize_payload(
         }
 
     changes: list[str] = []
+    pre_errors: list[dict[str, Any]] = []
     upgraded_msgs: list[dict[str, Any]] = []
     v08_roots: dict[str, str] = {}
 
@@ -519,7 +561,7 @@ def normalize_payload(
             su = mcopy["surfaceUpdate"]
             sid = str(su.get("surfaceId") or default_surface_id)
             comps = [
-                _normalize_component(c, changes)
+                _normalize_component(c, changes, pre_errors)
                 for c in su.get("components", [])
                 if isinstance(c, dict)
             ]
@@ -573,7 +615,7 @@ def normalize_payload(
                 changes.append("stripped removed v1.0 createSurface.theme")
             if isinstance(cs.get("components"), list):
                 cs["components"] = [
-                    _normalize_component(c, changes)
+                    _normalize_component(c, changes, pre_errors)
                     for c in cs["components"]
                     if isinstance(c, dict)
                 ]
@@ -584,7 +626,7 @@ def normalize_payload(
             uc.setdefault("surfaceId", default_surface_id)
             if isinstance(uc.get("components"), list):
                 uc["components"] = [
-                    _normalize_component(c, changes)
+                    _normalize_component(c, changes, pre_errors)
                     for c in uc["components"]
                     if isinstance(c, dict)
                 ]
@@ -731,6 +773,15 @@ def normalize_payload(
         version="1.0",
         strict=True,
     )
+    if pre_errors:
+        combined_errors = pre_errors + list(strict_check.get("errors", []))
+        strict_check = dict(strict_check)
+        strict_check["ok"] = False
+        strict_check["errors"] = combined_errors
+        if isinstance(strict_check.get("stats"), dict):
+            stats_copy = dict(strict_check["stats"])
+            stats_copy["errorCount"] = len(combined_errors)
+            strict_check["stats"] = stats_copy
 
     dedup_changes = list(dict.fromkeys(changes))
     return {

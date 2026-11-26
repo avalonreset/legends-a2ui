@@ -186,6 +186,84 @@ def validate_open_url(raw_url: str) -> tuple[bool, str | None]:
     return False, f"Disallowed openUrl scheme '{scheme}:' (only https:, http:, mailto: allowed)."
 
 
+def _scan_str_for_secrets(
+    text: str,
+    cur_path: str,
+    msg_template: str,
+    findings: list[dict[str, str]],
+) -> None:
+    if len(text) < 15:
+        return
+    has_underscore = "_" in text
+    has_dot = "." in text
+    low: str | None = None
+    for rule_name, pattern in _SECRET_PATTERNS:
+        if rule_name == "stripe_live_secret":
+            if "sk_live_" not in text:
+                continue
+        elif rule_name == "stripe_restricted_key":
+            if "rk_live_" not in text:
+                continue
+        elif rule_name == "stripe_webhook_secret":
+            if "whsec_" not in text:
+                continue
+        elif rule_name == "github_token":
+            if not has_underscore or "gh" not in text:
+                continue
+        elif rule_name == "github_fine_grained_pat":
+            if "github_pat_" not in text:
+                continue
+        elif rule_name == "openai_project_key":
+            if "sk-proj-" not in text:
+                continue
+        elif rule_name == "openai_service_account_key":
+            if "sk-svcacct-" not in text:
+                continue
+        elif rule_name == "anthropic_api_key":
+            if "sk-ant-" not in text:
+                continue
+        elif rule_name == "private_key_pem":
+            if "PRIVATE KEY-----" not in text:
+                continue
+        elif rule_name == "aws_access_key_id":
+            if "AKIA" not in text:
+                continue
+        elif rule_name == "aws_temp_access_key_id":
+            if "ASIA" not in text:
+                continue
+        elif rule_name == "slack_token":
+            if "xox" not in text:
+                continue
+        elif rule_name == "google_api_key":
+            if "AIza" not in text:
+                continue
+        elif rule_name == "aws_secret_assignment":
+            if not has_underscore:
+                continue
+            if low is None:
+                low = text.lower()
+            if "aws_secret_access_key" not in low:
+                continue
+        elif rule_name == "bearer_jwt":
+            if not has_dot:
+                continue
+            if low is None:
+                low = text.lower()
+            if "eyj" not in low or "bearer" not in low:
+                continue
+        elif rule_name == "raw_jwt":
+            if not has_dot or "eyJ" not in text:
+                continue
+        if pattern.search(text):
+            findings.append(
+                {
+                    "path": cur_path,
+                    "rule": rule_name,
+                    "message": msg_template.format(rule_name=rule_name),
+                }
+            )
+
+
 def scan_for_secrets(obj: Any, path: str = "$") -> list[dict[str, str]]:
     """Iteratively scan JSON-compatible objects for leaked API keys, tokens, or private keys."""
     findings: list[dict[str, str]] = []
@@ -193,32 +271,28 @@ def scan_for_secrets(obj: Any, path: str = "$") -> list[dict[str, str]]:
     while stack:
         current, cur_path = stack.pop()
         if isinstance(current, str):
-            for rule_name, pattern in _SECRET_PATTERNS:
-                if pattern.search(current):
-                    findings.append(
-                        {
-                            "path": cur_path,
-                            "rule": rule_name,
-                            "message": f"Potential secret detected ({rule_name}); redacted and refused.",
-                        }
-                    )
+            _scan_str_for_secrets(
+                current,
+                cur_path,
+                "Potential secret detected ({rule_name}); redacted and refused.",
+                findings,
+            )
         elif isinstance(current, dict):
             for key, val in current.items():
-                key_path = f"{cur_path}.{key}"
-                stack.append((val, key_path))
-                if isinstance(key, str):
-                    for rule_name, pattern in _SECRET_PATTERNS:
-                        if pattern.search(key):
-                            findings.append(
-                                {
-                                    "path": key_path,
-                                    "rule": rule_name,
-                                    "message": f"Potential secret in key ({rule_name}); redacted and refused.",
-                                }
-                            )
+                if isinstance(val, (str, dict, list)):
+                    stack.append((val, f"{cur_path}.{key}"))
+                if isinstance(key, str) and len(key) >= 15:
+                    _scan_str_for_secrets(
+                        key,
+                        f"{cur_path}.{key}",
+                        "Potential secret in key ({rule_name}); redacted and refused.",
+                        findings,
+                    )
         elif isinstance(current, list):
             for idx in range(len(current) - 1, -1, -1):
-                stack.append((current[idx], f"{cur_path}[{idx}]"))
+                item = current[idx]
+                if isinstance(item, (str, dict, list)):
+                    stack.append((item, f"{cur_path}[{idx}]"))
     return findings
 
 
@@ -374,10 +448,24 @@ def normalize_version_arg(version: str) -> str:
 def load_catalog_spec(version: str = "1.0", vendor_dir: Path | None = None) -> dict[str, Any]:
     """Load and parse the vendored official Basic/Standard Catalog schema for a version."""
     norm_ver = normalize_version_arg(version)
-    vdir = (vendor_dir or get_vendor_dir()).resolve()
-    cache_key = (str(vdir), norm_ver)
-    if cache_key in _CATALOG_CACHE:
-        return _CATALOG_CACHE[cache_key]
+    if vendor_dir is None:
+        default_key = ("", norm_ver)
+        cached = _CATALOG_CACHE.get(default_key)
+        if cached is not None:
+            return cached
+        vdir = get_vendor_dir().resolve()
+        cache_key = (str(vdir), norm_ver)
+        cached = _CATALOG_CACHE.get(cache_key)
+        if cached is not None:
+            _CATALOG_CACHE[default_key] = cached
+            return cached
+    else:
+        default_key = None
+        vdir = vendor_dir.resolve()
+        cache_key = (str(vdir), norm_ver)
+        cached = _CATALOG_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
     rel_path = CATALOG_RELATIVE_PATHS[norm_ver]
     schema_path = ensure_within_base(vdir / rel_path, vdir)
@@ -419,4 +507,6 @@ def load_catalog_spec(version: str = "1.0", vendor_dir: Path | None = None) -> d
         "functions": functions,
     }
     _CATALOG_CACHE[cache_key] = result
+    if default_key is not None:
+        _CATALOG_CACHE[default_key] = result
     return result
