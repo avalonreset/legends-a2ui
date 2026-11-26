@@ -4375,6 +4375,375 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertFalse(res_nas["ok"])
         self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_nas["errors"]})
 
+    def test_long_pointer_lazy_resolution_and_per_kb_eval_budgeting(self) -> None:
+        """Long (>2048-char) pointers resolve lazily, preserve RFC 6901 edges, and charge per-KB eval cost."""
+        from legends_a2ui.validator import _resolve_json_pointer, _resolve_pointer_with_context
+
+        # 1. Lazy >2048-char pointer resolution edge cases (trailing slash, empty-key, tilde, empty container, valid hit)
+        long_key = "k" * 2500
+        long_tilde_seg = "~0" * 1500
+        decoded_tilde_key = "~" * 1500
+        dm_lazy = {
+            long_key: {"": "trailing_hit", "sub": ["arr_hit"]},
+            "": {long_key: "empty_root_hit"},
+            "~": {"/": {decoded_tilde_key: "tilde_hit"}},
+            "empty_d": {},
+            "empty_l": [],
+        }
+        self.assertEqual(_resolve_json_pointer(dm_lazy, f"/{long_key}/"), (True, "trailing_hit"))
+        self.assertEqual(_resolve_json_pointer(dm_lazy, f"/{long_key}/sub/0"), (True, "arr_hit"))
+        self.assertEqual(_resolve_json_pointer(dm_lazy, f"//{long_key}"), (True, "empty_root_hit"))
+        self.assertEqual(_resolve_json_pointer(dm_lazy, f"/~0/~1/{long_tilde_seg}"), (True, "tilde_hit"))
+        self.assertEqual(_resolve_json_pointer(dm_lazy, f"/empty_d/{long_tilde_seg}"), (False, None))
+        self.assertEqual(_resolve_json_pointer(dm_lazy, f"/empty_l/{long_tilde_seg}"), (False, None))
+        self.assertEqual(_resolve_json_pointer({}, f"/{long_key}"), (False, None))
+        self.assertEqual(_resolve_json_pointer([], f"/{long_key}"), (False, None))
+        self.assertEqual(_resolve_pointer_with_context({}, f"{long_key}/", dm_lazy), (True, "trailing_hit"))
+        self.assertEqual(_resolve_pointer_with_context({}, f"~0/~1/{long_tilde_seg}", dm_lazy), (True, "tilde_hit"))
+        self.assertEqual(_resolve_pointer_with_context({}, f"empty_d/{long_tilde_seg}", dm_lazy), (False, None))
+        self.assertEqual(_resolve_pointer_with_context({}, long_key, {}), (False, None))
+        self.assertEqual(_resolve_pointer_with_context({}, long_key, []), (False, None))
+
+        # 2. Long inner_list_ptr (tilde and tilde-free single-segment) trips eval budget fast
+        for inner_ptr in ("a/" + ("~0" * 120_000), "x" * 240_000):
+            comps_inner = (
+                [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(20)]}]
+                + [{"id": f"l{k}", "component": "List", "children": {"componentId": f"g{k}", "path": "/g"}} for k in range(20)]
+                + [{"id": "g0", "component": "List", "children": {"componentId": "leaf", "path": inner_ptr}}]
+                + [{"id": f"g{k}", "component": "Card", "child": "g0"} for k in range(1, 20)]
+                + [{"id": "leaf", "component": "Image", "url": {"@path": "u"}}]
+            )
+            payload_inner = {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_long_inner",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_inner,
+                    "dataModel": {"g": [{"a": {"z": 1}} for _ in range(100)]},
+                },
+            }
+            t0 = time.perf_counter()
+            res_inner = validate_payload(json.dumps(payload_inner, separators=(",", ":")), version="1.0", strict=True)
+            self.assertFalse(res_inner["ok"])
+            self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_inner["errors"]})
+            self.assertLess(time.perf_counter() - t0, 0.5)
+
+        # 3. Long @path binding and v0.8 dual literalString+path binding charge per-KB cost
+        long_path_tilde = "~0/" + ("~0" * 120_000)
+        payload_path = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s_long_path",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "List", "children": {"componentId": "row", "path": "/g"}},
+                    {"id": "row", "component": "Image", "url": {"@path": long_path_tilde}},
+                ],
+                "dataModel": {"g": [{"~": {"z": 1}} for _ in range(700)]},
+            },
+        }
+        t1 = time.perf_counter()
+        res_path = validate_payload(json.dumps(payload_path, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_path["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_path["errors"]})
+        self.assertLess(time.perf_counter() - t1, 0.5)
+
+        v08_long_dual = [
+            {"beginRendering": {"surfaceId": "s_v08_long", "root": "root"}},
+            {
+                "surfaceUpdate": {
+                    "surfaceId": "s_v08_long",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": {"List": {"children": {"template": {"componentId": "row", "dataBinding": "/g"}}}},
+                        },
+                        {
+                            "id": "row",
+                            "component": {
+                                "Image": {
+                                    "url": {
+                                        "literalString": "https://example.com/ok.png",
+                                        "path": long_path_tilde,
+                                    }
+                                }
+                            },
+                        },
+                    ],
+                }
+            },
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "s_v08_long",
+                    "path": "/g",
+                    "value": [{"~": {"z": 1}} for _ in range(700)],
+                }
+            },
+        ]
+        t2 = time.perf_counter()
+        res_v08_dual = validate_payload(json.dumps(v08_long_dual, separators=(",", ":")), version="0.8", strict=False)
+        self.assertFalse(res_v08_dual["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_v08_dual["errors"]})
+        self.assertLess(time.perf_counter() - t2, 0.5)
+
+        # 4. Outgoing template chain with long chain_ptrs charges per-KB cost in updateComponents
+        long_chain_ptr = "a/" + ("~0" * 120_000)
+        chain_msgs = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_long_chain",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "mid", "path": "/g"}},
+                        {"id": "mid", "component": "List", "children": {"componentId": "leaf", "path": long_chain_ptr}},
+                        {
+                            "id": "leaf",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${u}"}},
+                        },
+                    ],
+                    "dataModel": {"g": [{"a": {"z": 1}} for _ in range(700)]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "s_long_chain",
+                    "components": [
+                        {"id": "mid", "component": "Text", "text": "replaced"},
+                    ],
+                },
+            },
+        ]
+        t3 = time.perf_counter()
+        res_chain = validate_payload(json.dumps(chain_msgs, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_chain["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_chain["errors"]})
+        self.assertLess(time.perf_counter() - t3, 0.5)
+
+        # 5. Malformed >2048-char formatString templates charge per-KB cost across all error branches
+        from legends_a2ui.validator import _parse_format_string_template
+
+        for expected_status, bad_tpl in (
+            ("err_too_long", (" " * 280_000) + "data:image/png;base64,${u}"),
+            ("err_ctrl", "data:image/png;base64," + ("A" * 200_000) + "\x07${u}"),
+            ("err_esc", "data:image/png;base64," + ("A" * 200_000) + r"\${u}"),
+            ("err_too_many_exprs", "data:image/png;base64," + ("A" * 10_000) + ("${u}" * 65)),
+            ("err_unclosed", "data:image/png;base64," + ("A" * 200_000) + "${u"),
+            ("err_expr", "data:image/png;base64," + ("A" * 200_000) + "${bad expr}"),
+        ):
+            parsed_bad = _parse_format_string_template(bad_tpl)
+            self.assertEqual(parsed_bad[0], expected_status)
+            self.assertEqual(parsed_bad[5], 1 + (len(bad_tpl) // 1024))
+
+        bad_fmt_payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s_bad_fmt",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["i0", "i1", "i2"]},
+                    {
+                        "id": "i0",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": "data:image/png;base64," + ("A" * 200_000) + "\x07${u}"}},
+                    },
+                    {
+                        "id": "i1",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": "data:image/png;base64," + ("A" * 200_000) + r"\${u}"}},
+                    },
+                    {
+                        "id": "i2",
+                        "component": "Image",
+                        "url": {"@call": "formatString", "args": {"value": (" " * 280_000) + "data:image/png;base64,${u}"}},
+                    },
+                ],
+                "dataModel": {},
+            },
+        }
+        t4 = time.perf_counter()
+        res_bf = validate_payload(json.dumps(bad_fmt_payload, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_bf["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_bf["errors"]})
+        self.assertLess(time.perf_counter() - t4, 0.5)
+
+        # 6. Long list_ptr in Step 2a, 2b, and 2c charges per-KB cost and stays fast
+        long_list_ptr = "/" + ("~0" * 100_000)
+        long_lp_msgs = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_long_lp",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row", "path": long_list_ptr}},
+                        {
+                            "id": "row",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "https://a.co/${/p}${u}"}},
+                        },
+                    ],
+                    "dataModel": {"p": "a"},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_long_lp", "path": "/p", "value": i}}
+            for i in range(800)
+        ]
+        t5 = time.perf_counter()
+        res_llp = validate_payload(json.dumps(long_lp_msgs, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_llp["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_llp["errors"]})
+        self.assertLess(time.perf_counter() - t5, 0.5)
+
+    def test_step2a_full_list_budget_and_v08_empty_key_root_merge_scoping(self) -> None:
+        """Repeated ancestor updates budget full_list_pairs, and v0.8 empty-key merges avoid unrelated broadcasts."""
+        # 1. Step 2a full_list_pairs budgeting over deep missing/empty List templates
+        deep58 = "/~0" * 58
+        dm_deep: dict[str, object] = {}
+        cur_d: dict[str, object] = dm_deep
+        for _ in range(58):
+            nxt_d: dict[str, object] = {}
+            cur_d["~"] = nxt_d
+            cur_d = nxt_d
+        comps_deep = (
+            [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(498)]}]
+            + [{"id": f"l{k}", "component": "List", "children": {"componentId": "row", "path": f"{deep58}/z{k}"}} for k in range(498)]
+            + [{"id": "row", "component": "Image", "url": {"@path": "u"}}]
+        )
+        msgs_step2a = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_step2a",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_deep,
+                    "dataModel": dm_deep,
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_step2a", "path": deep58, "value": {}}}
+            for _ in range(400)
+        ]
+        t0 = time.perf_counter()
+        res_2a = validate_payload(json.dumps(msgs_step2a, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_2a["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_2a["errors"]})
+        self.assertLess(time.perf_counter() - t0, 0.5)
+
+        # 2. v0.8 empty-key ("") root merge does NOT broadcast to unrelated /~0/... List templates
+        v08_comps_unrelated = (
+            [{"id": "root", "component": {"Column": {"children": {"explicitList": [f"l{k}" for k in range(498)]}}}}]
+            + [
+                {
+                    "id": f"l{k}",
+                    "component": {"List": {"children": {"template": {"componentId": "row", "dataBinding": f"{deep58}/z{k}"}}}},
+                }
+                for k in range(498)
+            ]
+            + [{"id": "row", "component": {"Image": {"url": {"path": "u"}}}}]
+        )
+        v08_empty_key_msgs = [
+            {"beginRendering": {"surfaceId": "s_v08_ek", "root": "root"}},
+            {"surfaceUpdate": {"surfaceId": "s_v08_ek", "components": v08_comps_unrelated}},
+        ] + [
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "s_v08_ek",
+                    "path": "/",
+                    "contents": [{"key": "", "valueNumber": i}],
+                }
+            }
+            for i in range(4000)
+        ]
+        t1 = time.perf_counter()
+        res_v08_ek = validate_payload(json.dumps(v08_empty_key_msgs, separators=(",", ":")), version="0.8", strict=False)
+        self.assertTrue(res_v08_ek["ok"], res_v08_ek["errors"])
+        self.assertLess(time.perf_counter() - t1, 0.5)
+
+        # 3. v0.8 empty-key ("") root merge STILL catches UNSAFE_MEDIA_URL on direct "//u" and ChildList "//items"
+        v08_ek_direct = [
+            {"beginRendering": {"surfaceId": "s_v08_dir", "root": "root"}},
+            {
+                "surfaceUpdate": {
+                    "surfaceId": "s_v08_dir",
+                    "components": [{"id": "root", "component": {"Image": {"url": {"path": "//u"}}}}],
+                }
+            },
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "s_v08_dir",
+                    "path": "/",
+                    "contents": [{"key": "", "valueMap": [{"key": "u", "valueString": "javascript:alert(1)"}]}],
+                }
+            },
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "s_v08_dir",
+                    "path": "/",
+                    "contents": [{"key": "", "valueMap": [{"key": "u", "valueString": "https://example.com/ok.png"}]}],
+                }
+            },
+        ]
+        res_ek_d = validate_payload(json.dumps(v08_ek_direct), version="0.8", strict=False)
+        self.assertFalse(res_ek_d["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_ek_d["errors"]})
+
+        v08_ek_list = [
+            {"beginRendering": {"surfaceId": "s_v08_lst", "root": "root"}},
+            {
+                "surfaceUpdate": {
+                    "surfaceId": "s_v08_lst",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": {"List": {"children": {"template": {"componentId": "row", "dataBinding": "//items"}}}},
+                        },
+                        {"id": "row", "component": {"Image": {"url": {"path": "u"}}}},
+                    ],
+                }
+            },
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "s_v08_lst",
+                    "path": "/",
+                    "contents": [
+                        {
+                            "key": "",
+                            "valueMap": [
+                                {
+                                    "key": "items",
+                                    "valueArray": [{"valueMap": [{"key": "u", "valueString": "javascript:alert(1)"}]}],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "s_v08_lst",
+                    "path": "/",
+                    "contents": [
+                        {
+                            "key": "",
+                            "valueMap": [
+                                {
+                                    "key": "items",
+                                    "valueArray": [{"valueMap": [{"key": "u", "valueString": "https://example.com/ok.png"}]}],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        ]
+        res_ek_l = validate_payload(json.dumps(v08_ek_list), version="0.8", strict=False)
+        self.assertFalse(res_ek_l["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_ek_l["errors"]})
+
 
 if __name__ == "__main__":
     unittest.main()

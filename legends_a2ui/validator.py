@@ -604,12 +604,17 @@ def _resolve_json_pointer(
     if not pointer.startswith("/"):
         return False, None
     if pointer.find("/", 1) == -1 and "~" not in pointer:
-        seg = pointer[1:]
         if isinstance(data, dict):
+            if not data:
+                return False, None
+            seg = pointer[1:]
             if seg in data:
                 return True, data[seg]
             return False, None
         if isinstance(data, list):
+            if not data or len(pointer) > 8:
+                return False, None
+            seg = pointer[1:]
             idx = _parse_rfc6901_array_index(seg)
             if idx is None or idx >= len(data):
                 return False, None
@@ -618,22 +623,56 @@ def _resolve_json_pointer(
     if len(pointer) > max_segments and pointer.count("/") > max_segments:
         return False, None
     cur = data
-    if "~" in pointer:
-        segs: Any = (
-            _split_tilde_pointer_cached(pointer)
-            if len(pointer) <= _SAFE_URL_CACHE_MAX_ITEM_LEN
-            else (
-                s.replace("~1", "/").replace("~0", "~") if "~" in s else s
-                for s in pointer[1:].split("/")
-            )
-        )
-        for seg in segs:
+    if len(pointer) > _SAFE_URL_CACHE_MAX_ITEM_LEN:
+        has_tilde = "~" in pointer
+        pos = 1
+        while True:
             if type(cur) is dict:
+                if not cur:
+                    return False, None
+                nxt = pointer.find("/", pos)
+                raw_seg = pointer[pos:] if nxt == -1 else pointer[pos:nxt]
+                seg = (
+                    raw_seg.replace("~1", "/").replace("~0", "~")
+                    if (has_tilde and "~" in raw_seg)
+                    else raw_seg
+                )
                 if seg in cur:
                     cur = cur[seg]
                 else:
                     return False, None
             elif type(cur) is list:
+                if not cur:
+                    return False, None
+                nxt = pointer.find("/", pos)
+                seg_len = (len(pointer) - pos) if nxt == -1 else (nxt - pos)
+                if seg_len == 0 or seg_len > 7:
+                    return False, None
+                raw_seg = pointer[pos:] if nxt == -1 else pointer[pos:nxt]
+                if has_tilde and "~" in raw_seg:
+                    return False, None
+                idx = _parse_rfc6901_array_index(raw_seg)
+                if idx is None or idx >= len(cur):
+                    return False, None
+                cur = cur[idx]
+            else:
+                return False, None
+            if nxt == -1:
+                break
+            pos = nxt + 1
+        return True, cur
+    if "~" in pointer:
+        for seg in _split_tilde_pointer_cached(pointer):
+            if type(cur) is dict:
+                if not cur:
+                    return False, None
+                if seg in cur:
+                    cur = cur[seg]
+                else:
+                    return False, None
+            elif type(cur) is list:
+                if not cur:
+                    return False, None
                 idx = _parse_rfc6901_array_index(seg)
                 if idx is None or idx >= len(cur):
                     return False, None
@@ -643,11 +682,15 @@ def _resolve_json_pointer(
     else:
         for seg in pointer[1:].split("/"):
             if type(cur) is dict:
+                if not cur:
+                    return False, None
                 if seg in cur:
                     cur = cur[seg]
                 else:
                     return False, None
             elif type(cur) is list:
+                if not cur:
+                    return False, None
                 idx = _parse_rfc6901_array_index(seg)
                 if idx is None or idx >= len(cur):
                     return False, None
@@ -672,10 +715,14 @@ def _resolve_pointer_with_context(
         return False, None
     if "/" not in pointer and "~" not in pointer:
         if type(item_ctx) is dict:
+            if not item_ctx:
+                return False, None
             if pointer in item_ctx:
                 return True, item_ctx[pointer]
             return False, None
         if type(item_ctx) is list:
+            if not item_ctx or len(pointer) > 7:
+                return False, None
             idx = _parse_rfc6901_array_index(pointer)
             if idx is None or idx >= len(item_ctx):
                 return False, None
@@ -684,22 +731,56 @@ def _resolve_pointer_with_context(
     if len(pointer) >= max_segments and pointer.count("/") >= max_segments:
         return False, None
     cur = item_ctx
-    if "~" in pointer:
-        segs: Any = (
-            _split_tilde_pointer_cached(pointer)
-            if len(pointer) <= _SAFE_URL_CACHE_MAX_ITEM_LEN
-            else (
-                s.replace("~1", "/").replace("~0", "~") if "~" in s else s
-                for s in pointer.split("/")
-            )
-        )
-        for seg in segs:
+    if len(pointer) > _SAFE_URL_CACHE_MAX_ITEM_LEN:
+        has_tilde = "~" in pointer
+        pos = 0
+        while True:
             if type(cur) is dict:
+                if not cur:
+                    return False, None
+                nxt = pointer.find("/", pos)
+                raw_seg = pointer[pos:] if nxt == -1 else pointer[pos:nxt]
+                seg = (
+                    raw_seg.replace("~1", "/").replace("~0", "~")
+                    if (has_tilde and "~" in raw_seg)
+                    else raw_seg
+                )
                 if seg in cur:
                     cur = cur[seg]
                 else:
                     return False, None
             elif type(cur) is list:
+                if not cur:
+                    return False, None
+                nxt = pointer.find("/", pos)
+                seg_len = (len(pointer) - pos) if nxt == -1 else (nxt - pos)
+                if seg_len == 0 or seg_len > 7:
+                    return False, None
+                raw_seg = pointer[pos:] if nxt == -1 else pointer[pos:nxt]
+                if has_tilde and "~" in raw_seg:
+                    return False, None
+                idx = _parse_rfc6901_array_index(raw_seg)
+                if idx is None or idx >= len(cur):
+                    return False, None
+                cur = cur[idx]
+            else:
+                return False, None
+            if nxt == -1:
+                break
+            pos = nxt + 1
+        return True, cur
+    if "~" in pointer:
+        for seg in _split_tilde_pointer_cached(pointer):
+            if type(cur) is dict:
+                if not cur:
+                    return False, None
+                if seg in cur:
+                    cur = cur[seg]
+                else:
+                    return False, None
+            elif type(cur) is list:
+                if not cur:
+                    return False, None
                 idx = _parse_rfc6901_array_index(seg)
                 if idx is None or idx >= len(cur):
                     return False, None
@@ -709,11 +790,15 @@ def _resolve_pointer_with_context(
     else:
         for seg in pointer.split("/"):
             if type(cur) is dict:
+                if not cur:
+                    return False, None
                 if seg in cur:
                     cur = cur[seg]
                 else:
                     return False, None
             elif type(cur) is list:
+                if not cur:
+                    return False, None
                 idx = _parse_rfc6901_array_index(seg)
                 if idx is None or idx >= len(cur):
                     return False, None
@@ -804,6 +889,19 @@ def _is_pointer_too_deep(ptr: str, max_segments: int) -> bool:
     return len(ptr) >= max_segments and ptr.count("/") >= max_segments
 
 
+def _pointer_eval_cost(ptr: str, *, base: int = 1, depth_div: int = 8) -> int:
+    """Estimate evaluation cost of resolving an RFC 6901 pointer by length, tilde escaping, and depth."""
+    plen = len(ptr)
+    kb_cost = (
+        (plen // 128)
+        if (plen > _SAFE_URL_CACHE_MAX_ITEM_LEN and "~" in ptr)
+        else (plen // 1024)
+    )
+    if depth_div == 1:
+        return max(base, ptr.count("/")) + kb_cost
+    return base + kb_cost + (ptr.count("/") // depth_div)
+
+
 def _cache_safe_url(safe_url_cache: _BoundedUrlCache | set[str] | None, candidate_url: str) -> None:
     """Insert a verified safe URL into cache subject to entry-count and character-budget caps."""
     if safe_url_cache is None:
@@ -817,20 +915,37 @@ def _cache_safe_url(safe_url_cache: _BoundedUrlCache | set[str] | None, candidat
         safe_url_cache.add(candidate_url)
 
 
+_NON_WS_RE = re.compile(r"\S")
+
+
+def _starts_with_data_scheme(value: str) -> bool:
+    """Check whether value begins with 'data:' after optional whitespace without copying value."""
+    if not value:
+        return False
+    if not value[0].isspace():
+        return value[:5].lower() == "data:"
+    m = _NON_WS_RE.search(value)
+    return m is not None and value[m.start() : m.start() + 5].lower() == "data:"
+
+
 def _parse_format_string_template_uncached(
     tpl: str,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str]:
     """Parse and validate a formatString URL template once into literal segments and pointer expressions."""
-    if len(tpl) > 1_048_576:
-        return ("err_too_long", (), (), False, "", 1, "")
-    if len(tpl) > _MAX_FORMAT_URL_NON_DATA_LEN and tpl.lstrip()[:5].lower() != "data:":
-        return ("err_too_long", (), (), False, "", 1, "")
+    tlen = len(tpl)
+    base_cost = 1 + (tlen // 1024)
+    if tlen > 1_048_576:
+        return ("err_too_long", (), (), False, "", base_cost, "")
+    if tlen > _MAX_FORMAT_URL_NON_DATA_LEN:
+        if tlen > _MAX_FORMAT_URL_DATA_LEN or not _starts_with_data_scheme(tpl):
+            return ("err_too_long", (), (), False, "", base_cost, "")
     if _URL_CTRL_CHAR_RE.search(tpl):
-        return ("err_ctrl", (), (), False, "", 1, "")
+        return ("err_ctrl", (), (), False, "", base_cost, "")
     if "${" not in tpl:
-        return ("static", (tpl,), (), bool(tpl.strip()), tpl, 1 + (len(tpl) // 1024), tpl)
+        has_non_ws = bool(tpl) and (not tpl[0].isspace() or _NON_WS_RE.search(tpl) is not None)
+        return ("static", (tpl,), (), has_non_ws, tpl, base_cost, tpl)
     if r"\${" in tpl:
-        return ("err_esc", (), (), False, "", 1, "")
+        return ("err_esc", (), (), False, "", base_cost, "")
     parts: list[str] = []
     exprs: list[str] = []
     pos = 0
@@ -840,21 +955,29 @@ def _parse_format_string_template_uncached(
             parts.append(tpl[pos:])
             break
         if len(exprs) >= _MAX_FORMAT_URL_PLACEHOLDERS:
-            return ("err_too_many_exprs", (), (), False, "", 1, "")
+            return ("err_too_many_exprs", (), (), False, "", base_cost, "")
         end = tpl.find("}", start + 2)
         if end == -1:
-            return ("err_unclosed", (), (), False, "", 1, "")
+            return ("err_unclosed", (), (), False, "", base_cost, "")
         inner = tpl[start + 2 : end]
         if not _SIMPLE_FORMAT_PTR_RE.fullmatch(inner):
-            return ("err_expr", (inner,), (), False, "", 1, "")
+            return ("err_expr", (inner,), (), False, "", base_cost, "")
         parts.append(tpl[pos:start])
         exprs.append(inner)
         pos = end + 1
     parts_t = tuple(parts)
     exprs_t = tuple(exprs)
-    eval_cost = max(1, len(exprs_t)) + (len(tpl) // 1024)
+    eval_cost = (
+        max(1, len(exprs_t))
+        + (tlen // 1024)
+        + sum(_pointer_eval_cost(ex, base=0, depth_div=8) for ex in exprs_t)
+    )
     empty_single = f"{parts_t[0]}{parts_t[1]}" if len(exprs_t) == 1 else ""
-    return ("ok", parts_t, exprs_t, bool(parts_t[0].strip()), "placeholder".join(parts_t), eval_cost, empty_single)
+    first_part = parts_t[0]
+    prefix_nonempty = bool(first_part) and (
+        not first_part[0].isspace() or _NON_WS_RE.search(first_part) is not None
+    )
+    return ("ok", parts_t, exprs_t, prefix_nonempty, "placeholder".join(parts_t), eval_cost, empty_single)
 
 
 @lru_cache(maxsize=4096)
@@ -1069,7 +1192,7 @@ def _validate_url_function_call(
             )
             return
 
-        is_data_media_tpl = kind == "media" and parts[0].lstrip()[:5].lower() == "data:"
+        is_data_media_tpl = kind == "media" and _starts_with_data_scheme(parts[0])
         max_interp_len = _MAX_FORMAT_URL_DATA_LEN if is_data_media_tpl else _MAX_FORMAT_URL_NON_DATA_LEN
 
         def _charge_interp_evals(interp_len: int) -> bool:
@@ -3219,15 +3342,20 @@ def validate_payload(
             cache = safe_media_urls if kind == "media" else safe_open_urls
             eval_cost = 1
             parsed_fmt: tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str] | None = None
-            if isinstance(raw_val, dict) and ("@call" in raw_val or "call" in raw_val):
-                fn_name = raw_val.get("@call") if "@call" in raw_val else raw_val.get("call")
-                if fn_name == "formatString":
-                    args_d = raw_val.get("args")
-                    if isinstance(args_d, dict):
-                        tpl_s = args_d.get("value")
-                        if isinstance(tpl_s, str):
-                            parsed_fmt = _parse_format_string_template(tpl_s)
-                            eval_cost = parsed_fmt[5]
+            if isinstance(raw_val, dict):
+                if "@call" in raw_val or "call" in raw_val:
+                    fn_name = raw_val.get("@call") if "@call" in raw_val else raw_val.get("call")
+                    if fn_name == "formatString":
+                        args_d = raw_val.get("args")
+                        if isinstance(args_d, dict):
+                            tpl_s = args_d.get("value")
+                            if isinstance(tpl_s, str):
+                                parsed_fmt = _parse_format_string_template(tpl_s)
+                                eval_cost = parsed_fmt[5]
+                else:
+                    ptr_s = raw_val.get("@path") if "@path" in raw_val else raw_val.get("path")
+                    if isinstance(ptr_s, str):
+                        eval_cost = _pointer_eval_cost(ptr_s, base=1, depth_div=8)
 
             if payload_url_slot_evals[0] + eval_cost > max_surface_url_evals:
                 if not payload_budget_exceeded and not payload_budget_flag[0]:
@@ -3754,19 +3882,18 @@ def validate_payload(
                         tree_has_slots_cache[inner_tpl_id] = has_inner_slots
                     if not has_inner_slots:
                         continue
+                    inner_ptr_extra = _pointer_eval_cost(inner_list_ptr, base=0, depth_div=8)
+                    if inner_ptr_extra > 0:
+                        if not _charge_payload_url_evals(inner_ptr_extra, sid_tpl, tmp_errors):
+                            return True
                     item_is_dict = type(item_ctx) is dict
                     if item_is_dict and "/" not in inner_list_ptr and "~" not in inner_list_ptr:
-                        inner_items = item_ctx.get(inner_list_ptr)
+                        inner_items = item_ctx.get(inner_list_ptr) if item_ctx else None
                         found_inner = inner_items is not None
                     elif not item_is_dict and type(item_ctx) is not list:
                         found_inner = False
                         inner_items = None
                     else:
-                        if "/" in inner_list_ptr:
-                            inner_ptr_extra = inner_list_ptr.count("/") // 8
-                            if inner_ptr_extra > 0:
-                                if not _charge_payload_url_evals(inner_ptr_extra, sid_tpl, tmp_errors):
-                                    return True
                         found_inner, inner_items = _resolve_pointer_with_context(
                             dm, inner_list_ptr, item_ctx, max_segments=max_ptr_segments
                         )
@@ -4024,13 +4151,17 @@ def validate_payload(
                                     tuple[str, str, Any, frozenset[str], frozenset[str], str, str]
                                 ],
                             ) -> bool:
+                                ptr_step = chain_ptrs[depth]
+                                step_cost = _pointer_eval_cost(ptr_step, base=1, depth_div=8)
+                                if not _charge_payload_url_evals(step_cost, sid_ing, tmp_errors):
+                                    return True
                                 if depth == 0:
                                     found_l, items_l = _resolve_json_pointer(
-                                        dm, chain_ptrs[0], max_segments=max_ptr_segments
+                                        dm, ptr_step, max_segments=max_ptr_segments
                                     )
                                 else:
                                     found_l, items_l = _resolve_pointer_with_context(
-                                        dm, chain_ptrs[depth], cur_ctx, max_segments=max_ptr_segments
+                                        dm, ptr_step, cur_ctx, max_segments=max_ptr_segments
                                     )
                                 if not found_l or not isinstance(items_l, list) or not items_l:
                                     return False
@@ -4130,6 +4261,10 @@ def validate_payload(
                 if tpl_pair in seen_tpl_pairs_ing:
                     continue
                 seen_tpl_pairs_ing.add(tpl_pair)
+                ing_list_cost = _pointer_eval_cost(list_ptr, base=1, depth_div=8)
+                if not _charge_payload_url_evals(ing_list_cost, sid_ing, tmp_errors):
+                    ing_tpl_cap = True
+                    break
                 found_list, items_val = _resolve_json_pointer(dm, list_ptr, max_segments=max_ptr_segments)
                 if not found_list or not isinstance(items_val, list):
                     continue
@@ -4230,8 +4365,8 @@ def validate_payload(
                                     and len(root_scope_ing[2]) == 1
                                 ):
                                     ip0 = root_scope_ing[2][0][1]
-                                    if "/" not in ip0 and "~" not in ip0:
-                                        iv0 = item.get(ip0)
+                                    if len(ip0) < 1024 and "/" not in ip0 and "~" not in ip0:
+                                        iv0 = item.get(ip0) if item else None
                                         skip_empty = type(iv0) is not list or not iv0
                                 if skip_empty:
                                     nxt_evals = payload_url_slot_evals[0] + 1
@@ -4340,10 +4475,12 @@ def validate_payload(
                         full_list_pair_set = set(all_tpl_pairs)
                     else:
                         if popped_idx is None:
-                            for tp in exact_list_ptr.get(ptr, ()):
-                                if tp not in full_list_pair_set:
-                                    full_list_pair_set.add(tp)
-                                    full_list_pairs.append(tp)
+                            exact_keys = (ptr, "/") if ptr == _EMPTY_ROOT_KEY_PTR else (ptr,)
+                            for ekey in exact_keys:
+                                for tp in exact_list_ptr.get(ekey, ()):
+                                    if tp not in full_list_pair_set:
+                                        full_list_pair_set.add(tp)
+                                        full_list_pairs.append(tp)
                         for tp in _lookup_prefix_bucket(anc_list_ptr, ptr, popped_idx):
                             if tp not in full_list_pair_set:
                                 full_list_pair_set.add(tp)
@@ -4416,81 +4553,37 @@ def validate_payload(
                             sid_upd, tpl_root_id
                         )
                         cached_res = resolved_list_by_ptr.get(list_ptr)
-                        if cached_res is None:
+                        was_cached = cached_res is not None
+                        if not was_cached:
+                            list_ptr_cost = _pointer_eval_cost(list_ptr, base=1, depth_div=1)
+                            if not _charge_payload_url_evals(list_ptr_cost, sid_upd, tmp_errors):
+                                surf_cap_hit = True
+                                break
                             cached_res = _resolve_json_pointer(
                                 dm, list_ptr, max_segments=max_ptr_segments
                             )
                             resolved_list_by_ptr[list_ptr] = cached_res
                         found_list, items_val = cached_res
-                        if found_list and isinstance(items_val, list):
-                            if popped_idx is not None:
-                                rescan_budget = payload_tpl_rescan_evals
-                                if not has_nested_rel:
-                                    cap_hit = False
-                                    for item_idx, item in enumerate(items_val):
-                                        for slot in rel_slots:
-                                            if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
-                                                cap_hit = True
-                                                break
-                                            if not _validate_single_url_slot(
-                                                sid_upd,
-                                                slot,
-                                                dm,
-                                                tmp_errors,
-                                                tmp_warnings,
-                                                item_ctx=item,
-                                                item_idx=item_idx,
-                                                is_historical_snapshot=True,
-                                            ):
-                                                surf_cap_hit = True
-                                                break
-                                            rescan_budget[0] += 1
-                                        if cap_hit or surf_cap_hit:
-                                            break
-                                    if cap_hit:
-                                        _add_issue(
-                                            tmp_errors,
-                                            "MAX_TEMPLATE_EVALS_EXCEEDED",
-                                            bidx,
-                                            f"surface:{sid_upd}",
-                                            f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
-                                        )
-                                else:
-                                    sc_pop: dict[str, Any] = {}
-                                    tc_pop: dict[str, bool] = {}
-                                    for item_idx, item in enumerate(items_val):
-                                        if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
-                                            _add_issue(
-                                                tmp_errors,
-                                                "MAX_TEMPLATE_EVALS_EXCEEDED",
-                                                bidx,
-                                                f"surface:{sid_upd}",
-                                                f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
-                                            )
-                                            break
-                                        before = rescan_budget[0]
-                                        if _validate_template_item_urls(
-                                            sid_upd,
-                                            tpl_root_id,
-                                            dm,
-                                            item,
-                                            item_idx,
-                                            tmp_errors,
-                                            tmp_warnings,
-                                            is_historical_snapshot=True,
-                                            eval_budget=rescan_budget,
-                                            eval_limit=_MAX_TEMPLATE_RESCAN_EVALS,
-                                            scope_cache=sc_pop,
-                                            tree_has_slots_cache=tc_pop,
-                                        ):
-                                            if payload_budget_exceeded:
-                                                surf_cap_hit = True
-                                            break
-                                        if rescan_budget[0] == before:
-                                            rescan_budget[0] += 1
-                            elif not has_nested_rel:
+                        if (
+                            not found_list
+                            or not isinstance(items_val, list)
+                            or not items_val
+                            or (not has_nested_rel and not rel_slots)
+                        ):
+                            if was_cached:
+                                if not _charge_payload_url_evals(1, sid_upd, tmp_errors):
+                                    surf_cap_hit = True
+                                    break
+                            continue
+                        if popped_idx is not None:
+                            rescan_budget = payload_tpl_rescan_evals
+                            if not has_nested_rel:
+                                cap_hit = False
                                 for item_idx, item in enumerate(items_val):
                                     for slot in rel_slots:
+                                        if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
+                                            cap_hit = True
+                                            break
                                         if not _validate_single_url_slot(
                                             sid_upd,
                                             slot,
@@ -4503,39 +4596,31 @@ def validate_payload(
                                         ):
                                             surf_cap_hit = True
                                             break
-                                    if surf_cap_hit:
+                                        rescan_budget[0] += 1
+                                    if cap_hit or surf_cap_hit:
                                         break
-                            else:
-                                sc_full: dict[str, Any] = {}
-                                tc_full: dict[str, bool] = {}
-                                root_scope_full = _collect_template_scope(sid_upd, tpl_root_id)
-                                sc_full[tpl_root_id] = root_scope_full
-                                no_direct_full = not root_scope_full[1]
-                                simple_nested_full = (
-                                    root_scope_full[2][0][1]
-                                    if (
-                                        no_direct_full
-                                        and len(root_scope_full[2]) == 1
-                                        and "/" not in root_scope_full[2][0][1]
-                                        and "~" not in root_scope_full[2][0][1]
+                                if cap_hit:
+                                    _add_issue(
+                                        tmp_errors,
+                                        "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                        bidx,
+                                        f"surface:{sid_upd}",
+                                        f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
                                     )
-                                    else None
-                                )
+                            else:
+                                sc_pop: dict[str, Any] = {}
+                                tc_pop: dict[str, bool] = {}
                                 for item_idx, item in enumerate(items_val):
-                                    if no_direct_full:
-                                        itype = type(item)
-                                        skip_empty = itype is not dict and itype is not list
-                                        if not skip_empty and itype is dict and simple_nested_full is not None:
-                                            iv0 = item.get(simple_nested_full)
-                                            skip_empty = type(iv0) is not list or not iv0
-                                        if skip_empty:
-                                            nxt_evals = payload_url_slot_evals[0] + 1
-                                            if nxt_evals > max_surface_url_evals:
-                                                _charge_payload_url_evals(1, sid_upd, tmp_errors)
-                                                surf_cap_hit = True
-                                                break
-                                            payload_url_slot_evals[0] = nxt_evals
-                                            continue
+                                    if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
+                                        _add_issue(
+                                            tmp_errors,
+                                            "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                            bidx,
+                                            f"surface:{sid_upd}",
+                                            f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
+                                        )
+                                        break
+                                    before = rescan_budget[0]
                                     if _validate_template_item_urls(
                                         sid_upd,
                                         tpl_root_id,
@@ -4545,12 +4630,80 @@ def validate_payload(
                                         tmp_errors,
                                         tmp_warnings,
                                         is_historical_snapshot=True,
-                                        scope_cache=sc_full,
-                                        tree_has_slots_cache=tc_full,
+                                        eval_budget=rescan_budget,
+                                        eval_limit=_MAX_TEMPLATE_RESCAN_EVALS,
+                                        scope_cache=sc_pop,
+                                        tree_has_slots_cache=tc_pop,
                                     ):
                                         if payload_budget_exceeded:
                                             surf_cap_hit = True
                                         break
+                                    if rescan_budget[0] == before:
+                                        rescan_budget[0] += 1
+                        elif not has_nested_rel:
+                            for item_idx, item in enumerate(items_val):
+                                for slot in rel_slots:
+                                    if not _validate_single_url_slot(
+                                        sid_upd,
+                                        slot,
+                                        dm,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        item_ctx=item,
+                                        item_idx=item_idx,
+                                        is_historical_snapshot=True,
+                                    ):
+                                        surf_cap_hit = True
+                                        break
+                                if surf_cap_hit:
+                                    break
+                        else:
+                            sc_full: dict[str, Any] = {}
+                            tc_full: dict[str, bool] = {}
+                            root_scope_full = _collect_template_scope(sid_upd, tpl_root_id)
+                            sc_full[tpl_root_id] = root_scope_full
+                            no_direct_full = not root_scope_full[1]
+                            simple_nested_full = (
+                                root_scope_full[2][0][1]
+                                if (
+                                    no_direct_full
+                                    and len(root_scope_full[2]) == 1
+                                    and len(root_scope_full[2][0][1]) < 1024
+                                    and "/" not in root_scope_full[2][0][1]
+                                    and "~" not in root_scope_full[2][0][1]
+                                )
+                                else None
+                            )
+                            for item_idx, item in enumerate(items_val):
+                                if no_direct_full:
+                                    itype = type(item)
+                                    skip_empty = itype is not dict and itype is not list
+                                    if not skip_empty and itype is dict and simple_nested_full is not None:
+                                        iv0 = item.get(simple_nested_full) if item else None
+                                        skip_empty = type(iv0) is not list or not iv0
+                                    if skip_empty:
+                                        nxt_evals = payload_url_slot_evals[0] + 1
+                                        if nxt_evals > max_surface_url_evals:
+                                            _charge_payload_url_evals(1, sid_upd, tmp_errors)
+                                            surf_cap_hit = True
+                                            break
+                                        payload_url_slot_evals[0] = nxt_evals
+                                        continue
+                                if _validate_template_item_urls(
+                                    sid_upd,
+                                    tpl_root_id,
+                                    dm,
+                                    item,
+                                    item_idx,
+                                    tmp_errors,
+                                    tmp_warnings,
+                                    is_historical_snapshot=True,
+                                    scope_cache=sc_full,
+                                    tree_has_slots_cache=tc_full,
+                                ):
+                                    if payload_budget_exceeded:
+                                        surf_cap_hit = True
+                                    break
                         if surf_cap_hit or payload_budget_exceeded:
                             break
 
@@ -4559,13 +4712,22 @@ def validate_payload(
                     if not surf_cap_hit and not payload_budget_exceeded and single_item_list_ptrs:
                         for list_ptr in single_item_list_ptrs:
                             cached_res = resolved_list_by_ptr.get(list_ptr)
-                            if cached_res is None:
+                            was_cached = cached_res is not None
+                            if not was_cached:
+                                list_ptr_cost = _pointer_eval_cost(list_ptr, base=1, depth_div=8)
+                                if not _charge_payload_url_evals(list_ptr_cost, sid_upd, tmp_errors):
+                                    surf_cap_hit = True
+                                    break
                                 cached_res = _resolve_json_pointer(
                                     dm, list_ptr, max_segments=max_ptr_segments
                                 )
                                 resolved_list_by_ptr[list_ptr] = cached_res
                             found_list, items_val = cached_res
                             if not found_list or not isinstance(items_val, list):
+                                if was_cached:
+                                    if not _charge_payload_url_evals(1, sid_upd, tmp_errors):
+                                        surf_cap_hit = True
+                                        break
                                 continue
                             rest = ptr[len(list_ptr) + 1 :]
                             slash_pos = rest.find("/")
@@ -4580,6 +4742,10 @@ def validate_payload(
                                     else None
                                 )
                             if target_idx is None:
+                                if was_cached:
+                                    if not _charge_payload_url_evals(1, sid_upd, tmp_errors):
+                                        surf_cap_hit = True
+                                        break
                                 continue
                             item = items_val[target_idx]
                             item_sub_ptr = (
@@ -4860,13 +5026,17 @@ def validate_payload(
                                 if tpl_pair in full_list_pair_set:
                                     continue
                                 tpl_root_id, list_ptr = tpl_pair
-                                list_ptr_cost = max(1, list_ptr.count("/"))
+                                cached_res = resolved_list_by_ptr.get(list_ptr)
+                                list_ptr_cost = (
+                                    1
+                                    if cached_res is not None
+                                    else _pointer_eval_cost(list_ptr, base=1, depth_div=1)
+                                )
                                 if not _charge_payload_url_evals(
                                     list_ptr_cost, sid_upd, tmp_errors
                                 ):
                                     surf_cap_hit = True
                                     break
-                                cached_res = resolved_list_by_ptr.get(list_ptr)
                                 if cached_res is not None:
                                     found_list, items_val = cached_res
                                 else:
@@ -5004,6 +5174,10 @@ def validate_payload(
                     prefixless_slots = [s for s in rel_slots if _is_prefixless_format_string_url(s[2])]
                     if not prefixless_slots:
                         continue
+                    fl_list_cost = _pointer_eval_cost(list_ptr, base=1, depth_div=8)
+                    if not _charge_payload_url_evals(fl_list_cost, sid_to_flush, final_tpl_errors):
+                        fl_cap_hit = True
+                        break
                     found_list, items_val = _resolve_json_pointer(
                         dm, list_ptr, max_segments=max_ptr_segments
                     )
@@ -5038,6 +5212,7 @@ def validate_payload(
                             if (
                                 no_direct_fl
                                 and len(root_scope_fl[2]) == 1
+                                and len(root_scope_fl[2][0][1]) < 1024
                                 and "/" not in root_scope_fl[2][0][1]
                                 and "~" not in root_scope_fl[2][0][1]
                             )
@@ -5048,7 +5223,7 @@ def validate_payload(
                                 itype = type(item)
                                 skip_empty = itype is not dict and itype is not list
                                 if not skip_empty and itype is dict and simple_nested_fl is not None:
-                                    iv0 = item.get(simple_nested_fl)
+                                    iv0 = item.get(simple_nested_fl) if item else None
                                     skip_empty = type(iv0) is not list or not iv0
                                 if skip_empty:
                                     nxt_evals = payload_url_slot_evals[0] + 1
@@ -5691,7 +5866,11 @@ def validate_payload(
                         for merged_k in v08_merged_keys:
                             if payload_budget_exceeded:
                                 break
-                            key_ptr = "/" + merged_k.replace("~", "~0").replace("/", "~1")
+                            key_ptr = (
+                                _EMPTY_ROOT_KEY_PTR
+                                if merged_k == ""
+                                else "/" + merged_k.replace("~", "~0").replace("/", "~1")
+                            )
                             _validate_streaming_data_update(sid, key_ptr, popped_idx=None)
                     elif mutated and isinstance(effective_ptr, str):
                         _validate_streaming_data_update(sid, effective_ptr, popped_idx=popped_idx)
