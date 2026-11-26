@@ -29,6 +29,10 @@ _SAFE_DATA_MEDIA_RE = re.compile(
     r"^data:(?:image/(?:png|jpeg|jpg|gif|webp|avif|bmp)|(?:audio|video)/[a-z0-9.+-]+)[;,]",
     re.IGNORECASE,
 )
+_MAX_NON_DATA_URL_LEN = 16_384
+_MAX_DATA_MEDIA_URL_LEN = 1_048_576
+_URL_CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_URL_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("stripe_live_secret", re.compile(r"\bsk_live_[A-Za-z0-9]{12,}\b")),
@@ -107,19 +111,29 @@ def validate_media_url(raw_url: str) -> tuple[bool, str | None]:
     """Validate media URLs per official A2UI Basic Catalog implementation guide."""
     if not isinstance(raw_url, str):
         return False, "Media URL must be a string."
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_url):
+    if len(raw_url) > _MAX_NON_DATA_URL_LEN:
+        if len(raw_url) > _MAX_DATA_MEDIA_URL_LEN:
+            return (
+                False,
+                f"Media URL exceeds maximum length ({_MAX_DATA_MEDIA_URL_LEN} chars).",
+            )
+        if raw_url.lstrip()[:5].lower() != "data:":
+            return (
+                False,
+                f"Media URL exceeds maximum length ({_MAX_NON_DATA_URL_LEN} chars).",
+            )
+    if _URL_CTRL_CHAR_RE.search(raw_url):
         return False, "Media URL contains disallowed control or whitespace-smuggling characters."
     trimmed = raw_url.strip()
     if not trimmed:
         return False, "Media URL must not be empty."
 
-    normalized_slashes = trimmed.replace("\\", "/")
-    if normalized_slashes.startswith("//"):
+    if trimmed[:2] in {"//", "/\\", "\\/", "\\\\"}:
         return False, "Scheme-relative or UNC media URLs (//host or \\\\host) are disallowed."
     if trimmed.startswith("/") and not trimmed.startswith("/\\"):
         return True, None
 
-    scheme_match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):(.*)$", trimmed)
+    scheme_match = _URL_SCHEME_RE.match(trimmed)
     if not scheme_match:
         return (
             False,
@@ -127,10 +141,10 @@ def validate_media_url(raw_url: str) -> tuple[bool, str | None]:
         )
 
     scheme = scheme_match.group(1).lower()
-    rest = scheme_match.group(2)
+    rest_pos = scheme_match.end()
 
     if scheme in {"http", "https"}:
-        if not rest.startswith("//"):
+        if not trimmed.startswith("//", rest_pos):
             return False, f"{scheme}: media URL must include // and a host."
         parsed = urlsplit(trimmed)
         if not parsed.netloc or not parsed.hostname or any(ch.isspace() for ch in parsed.netloc):
@@ -154,24 +168,25 @@ def validate_open_url(raw_url: str) -> tuple[bool, str | None]:
     """Validate interactive openUrl action targets strictly (https:, http:, mailto: only)."""
     if not isinstance(raw_url, str):
         return False, "openUrl target must be a string."
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_url):
+    if len(raw_url) > _MAX_NON_DATA_URL_LEN:
+        return False, f"URL exceeds maximum length ({_MAX_NON_DATA_URL_LEN} chars)."
+    if _URL_CTRL_CHAR_RE.search(raw_url):
         return False, "openUrl target contains disallowed control characters."
     trimmed = raw_url.strip()
     if not trimmed:
         return False, "openUrl target must not be empty."
 
-    normalized_slashes = trimmed.replace("\\", "/")
-    if normalized_slashes.startswith("//"):
+    if trimmed[:2] in {"//", "/\\", "\\/", "\\\\"}:
         return False, "Scheme-relative URLs are not allowed in openUrl."
 
-    scheme_match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*):(.*)$", trimmed)
+    scheme_match = _URL_SCHEME_RE.match(trimmed)
     if not scheme_match:
         return False, "openUrl target must specify https:, http:, or mailto: scheme."
 
     scheme = scheme_match.group(1).lower()
-    rest = scheme_match.group(2)
+    rest_pos = scheme_match.end()
     if scheme in {"https", "http"}:
-        if not rest.startswith("//"):
+        if not trimmed.startswith("//", rest_pos):
             return False, f"{scheme}: openUrl target must include // and a host."
         parsed = urlsplit(trimmed)
         if not parsed.netloc or not parsed.hostname or any(ch.isspace() for ch in parsed.netloc):
@@ -180,6 +195,7 @@ def validate_open_url(raw_url: str) -> tuple[bool, str | None]:
             return False, f"{scheme}: openUrl target must not contain userinfo credentials."
         return True, None
     if scheme == "mailto":
+        rest = trimmed[rest_pos:]
         if not rest.strip() or "@" not in rest:
             return False, "mailto: openUrl target must include an email address."
         return True, None
@@ -241,14 +257,14 @@ def _scan_str_for_secrets(
             if not has_underscore:
                 continue
             if low is None:
-                low = text.lower()
+                low = text.casefold()
             if "aws_secret_access_key" not in low:
                 continue
         elif rule_name == "bearer_jwt":
             if not has_dot:
                 continue
             if low is None:
-                low = text.lower()
+                low = text.casefold()
             if "eyj" not in low or "bearer" not in low:
                 continue
         elif rule_name == "raw_jwt":

@@ -159,6 +159,29 @@ class TestRegistryAndCatalog(unittest.TestCase):
             for hit in hits:
                 self.assertNotIn(tok, hit["message"])
 
+        # Unicode casefold equivalence for case-insensitive secret patterns (e.g. U+017F long s)
+        long_s_hits = scan_for_secrets({"val": "AWS_\u017fecret_access_key=0123456789abcdef"})
+        self.assertIn("aws_secret_assignment", {h["rule"] for h in long_s_hits})
+        kelvin_hits = scan_for_secrets({"val": "AWS_SECRET_ACCESS_\u212aEY=0123456789abcdef"})
+        self.assertIn("aws_secret_assignment", {h["rule"] for h in kelvin_hits})
+
+    def test_url_length_bounds(self) -> None:
+        self.assertTrue(validate_open_url("https://example.com/" + ("a" * 16_300))[0])
+        ok_open, reason_open = validate_open_url("https://example.com/" + ("a" * 16_400))
+        self.assertFalse(ok_open)
+        self.assertIn("16384", reason_open or "")
+
+        self.assertTrue(validate_media_url("https://example.com/" + ("a" * 16_300))[0])
+        ok_media, reason_media = validate_media_url("https://example.com/" + ("a" * 16_400))
+        self.assertFalse(ok_media)
+        self.assertIn("16384", reason_media or "")
+
+        self.assertTrue(validate_media_url("data:image/png;base64," + ("A" * 20_000))[0])
+        ok_data, reason_data = validate_media_url("data:image/png;base64," + ("A" * 1_050_000))
+        self.assertFalse(ok_data)
+        self.assertIn("1048576", reason_data or "")
+        self.assertFalse(validate_media_url("  data:image/png;base64," + ("A" * 1_050_000))[0])
+
     def test_docs_lookup_offline_and_live_locations(self) -> None:
         res = search_docs("Checkable", version="1.0", live_locations=True, limit=5)
         self.assertTrue(res["ok"])

@@ -3317,6 +3317,396 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertFalse(res_prev["ok"])
         self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_prev["validation"]["errors"]})
 
+    def test_interpolated_url_length_cap_container_rejection_and_cache_bounds(self) -> None:
+        import time
+        from legends_a2ui.validator import _SAFE_URL_CACHE_MAX_ITEM_LEN, _cache_safe_url
+
+        # 1. Cache entry length cap keeps safe URL cache bounded
+        cache: set[str] = set()
+        short_url = "https://example.com/" + ("a" * 100)
+        long_url = "https://example.com/" + ("a" * (_SAFE_URL_CACHE_MAX_ITEM_LEN + 100))
+        _cache_safe_url(cache, short_url)
+        _cache_safe_url(cache, long_url)
+        self.assertIn(short_url, cache)
+        self.assertNotIn(long_url, cache)
+
+        # 2. Multi-placeholder formatString referencing a large string fails closed before join
+        multi_amp = json.dumps(
+            [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s_amp_multi",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [
+                            {"id": "root", "component": "List", "children": {"componentId": "img", "path": "/items"}},
+                            {
+                                "id": "img",
+                                "component": "Image",
+                                "url": {
+                                    "@call": "formatString",
+                                    "args": {"value": "https://example.com/" + ("${/b}" * 63) + "/${u}"},
+                                },
+                            },
+                        ],
+                        "dataModel": {"b": "a" * 500_000, "items": [{"u": k} for k in range(5)]},
+                    },
+                }
+            ],
+            separators=(",", ":"),
+        )
+        t0 = time.perf_counter()
+        res_amp = validate_payload(multi_amp, version="1.0", strict=True)
+        elapsed_amp = time.perf_counter() - t0
+        self.assertFalse(res_amp["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_amp["errors"]})
+        self.assertLess(elapsed_amp, 0.5)
+
+        # 3. 2-placeholder formatString exceeding 16,384 chars fails closed quickly
+        two_ph_amp = json.dumps(
+            [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s_amp_two",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [
+                            {"id": "root", "component": "List", "children": {"componentId": "img", "path": "/items"}},
+                            {
+                                "id": "img",
+                                "component": "Image",
+                                "url": {
+                                    "@call": "formatString",
+                                    "args": {"value": "https://example.com/${/b}/${u}"},
+                                },
+                            },
+                        ],
+                        "dataModel": {"b": "a" * 500_000, "items": [{"u": k} for k in range(50)]},
+                    },
+                }
+            ],
+            separators=(",", ":"),
+        )
+        t0 = time.perf_counter()
+        res_two = validate_payload(two_ph_amp, version="1.0", strict=True)
+        elapsed_two = time.perf_counter() - t0
+        self.assertFalse(res_two["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_two["errors"]})
+        self.assertLess(elapsed_two, 0.5)
+
+        # 4. Non-scalar dict/list container placeholders fail closed without str(container) serialization
+        dict_msgs: list[dict[str, Any]] = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_dict_ph",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["img", "btn"]},
+                        {
+                            "id": "img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "https://example.com/${/b}"}},
+                        },
+                        {
+                            "id": "btn",
+                            "component": "Button",
+                            "child": "lbl",
+                            "action": {
+                                "functionCall": {
+                                    "@call": "openUrl",
+                                    "args": {
+                                        "url": {
+                                            "@call": "formatString",
+                                            "args": {"value": "https://example.com/${/arr}"},
+                                        }
+                                    },
+                                }
+                            },
+                        },
+                        {"id": "lbl", "component": "Text", "text": "Open"},
+                    ],
+                    "dataModel": {"b": {"pad": "a" * 500_000, "flag": 0}, "arr": ["x", "y"]},
+                },
+            }
+        ]
+        for idx in range(1, 11):
+            dict_msgs.append(
+                {
+                    "version": "1.0",
+                    "updateDataModel": {"surfaceId": "s_dict_ph", "path": "/b/flag", "value": idx},
+                }
+            )
+        t0 = time.perf_counter()
+        res_dict = validate_payload(json.dumps(dict_msgs, separators=(",", ":")), version="1.0", strict=True)
+        elapsed_dict = time.perf_counter() - t0
+        self.assertFalse(res_dict["ok"])
+        err_codes = {e["code"] for e in res_dict["errors"]}
+        self.assertIn("UNSAFE_MEDIA_URL", err_codes)
+        self.assertIn("UNSAFE_OPEN_URL", err_codes)
+        self.assertLess(elapsed_dict, 0.5)
+
+        # 5. data: formatString media template allows up to 262,144 chars and refuses > 262,144 chars
+        data_ok = json.dumps(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_data_ok",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Image",
+                            "url": {
+                                "@call": "formatString",
+                                "args": {"value": "data:image/png;base64,${/chunk}"},
+                            },
+                        }
+                    ],
+                    "dataModel": {"chunk": "A" * 20_000},
+                },
+            }
+        )
+        self.assertTrue(validate_payload(data_ok, version="1.0", strict=True)["ok"])
+
+        data_too_big = json.dumps(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_data_big",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Image",
+                            "url": {
+                                "@call": "formatString",
+                                "args": {"value": "data:image/png;base64,${/chunk}"},
+                            },
+                        }
+                    ],
+                    "dataModel": {"chunk": "A" * 270_000},
+                },
+            }
+        )
+        res_data_big = validate_payload(data_too_big, version="1.0", strict=True)
+        self.assertFalse(res_data_big["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_data_big["errors"]})
+
+        # 6. openUrl formatString rejects interpolated URL > 16,384 chars
+        open_too_big = json.dumps(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_open_big",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Button",
+                            "child": "lbl",
+                            "action": {
+                                "functionCall": {
+                                    "@call": "openUrl",
+                                    "args": {
+                                        "url": {
+                                            "@call": "formatString",
+                                            "args": {"value": "https://example.com/${/seg}"},
+                                        }
+                                    },
+                                }
+                            },
+                        },
+                        {"id": "lbl", "component": "Text", "text": "Go"},
+                    ],
+                    "dataModel": {"seg": "a" * 16_400},
+                },
+            }
+        )
+        res_open_big = validate_payload(open_too_big, version="1.0", strict=True)
+        self.assertFalse(res_open_big["ok"])
+        self.assertIn("UNSAFE_OPEN_URL", {e["code"] for e in res_open_big["errors"]})
+
+    def test_data_model_mutation_depth_limits_and_overdeep_url_pointers(self) -> None:
+        from legends_a2ui.preview_html import render_preview_html
+
+        # 1. Deep updateDataModel graft (ptr_depth + val_depth > max_depth) + over-deep URL pointers fail closed
+        deep_graft = json.dumps(
+            [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s_deep_graft",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [
+                            {"id": "root", "component": "Column", "children": ["img1", "btn1", "img2"]},
+                            {"id": "img1", "component": "Image", "url": {"@path": ("/a" * 68) + "/x"}},
+                            {
+                                "id": "btn1",
+                                "component": "Button",
+                                "child": "lbl1",
+                                "action": {
+                                    "functionCall": {
+                                        "@call": "openUrl",
+                                        "args": {"url": {"@path": ("/a" * 68) + "/x"}},
+                                    }
+                                },
+                            },
+                            {
+                                "id": "img2",
+                                "component": "Image",
+                                "url": {
+                                    "@call": "formatString",
+                                    "args": {"value": "https://example.com${" + ("/a" * 68) + "/spoof}"},
+                                },
+                            },
+                            {"id": "lbl1", "component": "Text", "text": "Go"},
+                        ],
+                    },
+                },
+                {
+                    "version": "1.0",
+                    "updateDataModel": {
+                        "surfaceId": "s_deep_graft",
+                        "path": "/a" * 68,
+                        "value": {"x": "javascript:alert(1)", "spoof": "@evil.example/x.png"},
+                    },
+                },
+            ],
+            separators=(",", ":"),
+        )
+        res_val = validate_payload(deep_graft, version="1.0", strict=True)
+        self.assertFalse(res_val["ok"])
+        val_codes = {e["code"] for e in res_val["errors"]}
+        self.assertIn("MAX_DEPTH_EXCEEDED", val_codes)
+        self.assertIn("UNSAFE_MEDIA_URL", val_codes)
+        self.assertIn("UNSAFE_OPEN_URL", val_codes)
+
+        res_norm = normalize_payload(deep_graft)
+        self.assertFalse(res_norm["ok"])
+        self.assertIn("MAX_DEPTH_EXCEEDED", {e["code"] for e in res_norm["validation"]["errors"]})
+
+        res_prev = render_preview_html(deep_graft)
+        self.assertFalse(res_prev["ok"])
+        self.assertIn("MAX_DEPTH_EXCEEDED", {e["code"] for e in res_prev["validation"]["errors"]})
+
+        # 2. Boundary: ptr_depth 64 + dict val_depth 1 = 65 > 64 fails; ptr_depth 63 + dict val_depth 1 = 64 resolves & validates
+        at_65 = json.dumps(
+            [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s_b65",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [{"id": "root", "component": "Text", "text": "ok"}],
+                    },
+                },
+                {
+                    "version": "1.0",
+                    "updateDataModel": {
+                        "surfaceId": "s_b65",
+                        "path": "/a" * 64,
+                        "value": {"x": "https://example.com/ok.png"},
+                    },
+                },
+            ]
+        )
+        res_65 = validate_payload(at_65, version="1.0", strict=True)
+        self.assertFalse(res_65["ok"])
+        self.assertIn("MAX_DEPTH_EXCEEDED", {e["code"] for e in res_65["errors"]})
+
+        at_64_evil = json.dumps(
+            [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s_b64",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [
+                            {"id": "root", "component": "Image", "url": {"@path": ("/a" * 63) + "/x"}},
+                        ],
+                    },
+                },
+                {
+                    "version": "1.0",
+                    "updateDataModel": {
+                        "surfaceId": "s_b64",
+                        "path": "/a" * 63,
+                        "value": {"x": "javascript:alert(1)"},
+                    },
+                },
+            ]
+        )
+        res_64_evil = validate_payload(at_64_evil, version="1.0", strict=True)
+        self.assertFalse(res_64_evil["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_64_evil["errors"]})
+
+        # 3. v0.8 dataModelUpdate deep contents graft also fails closed with MAX_DEPTH_EXCEEDED
+        v08_deep = json.dumps(
+            [
+                {"beginRendering": {"surfaceId": "s8_deep", "root": "root"}},
+                {
+                    "surfaceUpdate": {
+                        "surfaceId": "s8_deep",
+                        "components": [{"id": "root", "component": {"Text": {"text": {"literalString": "hi"}}}}],
+                    }
+                },
+                {
+                    "dataModelUpdate": {
+                        "surfaceId": "s8_deep",
+                        "path": "/a" * 64,
+                        "contents": [{"key": "x", "valueString": "javascript:alert(1)"}],
+                    }
+                },
+            ]
+        )
+        res_v08_deep = validate_payload(v08_deep, version="0.8", strict=False)
+        self.assertFalse(res_v08_deep["ok"])
+        self.assertIn("MAX_DEPTH_EXCEEDED", {e["code"] for e in res_v08_deep["errors"]})
+
+        # 4. Deep null deletion remains a fast ok: True no-op
+        deep_del = json.dumps(
+            [
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": "s_deep_del",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [{"id": "root", "component": "Text", "text": "ok"}],
+                    },
+                },
+                {
+                    "version": "1.0",
+                    "updateDataModel": {
+                        "surfaceId": "s_deep_del",
+                        "path": "/a" * 25_000,
+                        "value": None,
+                    },
+                },
+            ]
+        )
+        res_del = validate_payload(deep_del, version="1.0", strict=True)
+        self.assertTrue(res_del["ok"], res_del["errors"])
+
+        # 5. Over-deep relative pointer inside ChildList template fails closed with UNSAFE_MEDIA_URL
+        rel_deep = json.dumps(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_rel_deep",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "img", "path": "/items"}},
+                        {"id": "img", "component": "Image", "url": {"@path": ("a/" * 68) + "u"}},
+                    ],
+                    "dataModel": {"items": [{"u": "https://example.com/a.png"}]},
+                },
+            }
+        )
+        res_rel = validate_payload(rel_deep, version="1.0", strict=True)
+        self.assertFalse(res_rel["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_rel["errors"]})
+
 
 if __name__ == "__main__":
     unittest.main()

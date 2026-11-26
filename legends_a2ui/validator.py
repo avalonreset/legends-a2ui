@@ -5,12 +5,18 @@ from functools import lru_cache
 import re
 from typing import Any
 
-from legends_a2ui.parser import DEFAULT_MAX_BYTES, DEFAULT_MAX_DEPTH, parse_payload
+from legends_a2ui.parser import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_DEPTH,
+    _measure_object_depth,
+    parse_payload,
+)
 from legends_a2ui.spec_registry import (
     BROKEN_V09_CATALOG_ID,
     CANONICAL_V08_CATALOG_ID,
     CANONICAL_V09_CATALOG_ID,
     CANONICAL_V1_CATALOG_ID,
+    _URL_CTRL_CHAR_RE,
     is_valid_uax31_id,
     load_catalog_spec,
     scan_for_secrets,
@@ -495,7 +501,24 @@ def _resolve_pointer_with_context(
 _FORMAT_EXPR_RE = re.compile(r"\$\{([^}]+)\}")
 _MAX_FORMAT_URL_PLACEHOLDERS = 64
 _MAX_FORMAT_URL_NON_DATA_LEN = 16_384
+_MAX_FORMAT_URL_DATA_LEN = 262_144
 _SAFE_URL_CACHE_MAX = 4096
+_SAFE_URL_CACHE_MAX_ITEM_LEN = 2048
+
+
+def _is_pointer_too_deep(ptr: str, max_segments: int) -> bool:
+    """Return True when an RFC 6901 pointer (absolute or relative) exceeds max_segments."""
+    if ptr.startswith("/"):
+        return len(ptr) > max_segments and ptr.count("/") > max_segments
+    return len(ptr) >= max_segments and ptr.count("/") >= max_segments
+
+
+def _cache_safe_url(safe_url_cache: set[str] | None, candidate_url: str) -> None:
+    """Insert a verified safe URL into cache only when its length is within cache item cap."""
+    if safe_url_cache is not None and len(candidate_url) <= _SAFE_URL_CACHE_MAX_ITEM_LEN:
+        if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
+            safe_url_cache.clear()
+        safe_url_cache.add(candidate_url)
 
 
 @lru_cache(maxsize=4096)
@@ -503,9 +526,11 @@ def _parse_format_string_template(
     tpl: str,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str]:
     """Parse and validate a formatString URL template once into literal segments and pointer expressions."""
-    if len(tpl) > _MAX_FORMAT_URL_NON_DATA_LEN and not tpl[:16].lstrip().lower().startswith("data:"):
+    if len(tpl) > 1_048_576:
         return ("err_too_long", (), (), False, "", 1, "")
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in tpl):
+    if len(tpl) > _MAX_FORMAT_URL_NON_DATA_LEN and tpl.lstrip()[:5].lower() != "data:":
+        return ("err_too_long", (), (), False, "", 1, "")
+    if _URL_CTRL_CHAR_RE.search(tpl):
         return ("err_ctrl", (), (), False, "", 1, "")
     if "${" not in tpl:
         return ("static", (tpl,), (), bool(tpl.strip()), tpl, 1, tpl)
@@ -549,10 +574,8 @@ def _check_url_with_cache(
     if uncached_counter is not None:
         uncached_counter[0] += 1
     ok_u, reason_u = validator_fn(candidate_url)
-    if ok_u and safe_url_cache is not None:
-        if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
-            safe_url_cache.clear()
-        safe_url_cache.add(candidate_url)
+    if ok_u:
+        _cache_safe_url(safe_url_cache, candidate_url)
     return ok_u, reason_u
 
 
@@ -572,6 +595,9 @@ def _validate_url_function_call(
     safe_url_cache: set[str] | None = None,
     uncached_counter: list[int] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
+    eval_counter: list[int] | None = None,
+    max_evals: int | None = None,
+    budget_exceeded: list[bool] | None = None,
 ) -> None:
     fn_name = fn_obj.get("@call") if "@call" in fn_obj else fn_obj.get("call")
     args = fn_obj.get("args") if isinstance(fn_obj.get("args"), dict) else {}
@@ -652,41 +678,156 @@ def _validate_url_function_call(
             )
             return
 
-        # Interpolate resolvable placeholders in a single pass and validate placeholder, resolved, and empty-unresolved forms.
+        is_data_media_tpl = kind == "media" and parts[0].lstrip()[:5].lower() == "data:"
+        max_interp_len = _MAX_FORMAT_URL_DATA_LEN if is_data_media_tpl else _MAX_FORMAT_URL_NON_DATA_LEN
+
+        def _charge_interp_evals(interp_len: int) -> bool:
+            if eval_counter is None or max_evals is None:
+                return True
+            extra_kb = interp_len // 1024
+            if extra_kb <= 0:
+                return True
+            if eval_counter[0] + extra_kb > max_evals:
+                if budget_exceeded is None or not budget_exceeded[0]:
+                    if budget_exceeded is not None:
+                        budget_exceeded[0] = True
+                    _add_issue(
+                        errors,
+                        "MAX_TEMPLATE_EVALS_EXCEEDED",
+                        block_index,
+                        path,
+                        f"Payload URL slot evaluations exceeded limit ({max_evals}).",
+                    )
+                return False
+            eval_counter[0] += extra_kb
+            return True
+
+        # Interpolate resolvable placeholders in a single pass with strict depth, scalar, length, and budget bounds.
         if len(exprs) == 1:
+            expr0 = exprs[0]
+            if _is_pointer_too_deep(expr0, max_segments):
+                _add_issue(
+                    errors,
+                    code,
+                    block_index,
+                    path,
+                    f"formatString {kind} URL placeholder '${{{expr0}}}' exceeds maximum pointer depth ({max_segments}).",
+                )
+                return
             found, val = _resolve_pointer_with_context(
-                data_model, exprs[0], item_ctx, max_segments=max_segments
+                data_model, expr0, item_ctx, max_segments=max_segments
             )
             if found:
+                if isinstance(val, (dict, list)):
+                    _add_issue(
+                        errors,
+                        code,
+                        block_index,
+                        path,
+                        f"formatString {kind} URL placeholder '${{{expr0}}}' resolved to a non-scalar container value.",
+                    )
+                    return
                 all_resolved = True
                 any_resolved = True
-                s_val = "" if val is None else str(val)
+                s_val = "" if val is None else (val if type(val) is str else str(val))
+                interp_len = len(parts[0]) + len(s_val) + len(parts[1])
+                if interp_len > max_interp_len:
+                    _add_issue(
+                        errors,
+                        code,
+                        block_index,
+                        path,
+                        f"Interpolated {kind} URL exceeds maximum length ({max_interp_len} chars).",
+                    )
+                    return
+                if not _charge_interp_evals(interp_len):
+                    return
                 resolved_str = f"{parts[0]}{s_val}{parts[1]}"
                 empty_unresolved_str = resolved_str
             else:
+                if len(placeholder_str) > max_interp_len:
+                    _add_issue(
+                        errors,
+                        code,
+                        block_index,
+                        path,
+                        f"Interpolated {kind} URL exceeds maximum length ({max_interp_len} chars).",
+                    )
+                    return
                 all_resolved = False
                 any_resolved = False
                 resolved_str = placeholder_str
                 empty_unresolved_str = f"{parts[0]}{parts[1]}"
         else:
+            res_len = len(parts[0])
+            if res_len > max_interp_len:
+                _add_issue(
+                    errors,
+                    code,
+                    block_index,
+                    path,
+                    f"Interpolated {kind} URL exceeds maximum length ({max_interp_len} chars).",
+                )
+                return
             all_resolved = True
             any_resolved = False
             res_chunks: list[str] = [parts[0]]
             emp_chunks: list[str] = [parts[0]]
             for idx_e, expr in enumerate(exprs):
+                if _is_pointer_too_deep(expr, max_segments):
+                    _add_issue(
+                        errors,
+                        code,
+                        block_index,
+                        path,
+                        f"formatString {kind} URL placeholder '${{{expr}}}' exceeds maximum pointer depth ({max_segments}).",
+                    )
+                    return
                 found, val = _resolve_pointer_with_context(
                     data_model, expr, item_ctx, max_segments=max_segments
                 )
+                next_part = parts[idx_e + 1]
                 if found:
+                    if isinstance(val, (dict, list)):
+                        _add_issue(
+                            errors,
+                            code,
+                            block_index,
+                            path,
+                            f"formatString {kind} URL placeholder '${{{expr}}}' resolved to a non-scalar container value.",
+                        )
+                        return
                     any_resolved = True
-                    s_val = "" if val is None else str(val)
+                    s_val = "" if val is None else (val if type(val) is str else str(val))
+                    res_len += len(s_val) + len(next_part)
+                    if res_len > max_interp_len:
+                        _add_issue(
+                            errors,
+                            code,
+                            block_index,
+                            path,
+                            f"Interpolated {kind} URL exceeds maximum length ({max_interp_len} chars).",
+                        )
+                        return
                     res_chunks.append(s_val)
                     emp_chunks.append(s_val)
                 else:
                     all_resolved = False
+                    res_len += 11 + len(next_part)
+                    if res_len > max_interp_len:
+                        _add_issue(
+                            errors,
+                            code,
+                            block_index,
+                            path,
+                            f"Interpolated {kind} URL exceeds maximum length ({max_interp_len} chars).",
+                        )
+                        return
                     res_chunks.append("placeholder")
-                res_chunks.append(parts[idx_e + 1])
-                emp_chunks.append(parts[idx_e + 1])
+                res_chunks.append(next_part)
+                emp_chunks.append(next_part)
+            if not _charge_interp_evals(res_len):
+                return
             resolved_str = "".join(res_chunks)
             empty_unresolved_str = resolved_str if all_resolved else "".join(emp_chunks)
 
@@ -822,6 +963,9 @@ def _validate_dynamic_value(
     template_validated_url_paths: frozenset[str] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
     safe_open_urls: set[str] | None = None,
+    eval_counter: list[int] | None = None,
+    max_evals: int | None = None,
+    budget_exceeded: list[bool] | None = None,
 ) -> None:
     """Validate DynamicValue, DataBinding (@path), FunctionCall (@call), arrays, and single-@ escape."""
     if isinstance(val, list):
@@ -989,6 +1133,9 @@ def _validate_dynamic_value(
                     is_superseded=is_superseded,
                     safe_url_cache=safe_open_urls,
                     max_segments=max_segments,
+                    eval_counter=eval_counter,
+                    max_evals=max_evals,
+                    budget_exceeded=budget_exceeded,
                 )
             for ak, av in args.items():
                 _validate_dynamic_value(
@@ -1102,6 +1249,9 @@ def _validate_open_url_arg(
     safe_url_cache: set[str] | None = None,
     uncached_counter: list[int] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
+    eval_counter: list[int] | None = None,
+    max_evals: int | None = None,
+    budget_exceeded: list[bool] | None = None,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = raw_url_val
@@ -1122,12 +1272,24 @@ def _validate_open_url_arg(
                 safe_url_cache=safe_url_cache,
                 uncached_counter=uncached_counter,
                 max_segments=max_segments,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
             )
             return
         keys = set(raw_url_val.keys())
         if keys in ({"@path"}, {"path"}):
             ptr = raw_url_val.get("@path") if "@path" in raw_url_val else raw_url_val.get("path")
             if isinstance(ptr, str) and ptr:
+                if _is_pointer_too_deep(ptr, max_segments):
+                    _add_issue(
+                        errors,
+                        "UNSAFE_OPEN_URL",
+                        block_index,
+                        path,
+                        f"openUrl DataBinding path exceeds maximum pointer depth ({max_segments}).",
+                    )
+                    return
                 found, resolved = _resolve_pointer_with_context(
                     data_model, ptr, item_ctx, max_segments=max_segments
                 )
@@ -1147,10 +1309,8 @@ def _validate_open_url_arg(
         uncached_counter[0] += 1
     ok, reason = validate_open_url(candidate)
     if ok:
-        if safe_url_cache is not None and type(candidate) is str:
-            if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
-                safe_url_cache.clear()
-            safe_url_cache.add(candidate)
+        if type(candidate) is str:
+            _cache_safe_url(safe_url_cache, candidate)
         return
     _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, reason or "Unsafe openUrl target.")
 
@@ -1171,6 +1331,9 @@ def _validate_media_prop(
     safe_url_cache: set[str] | None = None,
     uncached_counter: list[int] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
+    eval_counter: list[int] | None = None,
+    max_evals: int | None = None,
+    budget_exceeded: list[bool] | None = None,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = val
@@ -1197,10 +1360,8 @@ def _validate_media_prop(
                     ok_lit, reason_lit = validate_media_url(lit_val)
                     if ok_lit:
                         lit_ok = True
-                        if safe_url_cache is not None and type(lit_val) is str:
-                            if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
-                                safe_url_cache.clear()
-                            safe_url_cache.add(lit_val)
+                        if type(lit_val) is str:
+                            _cache_safe_url(safe_url_cache, lit_val)
                     else:
                         _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason_lit or "Unsafe media URL.")
                 if not lit_ok:
@@ -1210,6 +1371,15 @@ def _validate_media_prop(
             ptr = val.get("path")
             if not isinstance(ptr, str) or not ptr:
                 _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, "v0.8 media URL 'path' must be a non-empty string.")
+                return
+            if _is_pointer_too_deep(ptr, max_segments):
+                _add_issue(
+                    errors,
+                    "UNSAFE_MEDIA_URL",
+                    block_index,
+                    path,
+                    f"v0.8 media URL path exceeds maximum pointer depth ({max_segments}).",
+                )
                 return
             found, resolved = _resolve_pointer_with_context(
                 data_model, ptr, item_ctx, max_segments=max_segments
@@ -1233,6 +1403,9 @@ def _validate_media_prop(
                 safe_url_cache=safe_url_cache,
                 uncached_counter=uncached_counter,
                 max_segments=max_segments,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
             )
             return
         elif "literalString" in val:
@@ -1249,6 +1422,15 @@ def _validate_media_prop(
             if keys in ({"@path"}, {"path"}):
                 ptr = val.get("@path") if "@path" in val else val.get("path")
                 if isinstance(ptr, str) and ptr:
+                    if _is_pointer_too_deep(ptr, max_segments):
+                        _add_issue(
+                            errors,
+                            "UNSAFE_MEDIA_URL",
+                            block_index,
+                            path,
+                            f"Media URL DataBinding path exceeds maximum pointer depth ({max_segments}).",
+                        )
+                        return
                     found, resolved = _resolve_pointer_with_context(
                         data_model, ptr, item_ctx, max_segments=max_segments
                     )
@@ -1268,10 +1450,8 @@ def _validate_media_prop(
         uncached_counter[0] += 1
     ok, reason = validate_media_url(candidate)
     if ok:
-        if safe_url_cache is not None and type(candidate) is str:
-            if len(safe_url_cache) >= _SAFE_URL_CACHE_MAX:
-                safe_url_cache.clear()
-            safe_url_cache.add(candidate)
+        if type(candidate) is str:
+            _cache_safe_url(safe_url_cache, candidate)
         return
     _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason or "Unsafe media URL.")
 
@@ -1328,6 +1508,9 @@ def _validate_action(
     template_validated_url_paths: frozenset[str] | None = None,
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
     safe_open_urls: set[str] | None = None,
+    eval_counter: list[int] | None = None,
+    max_evals: int | None = None,
+    budget_exceeded: list[bool] | None = None,
 ) -> None:
     if not isinstance(action, dict):
         _add_issue(errors, "INVALID_ACTION", block_index, path, "Button action must be an object.")
@@ -1434,6 +1617,9 @@ def _validate_action(
             template_validated_url_paths=template_validated_url_paths,
             max_segments=max_segments,
             safe_open_urls=safe_open_urls,
+            eval_counter=eval_counter,
+            max_evals=max_evals,
+            budget_exceeded=budget_exceeded,
         )
 
 
@@ -1544,6 +1730,9 @@ def _validate_surface_components(
     max_segments: int = DEFAULT_MAX_DEPTH + 4,
     safe_media_urls: set[str] | None = None,
     safe_open_urls: set[str] | None = None,
+    eval_counter: list[int] | None = None,
+    max_evals: int | None = None,
+    budget_exceeded: list[bool] | None = None,
 ) -> int:
     catalog = load_catalog_spec(version)
     catalog_components = catalog["components"]
@@ -2145,6 +2334,9 @@ def _validate_surface_components(
                     template_validated_url_paths=template_validated_url_paths,
                     max_segments=max_segments,
                     safe_open_urls=safe_open_urls,
+                    eval_counter=eval_counter,
+                    max_evals=max_evals,
+                    budget_exceeded=budget_exceeded,
                 )
 
             if comp_type in _MEDIA_URL_PROPS:
@@ -2168,6 +2360,9 @@ def _validate_surface_components(
                             is_superseded=is_superseded,
                             safe_url_cache=safe_media_urls,
                             max_segments=max_segments,
+                            eval_counter=eval_counter,
+                            max_evals=max_evals,
+                            budget_exceeded=budget_exceeded,
                         )
             elif is_custom_catalog:
                 for media_prop in ("url", "posterUrl"):
@@ -2190,6 +2385,9 @@ def _validate_surface_components(
                             is_superseded=is_superseded,
                             safe_url_cache=safe_media_urls,
                             max_segments=max_segments,
+                            eval_counter=eval_counter,
+                            max_evals=max_evals,
+                            budget_exceeded=budget_exceeded,
                         )
 
     # Check root presence
@@ -2308,11 +2506,12 @@ def validate_payload(
     max_ptr_segments = max_depth + 4
     max_surface_url_evals = max(100_000, max_bytes // 8)
     max_surface_uncached_url_checks = max(30_000, max_bytes // 35)
-    payload_url_slot_evals = 0
+    payload_url_slot_evals: list[int] = [0]
     payload_uncached_url_checks: list[int] = [0]
     payload_tpl_rescan_evals: list[int] = [0]
     payload_tpl_abs_eval_count: list[int] = [0]
     payload_budget_exceeded = False
+    payload_budget_flag: list[bool] = [False]
     safe_media_urls: set[str] = set()
     safe_open_urls: set[str] = set()
 
@@ -2400,14 +2599,16 @@ def validate_payload(
             item_idx: int | None = None,
             is_historical_snapshot: bool = True,
         ) -> bool:
-            nonlocal payload_url_slot_evals, payload_budget_exceeded
+            nonlocal payload_budget_exceeded
             if (
                 payload_budget_exceeded
-                or payload_url_slot_evals >= max_surface_url_evals
+                or payload_budget_flag[0]
+                or payload_url_slot_evals[0] >= max_surface_url_evals
                 or payload_uncached_url_checks[0] >= max_surface_uncached_url_checks
             ):
-                if not payload_budget_exceeded:
+                if not payload_budget_exceeded and not payload_budget_flag[0]:
                     payload_budget_exceeded = True
+                    payload_budget_flag[0] = True
                     _add_issue(
                         tmp_errors,
                         "MAX_TEMPLATE_EVALS_EXCEEDED",
@@ -2415,6 +2616,8 @@ def validate_payload(
                         f"surface:{sid_slot}",
                         f"Payload URL slot evaluations exceeded limit ({max_surface_url_evals}).",
                     )
+                else:
+                    payload_budget_exceeded = True
                 return False
 
             kind, slot_path, raw_val, _abs_p, _rel_p, comp_cpath, slot_suffix = slot
@@ -2431,9 +2634,10 @@ def validate_payload(
                             parsed_fmt = _parse_format_string_template(tpl_s)
                             eval_cost = parsed_fmt[5]
 
-            if payload_url_slot_evals + eval_cost > max_surface_url_evals:
-                if not payload_budget_exceeded:
+            if payload_url_slot_evals[0] + eval_cost > max_surface_url_evals:
+                if not payload_budget_exceeded and not payload_budget_flag[0]:
                     payload_budget_exceeded = True
+                    payload_budget_flag[0] = True
                     _add_issue(
                         tmp_errors,
                         "MAX_TEMPLATE_EVALS_EXCEEDED",
@@ -2441,17 +2645,46 @@ def validate_payload(
                         f"surface:{sid_slot}",
                         f"Payload URL slot evaluations exceeded limit ({max_surface_url_evals}).",
                     )
+                else:
+                    payload_budget_exceeded = True
                 return False
-            payload_url_slot_evals += eval_cost
+            payload_url_slot_evals[0] += eval_cost
 
             if parsed_fmt is not None:
                 st, pts, exs, pfx_ne, ph_s, _cost, emp_s = parsed_fmt
-                if st == "ok" and pfx_ne and len(exs) == 1 and ph_s in cache:
+                if (
+                    st == "ok"
+                    and pfx_ne
+                    and len(exs) == 1
+                    and ph_s in cache
+                    and not _is_pointer_too_deep(exs[0], max_ptr_segments)
+                ):
                     f_ex, v_ex = _resolve_pointer_with_context(dm, exs[0], item_ctx, max_ptr_segments)
                     if f_ex:
-                        r_str = f"{pts[0]}{'' if v_ex is None else v_ex}{pts[1]}"
-                        if r_str in cache:
-                            return True
+                        if not isinstance(v_ex, (dict, list)):
+                            s_ex = "" if v_ex is None else (v_ex if type(v_ex) is str else str(v_ex))
+                            est_len = len(pts[0]) + len(s_ex) + len(pts[1])
+                            if est_len <= _SAFE_URL_CACHE_MAX_ITEM_LEN:
+                                r_str = f"{pts[0]}{s_ex}{pts[1]}"
+                                if r_str in cache:
+                                    extra_kb = est_len // 1024
+                                    if extra_kb > 0:
+                                        if payload_url_slot_evals[0] + extra_kb > max_surface_url_evals:
+                                            if not payload_budget_exceeded and not payload_budget_flag[0]:
+                                                payload_budget_exceeded = True
+                                                payload_budget_flag[0] = True
+                                                _add_issue(
+                                                    tmp_errors,
+                                                    "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                                    bidx,
+                                                    f"surface:{sid_slot}",
+                                                    f"Payload URL slot evaluations exceeded limit ({max_surface_url_evals}).",
+                                                )
+                                            else:
+                                                payload_budget_exceeded = True
+                                            return False
+                                        payload_url_slot_evals[0] += extra_kb
+                                    return True
                     elif emp_s in cache:
                         return True
             elif isinstance(raw_val, dict) and not ("@call" in raw_val or "call" in raw_val):
@@ -2463,7 +2696,7 @@ def validate_payload(
                 )
                 if is_simple_binding:
                     ptr = raw_val.get("@path") if "@path" in raw_val else raw_val.get("path")
-                    if isinstance(ptr, str) and ptr:
+                    if isinstance(ptr, str) and ptr and not _is_pointer_too_deep(ptr, max_ptr_segments):
                         found, resolved = _resolve_pointer_with_context(dm, ptr, item_ctx, max_ptr_segments)
                         if not found:
                             return True
@@ -2477,9 +2710,7 @@ def validate_payload(
                                 else validate_open_url(resolved)
                             )
                             if ok_u:
-                                if len(cache) >= _SAFE_URL_CACHE_MAX:
-                                    cache.clear()
-                                cache.add(resolved)
+                                _cache_safe_url(cache, resolved)
                                 return True
             target_path = f"{comp_cpath}[item:{item_idx}]{slot_suffix}" if item_idx is not None else slot_path
             if kind == "media":
@@ -2497,6 +2728,9 @@ def validate_payload(
                     safe_url_cache=cache,
                     uncached_counter=payload_uncached_url_checks,
                     max_segments=max_ptr_segments,
+                    eval_counter=payload_url_slot_evals,
+                    max_evals=max_surface_url_evals,
+                    budget_exceeded=payload_budget_flag,
                 )
             else:
                 _validate_open_url_arg(
@@ -2512,7 +2746,13 @@ def validate_payload(
                     safe_url_cache=cache,
                     uncached_counter=payload_uncached_url_checks,
                     max_segments=max_ptr_segments,
+                    eval_counter=payload_url_slot_evals,
+                    max_evals=max_surface_url_evals,
+                    budget_exceeded=payload_budget_flag,
                 )
+            if payload_budget_flag[0]:
+                payload_budget_exceeded = True
+                return False
             return True
 
         def _get_surface_ptr_index(
@@ -3635,7 +3875,7 @@ def validate_payload(
             _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
 
         def _flush_surface(sid_to_flush: str) -> None:
-            nonlocal total_components
+            nonlocal total_components, payload_budget_exceeded
             batches = surface_component_batches.pop(sid_to_flush, None)
             dm = surface_data_models.pop(sid_to_flush, {})
             scat = surface_catalog_ids.pop(sid_to_flush, None)
@@ -3754,7 +3994,12 @@ def validate_payload(
                 max_segments=max_ptr_segments,
                 safe_media_urls=safe_media_urls,
                 safe_open_urls=safe_open_urls,
+                eval_counter=payload_url_slot_evals,
+                max_evals=max_surface_url_evals,
+                budget_exceeded=payload_budget_flag,
             )
+            if payload_budget_flag[0]:
+                payload_budget_exceeded = True
             _emit_surface_issues(sid_to_flush, flush_errors, flush_warnings)
             _clear_surface_stream_state(sid_to_flush)
 
@@ -4011,14 +4256,48 @@ def validate_payload(
                         surface_data_models[sid] = {}
                         mutated = True
                     elif isinstance(body.get("value"), dict):
-                        surface_data_models[sid] = body["value"]
-                        mutated = True
+                        val_obj = body["value"]
+                        val_depth = _measure_object_depth(val_obj, max_depth)
+                        if val_depth > max_depth:
+                            _add_issue(
+                                errors,
+                                "MAX_DEPTH_EXCEEDED",
+                                bidx,
+                                f"{mpath}.updateDataModel.value",
+                                f"updateDataModel value depth exceeds max_depth ({max_depth}).",
+                            )
+                        else:
+                            surface_data_models[sid] = val_obj
+                            mutated = True
                 elif isinstance(ptr, str) and ptr.startswith("/") and "value" in body:
-                    dm = surface_data_models.setdefault(sid, {})
-                    effective_ptr, popped_idx = _mutate_json_pointer(
-                        dm, ptr, body["value"], max_segments=max_ptr_segments
-                    )
-                    mutated = True
+                    val_obj = body["value"]
+                    if val_obj is not None:
+                        ptr_depth = ptr.count("/")
+                        val_depth = (
+                            _measure_object_depth(val_obj, max_depth)
+                            if isinstance(val_obj, (dict, list))
+                            else 0
+                        )
+                        if ptr_depth > max_depth or ptr_depth + val_depth > max_depth:
+                            _add_issue(
+                                errors,
+                                "MAX_DEPTH_EXCEEDED",
+                                bidx,
+                                f"{mpath}.updateDataModel.path",
+                                f"updateDataModel combined depth ({ptr_depth + val_depth}) exceeds max_depth ({max_depth}).",
+                            )
+                        else:
+                            dm = surface_data_models.setdefault(sid, {})
+                            effective_ptr, popped_idx = _mutate_json_pointer(
+                                dm, ptr, val_obj, max_segments=max_ptr_segments
+                            )
+                            mutated = True
+                    else:
+                        dm = surface_data_models.setdefault(sid, {})
+                        effective_ptr, popped_idx = _mutate_json_pointer(
+                            dm, ptr, None, max_segments=max_ptr_segments
+                        )
+                        mutated = True
                 if mutated and isinstance(effective_ptr, str):
                     _validate_streaming_data_update(sid, effective_ptr, popped_idx=popped_idx)
 
@@ -4201,30 +4480,81 @@ def validate_payload(
                     v08_merged_keys: list[str] | None = None
                     if isinstance(contents, list):
                         conv_val = _convert_v08_contents(contents)
-                        if ptr in {"", "/"}:
+                        ptr_is_root = ptr in {"", "/"}
+                        ptr_is_abs = isinstance(ptr, str) and ptr.startswith("/")
+                        ptr_depth = 0 if ptr_is_root else (ptr.count("/") if ptr_is_abs else 0)
+                        val_depth = (
+                            _measure_object_depth(conv_val, max_depth)
+                            if isinstance(conv_val, (dict, list))
+                            else 0
+                        )
+                        if (ptr_is_root or ptr_is_abs) and (
+                            ptr_depth > max_depth or ptr_depth + val_depth > max_depth
+                        ):
+                            _add_issue(
+                                errors,
+                                "MAX_DEPTH_EXCEEDED",
+                                bidx,
+                                f"{mpath}.dataModelUpdate.path",
+                                f"dataModelUpdate combined depth ({ptr_depth + val_depth}) exceeds max_depth ({max_depth}).",
+                            )
+                        elif ptr_is_root:
                             dm = surface_data_models.setdefault(sid, {})
                             dm.update(conv_val)
                             v08_merged_keys = list(conv_val.keys())
-                        elif isinstance(ptr, str) and ptr.startswith("/"):
+                        elif ptr_is_abs:
                             dm = surface_data_models.setdefault(sid, {})
                             effective_ptr, popped_idx = _mutate_json_pointer(
                                 dm, ptr, conv_val, max_segments=max_ptr_segments
                             )
                             mutated = True
                     elif "value" in body:
+                        val_obj = body["value"]
                         if ptr in {"", "/"}:
-                            if body.get("value") is None:
+                            if val_obj is None:
                                 surface_data_models[sid] = {}
                                 mutated = True
-                            elif isinstance(body.get("value"), dict):
-                                surface_data_models[sid] = body["value"]
-                                mutated = True
+                            elif isinstance(val_obj, dict):
+                                val_depth = _measure_object_depth(val_obj, max_depth)
+                                if val_depth > max_depth:
+                                    _add_issue(
+                                        errors,
+                                        "MAX_DEPTH_EXCEEDED",
+                                        bidx,
+                                        f"{mpath}.dataModelUpdate.value",
+                                        f"dataModelUpdate value depth exceeds max_depth ({max_depth}).",
+                                    )
+                                else:
+                                    surface_data_models[sid] = val_obj
+                                    mutated = True
                         elif isinstance(ptr, str) and ptr.startswith("/"):
-                            dm = surface_data_models.setdefault(sid, {})
-                            effective_ptr, popped_idx = _mutate_json_pointer(
-                                dm, ptr, body["value"], max_segments=max_ptr_segments
-                            )
-                            mutated = True
+                            if val_obj is not None:
+                                ptr_depth = ptr.count("/")
+                                val_depth = (
+                                    _measure_object_depth(val_obj, max_depth)
+                                    if isinstance(val_obj, (dict, list))
+                                    else 0
+                                )
+                                if ptr_depth > max_depth or ptr_depth + val_depth > max_depth:
+                                    _add_issue(
+                                        errors,
+                                        "MAX_DEPTH_EXCEEDED",
+                                        bidx,
+                                        f"{mpath}.dataModelUpdate.path",
+                                        f"dataModelUpdate combined depth ({ptr_depth + val_depth}) exceeds max_depth ({max_depth}).",
+                                    )
+                                else:
+                                    dm = surface_data_models.setdefault(sid, {})
+                                    effective_ptr, popped_idx = _mutate_json_pointer(
+                                        dm, ptr, val_obj, max_segments=max_ptr_segments
+                                    )
+                                    mutated = True
+                            else:
+                                dm = surface_data_models.setdefault(sid, {})
+                                effective_ptr, popped_idx = _mutate_json_pointer(
+                                    dm, ptr, None, max_segments=max_ptr_segments
+                                )
+                                mutated = True
                     if v08_merged_keys is not None:
                         for merged_k in v08_merged_keys:
                             if payload_budget_exceeded:
