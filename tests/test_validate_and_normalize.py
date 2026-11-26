@@ -5022,6 +5022,280 @@ class TestValidateAndNormalize(unittest.TestCase):
         found_cycles = _detect_cycles_iterative(dense_adj)
         self.assertEqual(len(found_cycles), 64)
 
+    def test_template_scope_cache_child_ref_dedup_and_issue_caps(self) -> None:
+        """Template scope caching, child-ref deduplication, and priority-preserving issue caps stay linear and fail closed."""
+        # 1a. Dense unique-edge DAG with nested ChildList under repeated updateDataModel stays fast via surface scope cache
+        n_lists, n_mid, n_leaf = 40, 120, 120
+        s_ids = [f"s{j}" for j in range(n_leaf)]
+        d_ids = [f"d{i}" for i in range(n_mid)]
+        comps_dense_dag = (
+            [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(n_lists)]}]
+            + [{"id": f"l{k}", "component": "List", "children": {"componentId": f"r{k}", "path": "/g"}} for k in range(n_lists)]
+            + [{"id": f"r{k}", "component": "Column", "children": d_ids + ["sub_lst"]} for k in range(n_lists)]
+            + [{"id": f"d{i}", "component": "Column", "children": s_ids} for i in range(n_mid)]
+            + [{"id": f"s{j}", "component": "Divider"} for j in range(n_leaf)]
+            + [
+                {"id": "sub_lst", "component": "List", "children": {"componentId": "leaf", "path": "sub"}},
+                {"id": "leaf", "component": "Image", "url": {"@path": "u"}},
+            ]
+        )
+        msgs_dense_ok = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_scope_dag",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_dense_dag,
+                    "dataModel": {"g": [1]},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_scope_dag", "path": "/g", "value": [1]}}
+            for _ in range(300)
+        ]
+        raw_dense_ok = json.dumps(msgs_dense_ok, separators=(",", ":"))
+        t0 = time.perf_counter()
+        res_dense_ok = validate_payload(raw_dense_ok, version="1.0", strict=True)
+        self.assertTrue(res_dense_ok["ok"], res_dense_ok["errors"])
+        self.assertLess(time.perf_counter() - t0, 0.35)
+
+        # Nested unsafe URL on the same dense DAG is still caught fail-closed
+        msgs_dense_bad = list(msgs_dense_ok[:10]) + [
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "s_scope_dag",
+                    "path": "/g",
+                    "value": [{"sub": [{"u": "javascript:alert(1)"}]}],
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_scope_dag", "path": "/g", "value": [1]}},
+        ]
+        res_dense_bad = validate_payload(json.dumps(msgs_dense_bad, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_dense_bad["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_dense_bad["errors"]})
+
+        # 1b. Repeated valid child IDs ["d"] * 50_000 under nested ChildList updates stay fast and still catch unsafe nested URLs
+        comps_rep_child = (
+            [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(120)]}]
+            + [{"id": f"l{k}", "component": "List", "children": {"componentId": f"r{k}", "path": "/g"}} for k in range(120)]
+            + [{"id": f"r{k}", "component": "Column", "children": ["c0"]} for k in range(120)]
+            + [
+                {"id": "c0", "component": "Column", "children": ["sub_lst"] + ["d"] * 50_000},
+                {"id": "d", "component": "Divider"},
+                {"id": "sub_lst", "component": "List", "children": {"componentId": "leaf", "path": "sub"}},
+                {"id": "leaf", "component": "Image", "url": {"@path": "u"}},
+            ]
+        )
+        msgs_rep_ok = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_rep_child",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_rep_child,
+                    "dataModel": {"g": [1]},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_rep_child", "path": "/g", "value": [1]}}
+            for _ in range(100)
+        ]
+        raw_rep_ok = json.dumps(msgs_rep_ok, separators=(",", ":"))
+        t1 = time.perf_counter()
+        res_rep_ok = validate_payload(raw_rep_ok, version="1.0", strict=True)
+        self.assertTrue(res_rep_ok["ok"], res_rep_ok["errors"])
+        self.assertLess(time.perf_counter() - t1, 0.35)
+
+        msgs_rep_bad = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_rep_bad",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_rep_child,
+                    "dataModel": {"g": [{"sub": [{"u": "javascript:alert(1)"}]}]},
+                },
+            }
+        ]
+        res_rep_bad = validate_payload(json.dumps(msgs_rep_bad, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_rep_bad["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_rep_bad["errors"]})
+
+        # 2. 32,000+ distinct dangling IDs complete in linear time with capped errors while preserving UNSAFE_MEDIA_URL
+        dangling_ids = [f"m{i:05d}" for i in range(35_000)]
+        msg_dangling = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s_dang",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": dangling_ids + ["bad_img"]},
+                    {"id": "bad_img", "component": "Image", "url": "javascript:alert(1)"},
+                ],
+            },
+        }
+        raw_dangling = json.dumps(msg_dangling, separators=(",", ":"))
+        t2 = time.perf_counter()
+        res_dangling = validate_payload(raw_dangling, version="1.0", strict=True)
+        self.assertFalse(res_dangling["ok"])
+        self.assertLess(time.perf_counter() - t2, 0.25)
+        dang_errs = [e for e in res_dangling["errors"] if e["code"] == "DANGLING_COMPONENT_REF"]
+        self.assertEqual(len(dang_errs), 64)
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_dangling["errors"]})
+        # bad_img after the 35,000 dangling refs must still be linked into adj (not falsely flagged as orphan)
+        self.assertNotIn("ORPHAN_COMPONENT", {w["code"] for w in res_dangling["warnings"]})
+
+        # Priority-preserving cap: 5 surfaces of 64 dangling refs saturate generic cap (256), yet UNSAFE_MEDIA_URL on surface 6 still reports
+        multi_surf_msgs: list[dict[str, Any]] = []
+        for sidx in range(5):
+            multi_surf_msgs.append(
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": f"s_cap_{sidx}",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [
+                            {"id": "root", "component": "Column", "children": [f"x{sidx}_{j}" for j in range(70)]}
+                        ],
+                    },
+                }
+            )
+        multi_surf_msgs.append(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_cap_sec",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Image", "url": "javascript:alert(1)"}],
+                },
+            }
+        )
+        res_priority = validate_payload(json.dumps(multi_surf_msgs, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_priority["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_priority["errors"]})
+        self.assertLessEqual(len(res_priority["errors"]), 512)
+
+        # 3a. Dense unique-edge DAG in template binding chain diff stays budgeted and fast
+        n_a, n_b, n_u, n_v = 31, 31, 200, 150
+        v_ids = [f"v{j}" for j in range(n_v)]
+        u_ids = [f"u{i}" for i in range(n_u)]
+        comps_chain_dense = (
+            [
+                {"id": "root", "component": "List", "children": {"componentId": "c0", "path": "/g0"}},
+                {"id": "c0", "component": "Column", "children": [f"a{i}" for i in range(n_a)]},
+            ]
+            + [{"id": f"a{i}", "component": "List", "children": {"componentId": "c1", "path": f"p{i}"}} for i in range(n_a)]
+            + [{"id": "c1", "component": "Column", "children": [f"b{j}" for j in range(n_b)]}]
+            + [{"id": f"b{j}", "component": "List", "children": {"componentId": "c2", "path": f"q{j}"}} for j in range(n_b)]
+            + [{"id": "c2", "component": "Column", "children": u_ids}]
+            + [{"id": f"u{i}", "component": "Column", "children": v_ids} for i in range(n_u)]
+            + [{"id": f"v{j}", "component": "Column", "children": ["leaf"]} for j in range(n_v)]
+            + [{"id": "leaf", "component": "Image", "url": {"@call": "formatString", "args": {"value": "${u}"}}}]
+        )
+        msgs_chain_dense = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_chain_dense",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_chain_dense,
+                    "dataModel": {"g0": [], "g1": []},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "s_chain_dense",
+                    "components": [{"id": "root", "component": "List", "children": {"componentId": "c0", "path": "/g1"}}],
+                },
+            },
+        ]
+        raw_chain_dense = json.dumps(msgs_chain_dense, separators=(",", ":"))
+        t3 = time.perf_counter()
+        res_chain_dense = validate_payload(raw_chain_dense, version="1.0", strict=True)
+        self.assertFalse(res_chain_dense["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_chain_dense["errors"]})
+        self.assertLess(time.perf_counter() - t3, 0.35)
+
+        # 3b. Repeated-child DAG in template binding chain diff deduplicates edges and still catches unlinked prefix-less unsafe URL
+        comps_chain_rep = (
+            [
+                {"id": "root", "component": "List", "children": {"componentId": "c0", "path": "/g0"}},
+                {"id": "c0", "component": "Column", "children": [f"a{i}" for i in range(n_a)]},
+            ]
+            + [{"id": f"a{i}", "component": "List", "children": {"componentId": "c1", "path": f"p{i}"}} for i in range(n_a)]
+            + [{"id": "c1", "component": "Column", "children": [f"b{j}" for j in range(n_b)]}]
+            + [{"id": f"b{j}", "component": "List", "children": {"componentId": "c2", "path": f"q{j}"}} for j in range(n_b)]
+            + [
+                {"id": "c2", "component": "Column", "children": ["s0"] * 60_000},
+                {"id": "s0", "component": "Column", "children": ["leaf"]},
+                {"id": "leaf", "component": "Image", "url": {"@call": "formatString", "args": {"value": "${u}"}}},
+            ]
+        )
+        msgs_chain_rep = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_chain_rep",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_chain_rep,
+                    "dataModel": {"g0": [{"p0": [{"q0": [{}]}]}], "g1": []},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "s_chain_rep",
+                    "components": [{"id": "root", "component": "List", "children": {"componentId": "c0", "path": "/g1"}}],
+                },
+            },
+        ]
+        raw_chain_rep = json.dumps(msgs_chain_rep, separators=(",", ":"))
+        t4 = time.perf_counter()
+        res_chain_rep = validate_payload(raw_chain_rep, version="1.0", strict=True)
+        self.assertFalse(res_chain_rep["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_chain_rep["errors"]})
+        self.assertLess(time.perf_counter() - t4, 0.35)
+
+        # 4. Tabs.tabs and ChoicePicker.options with 50,000 invalid items complete fast with capped issues
+        msg_tabs_inv = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s_tabs_inv",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [{"id": "root", "component": "Tabs", "tabs": [0] * 50_000}],
+            },
+        }
+        raw_tabs_inv = json.dumps(msg_tabs_inv, separators=(",", ":"))
+        t5 = time.perf_counter()
+        res_tabs_inv = validate_payload(raw_tabs_inv, version="1.0", strict=True)
+        self.assertFalse(res_tabs_inv["ok"])
+        self.assertLess(time.perf_counter() - t5, 0.25)
+        self.assertEqual(len([e for e in res_tabs_inv["errors"] if e["code"] == "INVALID_TAB_ITEM"]), 64)
+
+        msg_choice_inv = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s_choice_inv",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "ChoicePicker",
+                        "value": {"@path": "/sel"},
+                        "options": [0] * 50_000,
+                    }
+                ],
+            },
+        }
+        raw_choice_inv = json.dumps(msg_choice_inv, separators=(",", ":"))
+        t6 = time.perf_counter()
+        res_choice_inv = validate_payload(raw_choice_inv, version="1.0", strict=True)
+        self.assertFalse(res_choice_inv["ok"])
+        self.assertLess(time.perf_counter() - t6, 0.25)
+        self.assertEqual(len([e for e in res_choice_inv["errors"] if e["code"] == "INVALID_CHOICE_OPTION"]), 64)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+from collections.abc import Iterator
 from functools import lru_cache
 import re
 from typing import Any
@@ -1479,6 +1480,25 @@ def _validate_url_function_call(
     )
 
 
+_MAX_GENERIC_ISSUES_PER_BUCKET = 256
+_MAX_PRIORITY_ISSUES_PER_BUCKET = 512
+_PRIORITY_ISSUE_CODES = frozenset(
+    {
+        "UNSAFE_MEDIA_URL",
+        "UNSAFE_OPEN_URL",
+        "MAX_TEMPLATE_EVALS_EXCEEDED",
+        "COMPONENT_CYCLE",
+        "MAX_DEPTH_EXCEEDED",
+        "MAX_COMPONENTS_EXCEEDED",
+        "PAYLOAD_TOO_LARGE",
+        "INVALID_REGEX",
+        "UNSAFE_REGEX",
+        "REGEX_TOO_LONG",
+        "SECRET_LEAK",
+    }
+)
+
+
 def _add_issue(
     bucket: list[dict[str, Any]],
     code: str,
@@ -1486,6 +1506,13 @@ def _add_issue(
     path: str,
     message: str,
 ) -> None:
+    limit = (
+        _MAX_PRIORITY_ISSUES_PER_BUCKET
+        if code in _PRIORITY_ISSUE_CODES
+        else _MAX_GENERIC_ISSUES_PER_BUCKET
+    )
+    if len(bucket) >= limit:
+        return
     bucket.append(
         {
             "code": code,
@@ -2098,7 +2125,15 @@ def _append_unique_issues(
     seen: set[tuple[str, int, str, str]],
 ) -> None:
     for issue in new_issues:
-        key = (issue["code"], issue["blockIndex"], issue["path"], issue["message"])
+        code = issue["code"]
+        limit = (
+            _MAX_PRIORITY_ISSUES_PER_BUCKET
+            if code in _PRIORITY_ISSUE_CODES
+            else _MAX_GENERIC_ISSUES_PER_BUCKET
+        )
+        if len(target) >= limit:
+            continue
+        key = (code, issue["blockIndex"], issue["path"], issue["message"])
         if key not in seen:
             seen.add(key)
             target.append(issue)
@@ -2308,6 +2343,119 @@ def _extract_child_refs(comp_type: str, props: dict[str, Any], version: str) -> 
     return refs
 
 
+def _iter_child_ref_ids(
+    props: dict[str, Any], version: str, *, include_template: bool = True
+) -> Iterator[str]:
+    """Yield referenced component IDs from a component without formatting property path labels."""
+    if version == "0.8":
+        for key in ("child", "entryPointChild", "contentChild"):
+            val = props.get(key)
+            if isinstance(val, str):
+                yield val
+        ch = props.get("children")
+        if isinstance(ch, dict):
+            explicit = ch.get("explicitList")
+            if isinstance(explicit, list):
+                for cid in explicit:
+                    if isinstance(cid, str):
+                        yield cid
+            if include_template:
+                tpl = ch.get("template")
+                if isinstance(tpl, dict):
+                    tpl_cid = tpl.get("componentId")
+                    if isinstance(tpl_cid, str):
+                        yield tpl_cid
+        tab_items = props.get("tabItems")
+        if isinstance(tab_items, list):
+            for item in tab_items:
+                if isinstance(item, dict):
+                    t_child = item.get("child")
+                    if isinstance(t_child, str):
+                        yield t_child
+        return
+
+    for key in ("child", "trigger", "content"):
+        val = props.get(key)
+        if isinstance(val, str):
+            yield val
+    ch = props.get("children")
+    if isinstance(ch, list):
+        for cid in ch:
+            if isinstance(cid, str):
+                yield cid
+    elif include_template and isinstance(ch, dict):
+        tpl_cid = ch.get("componentId")
+        if isinstance(tpl_cid, str):
+            yield tpl_cid
+    tabs = props.get("tabs")
+    if isinstance(tabs, list):
+        for tab in tabs:
+            if isinstance(tab, dict):
+                t_child = tab.get("child")
+                if isinstance(t_child, str):
+                    yield t_child
+
+
+def _iter_child_ref_entries(
+    props: dict[str, Any], version: str
+) -> Iterator[tuple[str, int | None, str]]:
+    """Yield (prop_kind, index_or_none, ref_id) lazily so path strings are formatted only on error."""
+    if version == "0.8":
+        for key in ("child", "entryPointChild", "contentChild"):
+            val = props.get(key)
+            if isinstance(val, str):
+                yield (key, None, val)
+        ch = props.get("children")
+        if isinstance(ch, dict):
+            explicit = ch.get("explicitList")
+            if isinstance(explicit, list):
+                for cid in explicit:
+                    if isinstance(cid, str):
+                        yield ("children.explicitList", None, cid)
+            tpl = ch.get("template")
+            if isinstance(tpl, dict):
+                tpl_cid = tpl.get("componentId")
+                if isinstance(tpl_cid, str):
+                    yield ("children.template.componentId", None, tpl_cid)
+        tab_items = props.get("tabItems")
+        if isinstance(tab_items, list):
+            for idx, item in enumerate(tab_items):
+                if isinstance(item, dict):
+                    t_child = item.get("child")
+                    if isinstance(t_child, str):
+                        yield ("tabItems", idx, t_child)
+        return
+
+    for key in ("child", "trigger", "content"):
+        val = props.get(key)
+        if isinstance(val, str):
+            yield (key, None, val)
+    ch = props.get("children")
+    if isinstance(ch, list):
+        for idx, cid in enumerate(ch):
+            if isinstance(cid, str):
+                yield ("children", idx, cid)
+    elif isinstance(ch, dict):
+        tpl_cid = ch.get("componentId")
+        if isinstance(tpl_cid, str):
+            yield ("children.componentId", None, tpl_cid)
+    tabs = props.get("tabs")
+    if isinstance(tabs, list):
+        for idx, tab in enumerate(tabs):
+            if isinstance(tab, dict):
+                t_child = tab.get("child")
+                if isinstance(t_child, str):
+                    yield ("tabs", idx, t_child)
+
+
+def _format_child_ref_prop(prop_kind: str, prop_idx: int | None) -> str:
+    if prop_idx is None:
+        return prop_kind
+    if prop_kind == "children":
+        return f"children[{prop_idx}]"
+    return f"{prop_kind}[{prop_idx}].child"
+
+
 def _detect_cycles_iterative(adj: dict[str, list[str]]) -> list[list[str]]:
     """Iterative 3-color DFS cycle detection (CWE-400 safe, no recursion limit)."""
     WHITE, GRAY, BLACK = 0, 1, 2
@@ -2389,9 +2537,11 @@ def _validate_surface_components(
 
     comp_map: dict[str, tuple[str, dict[str, Any], str]] = {}
     adj: dict[str, list[str]] = {}
-    parents_by_child: dict[str, list[str]] = {}
+    adj_sets: dict[str, set[str]] = {}
+    parents_by_child: dict[str, set[str]] = {}
     historical_adj: dict[str, list[str]] = {}
-    historical_parents: dict[str, list[str]] = {}
+    historical_adj_sets: dict[str, set[str]] = {}
+    historical_parents: dict[str, set[str]] = {}
 
     # Pre-compute the winning (b_idx, idx) per cid across component_batches (last-write-wins)
     winning_loc: dict[str, tuple[int, int]] = {}
@@ -2487,11 +2637,15 @@ def _validate_surface_components(
             comp_dm = {} if is_superseded else data_model
             comp_hist = is_superseded
             adj.setdefault(cid, [])
+            adj_sets.setdefault(cid, set())
             hist_edges = historical_adj.setdefault(cid, [])
-            for _ref_prop, ref_id in _extract_child_refs(comp_type, props, version):
-                if ref_id not in hist_edges:
-                    hist_edges.append(ref_id)
-                historical_parents.setdefault(ref_id, []).append(comp_type)
+            hist_set = historical_adj_sets.setdefault(cid, set())
+            for ref_id in _iter_child_ref_ids(props, version, include_template=True):
+                if ref_id in winning_loc:
+                    if ref_id not in hist_set:
+                        hist_set.add(ref_id)
+                        hist_edges.append(ref_id)
+                    historical_parents.setdefault(ref_id, set()).add(comp_type)
 
             # Transitional bare mixins in v1.0
             if version == "1.0":
@@ -2635,18 +2789,23 @@ def _validate_surface_components(
                 if comp_type == "Tabs" and isinstance(props.get("tabs"), list):
                     if len(props["tabs"]) == 0:
                         _add_issue(errors, "EMPTY_TABS", block_index, f"{cpath}.tabs", "Tabs.tabs must have at least 1 item.")
+                    invalid_tab_issues = 0
+                    unknown_tab_issues = 0
                     for tidx, tab in enumerate(props["tabs"]):
                         if not isinstance(tab, dict) or "title" not in tab or "child" not in tab:
-                            _add_issue(
-                                errors,
-                                "INVALID_TAB_ITEM",
-                                block_index,
-                                f"{cpath}.tabs[{tidx}]",
-                                "Each tab item must contain 'title' and 'child'.",
-                            )
+                            if invalid_tab_issues < 64:
+                                invalid_tab_issues += 1
+                                _add_issue(
+                                    errors,
+                                    "INVALID_TAB_ITEM",
+                                    block_index,
+                                    f"{cpath}.tabs[{tidx}]",
+                                    "Each tab item must contain 'title' and 'child'.",
+                                )
                         else:
                             extra_tab = set(tab.keys()) - {"title", "child"}
-                            if extra_tab:
+                            if extra_tab and unknown_tab_issues < 64:
+                                unknown_tab_issues += 1
                                 _add_issue(
                                     errors if strict else warnings,
                                     "UNKNOWN_TAB_ITEM_PROPERTY",
@@ -2657,18 +2816,23 @@ def _validate_surface_components(
 
                 # Validate ChoicePicker options
                 if comp_type == "ChoicePicker" and isinstance(props.get("options"), list):
+                    invalid_choice_issues = 0
+                    unknown_choice_issues = 0
                     for oidx, opt in enumerate(props["options"]):
                         if not isinstance(opt, dict) or "label" not in opt or not isinstance(opt.get("value"), str):
-                            _add_issue(
-                                errors,
-                                "INVALID_CHOICE_OPTION",
-                                block_index,
-                                f"{cpath}.options[{oidx}]",
-                                "Each ChoicePicker option requires 'label' and string 'value'.",
-                            )
+                            if invalid_choice_issues < 64:
+                                invalid_choice_issues += 1
+                                _add_issue(
+                                    errors,
+                                    "INVALID_CHOICE_OPTION",
+                                    block_index,
+                                    f"{cpath}.options[{oidx}]",
+                                    "Each ChoicePicker option requires 'label' and string 'value'.",
+                                )
                         else:
                             extra_opt = set(opt.keys()) - {"label", "value"}
-                            if extra_opt:
+                            if extra_opt and unknown_choice_issues < 64:
+                                unknown_choice_issues += 1
                                 _add_issue(
                                     errors if strict else warnings,
                                     "UNKNOWN_CHOICE_OPTION_PROPERTY",
@@ -2804,7 +2968,7 @@ def _validate_surface_components(
 
             if comp_type == "Tabs" and isinstance(props.get("tabs"), list):
                 for tidx, tab in enumerate(props["tabs"]):
-                    if isinstance(tab, dict) and "title" in tab:
+                    if isinstance(tab, dict) and "title" in tab and isinstance(tab["title"], (dict, list)):
                         _validate_dynamic_value(
                             tab["title"],
                             version=version,
@@ -2831,7 +2995,7 @@ def _validate_surface_components(
 
             if comp_type == "ChoicePicker" and isinstance(props.get("options"), list):
                 for oidx, opt in enumerate(props["options"]):
-                    if isinstance(opt, dict) and "label" in opt:
+                    if isinstance(opt, dict) and "label" in opt and isinstance(opt["label"], (dict, list)):
                         _validate_dynamic_value(
                             opt["label"],
                             version=version,
@@ -3082,47 +3246,57 @@ def _validate_surface_components(
         )
 
     # Build final active reference graph & check dangling refs
+    dangling_ref_issues = 0
     for cid, (comp_type, props, cpath) in comp_map.items():
-        for ref_prop, ref_id in _extract_child_refs(comp_type, props, version):
+        cid_adj = adj[cid]
+        cid_adj_set = adj_sets[cid]
+        for prop_kind, prop_idx, ref_id in _iter_child_ref_entries(props, version):
             if ref_id not in comp_map:
-                _add_issue(
-                    errors,
-                    "DANGLING_COMPONENT_REF",
-                    block_index,
-                    f"{cpath}.{ref_prop}",
-                    f"Component '{cid}' references non-existent component '{ref_id}'.",
-                )
+                if dangling_ref_issues < 64:
+                    dangling_ref_issues += 1
+                    ref_prop = _format_child_ref_prop(prop_kind, prop_idx)
+                    _add_issue(
+                        errors,
+                        "DANGLING_COMPONENT_REF",
+                        block_index,
+                        f"{cpath}.{ref_prop}",
+                        f"Component '{cid}' references non-existent component '{ref_id}'.",
+                    )
             else:
-                adj[cid].append(ref_id)
-                parents_by_child.setdefault(ref_id, []).append(comp_type)
+                if ref_id not in cid_adj_set:
+                    cid_adj_set.add(ref_id)
+                    cid_adj.append(ref_id)
+                parents_by_child.setdefault(ref_id, set()).add(comp_type)
 
     # Compute reachability on both final graph and historical union graph (for replaced placeholders)
     final_visited: set[str] = set()
     ever_visited: set[str] = set()
     if root_id in comp_map:
+        final_visited.add(root_id)
         queue = [root_id]
         while queue:
             cur = queue.pop()
-            if cur in final_visited:
-                continue
-            final_visited.add(cur)
-            queue.extend(adj.get(cur, []))
+            for nxt in adj.get(cur, ()):
+                if nxt not in final_visited and nxt in comp_map:
+                    final_visited.add(nxt)
+                    queue.append(nxt)
 
+        ever_visited.add(root_id)
         hist_queue = [root_id]
         while hist_queue:
             cur = hist_queue.pop()
-            if cur in ever_visited:
-                continue
-            ever_visited.add(cur)
-            hist_queue.extend(historical_adj.get(cur, []))
+            for nxt in historical_adj.get(cur, ()):
+                if nxt not in ever_visited and nxt in comp_map:
+                    ever_visited.add(nxt)
+                    hist_queue.append(nxt)
 
     # Check weight only under Row or Column
     for cid, (_comp_type, props, cpath) in comp_map.items():
         if "weight" in props:
             parent_types = (
-                parents_by_child.get(cid, [])
+                parents_by_child.get(cid, ())
                 if cid in final_visited
-                else (historical_parents.get(cid, []) if cid in ever_visited else parents_by_child.get(cid, []))
+                else (historical_parents.get(cid, ()) if cid in ever_visited else parents_by_child.get(cid, ()))
             )
             if not parent_types or any(pt not in {"Row", "Column"} for pt in parent_types):
                 _add_issue(
@@ -3233,6 +3407,17 @@ def validate_payload(
         surface_seen_errors: dict[str, set[tuple[str, int, str, str]]] = {}
         surface_seen_warnings: dict[str, set[tuple[str, int, str, str]]] = {}
         surface_total_comp_entries: dict[str, int] = {}
+        surface_tpl_scope_cache: dict[
+            str,
+            dict[
+                str,
+                tuple[
+                    list[str],
+                    list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+                    list[tuple[str, str]],
+                ],
+            ],
+        ] = {}
         surface_tpl_summary_cache: dict[
             str,
             dict[
@@ -3285,6 +3470,7 @@ def validate_payload(
             surface_seen_errors.pop(sid_clear, None)
             surface_seen_warnings.pop(sid_clear, None)
             surface_total_comp_entries.pop(sid_clear, None)
+            surface_tpl_scope_cache.pop(sid_clear, None)
             surface_tpl_summary_cache.pop(sid_clear, None)
             surface_tpl_rel_index_cache.pop(sid_clear, None)
             surface_childlist_index.pop(sid_clear, None)
@@ -3713,29 +3899,57 @@ def validate_payload(
             return res_cl
 
         def _collect_template_scope(
-            sid_tpl: str, tpl_root_id: str
+            sid_tpl: str,
+            tpl_root_id: str,
+            tmp_errors: list[dict[str, Any]] | None = None,
         ) -> tuple[
             list[str],
             list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
             list[tuple[str, str]],
         ]:
             """Collect nodes, relative URL slots, and nested relative ChildLists sharing tpl_root_id's item_ctx."""
+            surf_scope_cache = surface_tpl_scope_cache.setdefault(sid_tpl, {})
+            cached = surf_scope_cache.get(tpl_root_id)
+            if cached is not None:
+                return cached
+            if payload_budget_exceeded:
+                return [], [], []
             comp_map = surface_active_comp_map.get(sid_tpl, {})
             if tpl_root_id not in comp_map:
-                return [], [], []
+                res_empty: tuple[
+                    list[str],
+                    list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+                    list[tuple[str, str]],
+                ] = ([], [], [])
+                surf_scope_cache[tpl_root_id] = res_empty
+                return res_empty
             adj_map = surface_active_adj.get(sid_tpl, {})
             slots_by_cid = surface_url_slots.get(sid_tpl, {})
             tpl_map = surface_childlist_templates.get(sid_tpl, {})
+            err_target = tmp_errors if tmp_errors is not None else errors
             direct_nodes: list[str] = []
-            seen_tpl: set[str] = set()
+            seen_tpl: set[str] = {tpl_root_id}
             t_queue = [tpl_root_id]
+            edge_steps = 0
             while t_queue:
                 cur_id = t_queue.pop()
-                if cur_id in seen_tpl or cur_id not in comp_map:
-                    continue
-                seen_tpl.add(cur_id)
                 direct_nodes.append(cur_id)
-                t_queue.extend(adj_map.get(cur_id, []))
+                neighbors = adj_map.get(cur_id)
+                if neighbors:
+                    edge_steps += len(neighbors)
+                    for nxt in neighbors:
+                        if nxt not in seen_tpl and nxt in comp_map:
+                            seen_tpl.add(nxt)
+                            t_queue.append(nxt)
+                    if edge_steps >= 512:
+                        charge = edge_steps // 32
+                        edge_steps %= 32
+                        if not _charge_payload_url_evals(charge, sid_tpl, err_target):
+                            return [], [], []
+            if not _charge_payload_url_evals(
+                max(1, (len(direct_nodes) + edge_steps) // 32), sid_tpl, err_target
+            ):
+                return [], [], []
             direct_rel_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
             nested_rel_children: list[tuple[str, str]] = []
             seen_nested_rel: set[tuple[str, str]] = set()
@@ -3751,7 +3965,9 @@ def validate_payload(
                         if nested_pair not in seen_nested_rel:
                             seen_nested_rel.add(nested_pair)
                             nested_rel_children.append(nested_pair)
-            return direct_nodes, direct_rel_slots, nested_rel_children
+            res_scope = (direct_nodes, direct_rel_slots, nested_rel_children)
+            surf_scope_cache[tpl_root_id] = res_scope
+            return res_scope
 
         def _collect_template_binding_chains(
             g_comp_map: dict[str, tuple[str, dict[str, Any], str]],
@@ -3765,14 +3981,20 @@ def validate_payload(
             if not target_cids:
                 return set(), False
             rev_adj: dict[str, list[str]] = {}
-            rev_edges = 0
+            rev_edges_pending = 0
+            rev_charged_any = False
             for parent, children in g_adj_map.items():
                 if parent not in g_comp_map:
                     continue
                 for child in children:
                     if child in g_comp_map:
                         rev_adj.setdefault(child, []).append(parent)
-                        rev_edges += 1
+                        rev_edges_pending += 1
+                if rev_edges_pending >= 512:
+                    if not _charge_payload_url_evals(rev_edges_pending, sid_chain, tmp_errors):
+                        return set(), True
+                    rev_edges_pending = 0
+                    rev_charged_any = True
             for owner_cid, (inner_tpl_id, inner_list_ptr) in g_tpl_map.items():
                 if owner_cid not in g_comp_map:
                     continue
@@ -3783,9 +4005,15 @@ def validate_payload(
                     and inner_tpl_id in g_comp_map
                 ):
                     rev_adj.setdefault(inner_tpl_id, []).append(owner_cid)
-                    rev_edges += 1
-            if not _charge_payload_url_evals(max(1, rev_edges), sid_chain, tmp_errors):
-                return set(), True
+                    rev_edges_pending += 1
+                    if rev_edges_pending >= 512:
+                        if not _charge_payload_url_evals(rev_edges_pending, sid_chain, tmp_errors):
+                            return set(), True
+                        rev_edges_pending = 0
+                        rev_charged_any = True
+            if rev_edges_pending > 0 or not rev_charged_any:
+                if not _charge_payload_url_evals(max(1, rev_edges_pending), sid_chain, tmp_errors):
+                    return set(), True
             can_reach_target: set[str] = {tc for tc in target_cids if tc in g_comp_map}
             rev_stack = list(can_reach_target)
             while rev_stack:
@@ -3817,20 +4045,29 @@ def validate_payload(
 
             while work:
                 cur_root, chain, visited_tpls = work.pop()
-                seen_nodes: set[str] = set()
+                if cur_root not in can_reach_target or cur_root not in g_comp_map:
+                    continue
+                seen_nodes: set[str] = {cur_root}
                 n_stack = [cur_root]
                 node_steps = 0
+                edge_steps = 0
                 while n_stack:
                     nid = n_stack.pop()
-                    if nid in seen_nodes or nid not in can_reach_target:
-                        continue
-                    seen_nodes.add(nid)
                     node_steps += 1
                     if nid in target_cids:
                         active_chains.add((nid, chain))
-                    for nxt in g_adj_map.get(nid, ()):
-                        if nxt not in seen_nodes and nxt in can_reach_target:
-                            n_stack.append(nxt)
+                    neighbors = g_adj_map.get(nid)
+                    if neighbors:
+                        edge_steps += len(neighbors)
+                        for nxt in neighbors:
+                            if nxt not in seen_nodes and nxt in can_reach_target:
+                                seen_nodes.add(nxt)
+                                n_stack.append(nxt)
+                        if edge_steps >= 512:
+                            charge = edge_steps // 16
+                            edge_steps %= 16
+                            if not _charge_payload_url_evals(charge, sid_chain, tmp_errors):
+                                return active_chains, True
                     child_tpl = g_tpl_map.get(nid)
                     if child_tpl is not None:
                         inner_tpl_id, inner_list_ptr = child_tpl
@@ -3848,7 +4085,9 @@ def validate_payload(
                                     return active_chains, True
                                 seen_states.add(next_key)
                                 work.append((inner_tpl_id, next_chain, visited_tpls | {inner_tpl_id}))
-                if not _charge_payload_url_evals(1 + (node_steps // 16), sid_chain, tmp_errors):
+                if not _charge_payload_url_evals(
+                    max(1, (node_steps + edge_steps) // 16), sid_chain, tmp_errors
+                ):
                     return active_chains, True
             return active_chains, False
 
@@ -3880,7 +4119,11 @@ def validate_payload(
                 if cur_root in seen_roots:
                     continue
                 seen_roots.add(cur_root)
-                d_nodes, d_rel_slots, nested_rel = _collect_template_scope(sid_tpl, cur_root)
+                d_nodes, d_rel_slots, nested_rel = _collect_template_scope(
+                    sid_tpl, cur_root, tmp_errors
+                )
+                if payload_budget_exceeded:
+                    return set(), [], False
                 visited_nodes += len(d_nodes)
                 all_nodes.update(d_nodes)
                 for slot in d_rel_slots:
@@ -3943,12 +4186,14 @@ def validate_payload(
                 return False
             before_url_evals = payload_url_slot_evals[0]
             if scope_cache is None:
-                scope_cache = {}
+                scope_cache = surface_tpl_scope_cache.setdefault(sid_tpl, {})
             if tree_has_slots_cache is None:
                 tree_has_slots_cache = {}
             scope = scope_cache.get(tpl_root_id)
             if scope is None:
-                scope = _collect_template_scope(sid_tpl, tpl_root_id)
+                scope = _collect_template_scope(sid_tpl, tpl_root_id, tmp_errors)
+                if payload_budget_exceeded:
+                    return True
                 scope_cache[tpl_root_id] = scope
             _direct_nodes, direct_rel_slots, nested_rel_children = scope
 
@@ -4134,11 +4379,19 @@ def validate_payload(
                         continue
                 if c_type == "Surface":
                     continue
-                new_adj = [
-                    ref_id
-                    for rp, ref_id in _extract_child_refs(c_type, c_props, sver)
-                    if rp not in {"children.componentId", "children.template.componentId"}
-                ]
+                raw_ref_count = 0
+                new_adj: list[str] = []
+                seen_new_adj: set[str] = set()
+                for prop_kind, _prop_idx, ref_id in _iter_child_ref_entries(c_props, sver):
+                    raw_ref_count += 1
+                    if prop_kind not in {"children.componentId", "children.template.componentId"}:
+                        if ref_id not in seen_new_adj:
+                            seen_new_adj.add(ref_id)
+                            new_adj.append(ref_id)
+                if raw_ref_count >= 64:
+                    if not _charge_payload_url_evals(raw_ref_count // 64, sid_ing, tmp_errors):
+                        _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
+                        return
                 ch = c_props.get("children")
                 tpl_binding: tuple[str, str] | None = None
                 if isinstance(ch, dict):
@@ -4251,6 +4504,7 @@ def validate_payload(
             if abs_changed:
                 surface_ptr_index_dirty.add(sid_ing)
             if tpl_graph_changed:
+                surface_tpl_scope_cache.pop(sid_ing, None)
                 surface_tpl_summary_cache.pop(sid_ing, None)
                 surface_tpl_rel_index_cache.pop(sid_ing, None)
                 surface_childlist_index.pop(sid_ing, None)
@@ -4526,7 +4780,7 @@ def validate_payload(
                                 if ing_tpl_cap:
                                     break
                     else:
-                        sc_ing: dict[str, Any] = {}
+                        sc_ing = surface_tpl_scope_cache.setdefault(sid_ing, {})
                         tc_ing: dict[str, bool] = {}
                         for item_idx, item in enumerate(items_val):
                             if rescan_budget is not None:
@@ -4562,8 +4816,12 @@ def validate_payload(
                             else:
                                 root_scope_ing = sc_ing.get(tpl_root_id)
                                 if root_scope_ing is None:
-                                    root_scope_ing = _collect_template_scope(sid_ing, tpl_root_id)
-                                    sc_ing[tpl_root_id] = root_scope_ing
+                                    root_scope_ing = _collect_template_scope(
+                                        sid_ing, tpl_root_id, tmp_errors
+                                    )
+                                    if payload_budget_exceeded:
+                                        ing_tpl_cap = True
+                                        break
                                 if not root_scope_ing[1]:
                                     itype = type(item)
                                     skip_empty = itype is not dict and itype is not list
@@ -4825,7 +5083,7 @@ def validate_payload(
                                         f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
                                     )
                             else:
-                                sc_pop: dict[str, Any] = {}
+                                sc_pop = surface_tpl_scope_cache.setdefault(sid_upd, {})
                                 tc_pop: dict[str, bool] = {}
                                 for item_idx, item in enumerate(items_val):
                                     if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
@@ -4875,10 +5133,12 @@ def validate_payload(
                                 if surf_cap_hit:
                                     break
                         else:
-                            sc_full: dict[str, Any] = {}
+                            sc_full = surface_tpl_scope_cache.setdefault(sid_upd, {})
                             tc_full: dict[str, bool] = {}
-                            root_scope_full = _collect_template_scope(sid_upd, tpl_root_id)
-                            sc_full[tpl_root_id] = root_scope_full
+                            root_scope_full = _collect_template_scope(sid_upd, tpl_root_id, tmp_errors)
+                            if payload_budget_exceeded:
+                                surf_cap_hit = True
+                                break
                             no_direct_full = not root_scope_full[1]
                             simple_nested_full = (
                                 root_scope_full[2][0][1]
@@ -5055,7 +5315,12 @@ def validate_payload(
                                                 _d_nodes,
                                                 direct_rel_slots,
                                                 nested_rel_children,
-                                            ) = _collect_template_scope(sid_upd, tpl_root_id)
+                                            ) = _collect_template_scope(
+                                                sid_upd, tpl_root_id, tmp_errors
+                                            )
+                                            if payload_budget_exceeded:
+                                                rel_idx_aborted = True
+                                                break
                                         if direct_rel_slots:
                                             slots_by_rel: dict[
                                                 frozenset[str],
@@ -5365,7 +5630,7 @@ def validate_payload(
                                             f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_ABS_RESCAN_EVALS}).",
                                         )
                                 else:
-                                    sc_abs: dict[str, Any] = {}
+                                    sc_abs = surface_tpl_scope_cache.setdefault(sid_upd, {})
                                     tc_abs: dict[str, bool] = {}
                                     for item_idx, item in enumerate(items_val):
                                         if (
@@ -5471,10 +5736,14 @@ def validate_payload(
                             if fl_cap_hit:
                                 break
                     else:
-                        sc_fl: dict[str, Any] = {}
+                        sc_fl = surface_tpl_scope_cache.setdefault(sid_to_flush, {})
                         tc_fl: dict[str, bool] = {}
-                        root_scope_fl = _collect_template_scope(sid_to_flush, tpl_root_id)
-                        sc_fl[tpl_root_id] = root_scope_fl
+                        root_scope_fl = _collect_template_scope(
+                            sid_to_flush, tpl_root_id, final_tpl_errors
+                        )
+                        if payload_budget_exceeded:
+                            fl_cap_hit = True
+                            break
                         no_direct_fl = not root_scope_fl[1]
                         simple_nested_fl = (
                             root_scope_fl[2][0][1]
@@ -5533,13 +5802,14 @@ def validate_payload(
                 fl_adj_map = surface_active_adj.get(sid_to_flush, {})
                 direct_reachable: set[str] = set()
                 if sroot in fl_comp_map:
+                    direct_reachable.add(sroot)
                     d_stack = [sroot]
                     while d_stack:
                         dcid = d_stack.pop()
-                        if dcid in direct_reachable:
-                            continue
-                        direct_reachable.add(dcid)
-                        d_stack.extend(fl_adj_map.get(dcid, ()))
+                        for nxt in fl_adj_map.get(dcid, ()):
+                            if nxt not in direct_reachable and nxt in fl_comp_map:
+                                direct_reachable.add(nxt)
+                                d_stack.append(nxt)
                 tpl_validated: set[str] = set()
                 for scid, cslots in surface_url_slots.get(sid_to_flush, {}).items():
                     if scid in direct_reachable:
