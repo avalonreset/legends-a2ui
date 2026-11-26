@@ -3926,6 +3926,258 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_sfmt["errors"]})
         self.assertLess(dt_sfmt, 0.5)
 
+    def test_indexed_childlist_prefix_buckets_tilde_fastpath_and_template_lru_cap(self) -> None:
+        """Indexed ChildList/prefix lookups, bisect pop filtering, tilde canonicalization, and LRU length cap."""
+        from legends_a2ui.validator import (
+            _PrefixBucket,
+            _canonicalize_json_pointer,
+            _parse_format_string_template,
+            _parse_format_string_template_cached,
+        )
+
+        # 1. _canonicalize_json_pointer fast-path preserves canonical escapes and normalizes raw tildes
+        for canon in ("", "/", "/a/b", "/~0a/~1b", "/~01/~10/~0~1"):
+            self.assertEqual(_canonicalize_json_pointer(canon), canon)
+        self.assertEqual(_canonicalize_json_pointer("/~a"), "/~0a")
+        self.assertEqual(_canonicalize_json_pointer("/~~1"), "/~0~1")
+        self.assertEqual(_canonicalize_json_pointer("/trail~"), "/trail~0")
+        self.assertEqual(_canonicalize_json_pointer("~rel"), "~0rel")
+
+        # 2. _PrefixBucket tracks max numeric child index per item and promotes non-indexed items
+        bucket = _PrefixBucket()
+        bucket.add("a", "slot_a", 0)
+        bucket.add("a", "slot_a", 5)  # max index becomes 5
+        bucket.add("b", "slot_b", 2)
+        bucket.add("c", "slot_c", 3)
+        bucket.add("c", "slot_c", None)  # promoted to non-indexed
+        self.assertEqual(set(bucket.query(None)), {"slot_a", "slot_b", "slot_c"})
+        self.assertEqual(set(bucket.query(0)), {"slot_a", "slot_b", "slot_c"})
+        self.assertEqual(set(bucket.query(3)), {"slot_a", "slot_c"})
+        self.assertEqual(set(bucket.query(5)), {"slot_a", "slot_c"})
+        self.assertEqual(set(bucket.query(6)), {"slot_c"})
+
+        # 3. Single-item sibling updates with tilde-escaped absolute pointers on 498 Videos stay fast
+        tpl_tilde = "https://a.co/" + "".join(f"${{/~0{j}}}" for j in range(63)) + "${u}"
+        comps_a = [
+            {"id": "root", "component": "List", "children": {"componentId": "row", "path": "/items"}},
+            {"id": "row", "component": "Column", "children": [f"v{k}" for k in range(498)]},
+        ] + [
+            {
+                "id": f"v{k}",
+                "component": "Video",
+                "url": {"@call": "formatString", "args": {"value": tpl_tilde}},
+                "posterUrl": {"@call": "formatString", "args": {"value": tpl_tilde}},
+            }
+            for k in range(498)
+        ]
+        msgs_a = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_idx_a",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_a,
+                    "dataModel": {"items": [{"u": "x"}]},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_idx_a", "path": "/items/0/~0n", "value": i}}
+            for i in range(1000)
+        ]
+        t0 = time.perf_counter()
+        res_a = validate_payload(json.dumps(msgs_a, separators=(",", ":")), version="1.0", strict=True)
+        dt_a = time.perf_counter() - t0
+        self.assertTrue(res_a["ok"], res_a["errors"])
+        self.assertLess(dt_a, 0.5)
+
+        # 4. Multi-List templates with unrelated tilde updates and v0.8 root merges stay fast
+        comps_b = (
+            [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(166)]}]
+            + [{"id": f"l{k}", "component": "List", "children": {"componentId": "row", "path": f"/a{k}"}} for k in range(166)]
+            + [{"id": "row", "component": "Column", "children": [f"v{k}" for k in range(332)]}]
+            + [
+                {
+                    "id": f"v{k}",
+                    "component": "Video",
+                    "url": {"@call": "formatString", "args": {"value": tpl_tilde}},
+                    "posterUrl": {"@call": "formatString", "args": {"value": tpl_tilde}},
+                }
+                for k in range(332)
+            ]
+        )
+        msgs_b = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_idx_b",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_b,
+                    "dataModel": {},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_idx_b", "path": "/~0z", "value": i}}
+            for i in range(2000)
+        ]
+        t1 = time.perf_counter()
+        res_b = validate_payload(json.dumps(msgs_b, separators=(",", ":")), version="1.0", strict=True)
+        dt_b = time.perf_counter() - t1
+        self.assertTrue(res_b["ok"], res_b["errors"])
+        self.assertLess(dt_b, 0.5)
+
+        # 5. Direct prefix_map bisect skips unshifted array tail pops on 250 Videos fast
+        tpl_arr = "https://a.co/" + "".join(f"${{/arr/0/~0{j}}}" for j in range(64))
+        comps_c = [{"id": "root", "component": "Column", "children": [f"v{k}" for k in range(250)]}] + [
+            {
+                "id": f"v{k}",
+                "component": "Video",
+                "url": {"@call": "formatString", "args": {"value": tpl_arr}},
+                "posterUrl": {"@call": "formatString", "args": {"value": tpl_arr}},
+            }
+            for k in range(250)
+        ]
+        msgs_c = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_idx_c",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_c,
+                    "dataModel": {"arr": [0] * 2005},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_idx_c", "path": f"/arr/{2004 - i}", "value": None}}
+            for i in range(2000)
+        ]
+        t2 = time.perf_counter()
+        res_c = validate_payload(json.dumps(msgs_c, separators=(",", ":")), version="1.0", strict=True)
+        dt_c = time.perf_counter() - t2
+        self.assertTrue(res_c["ok"], res_c["errors"])
+        self.assertLess(dt_c, 0.5)
+
+        # 6. Shifted pop hitting higher index of a multi-pointer direct slot STILL fails closed
+        shifted_multi = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_shift_multi",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Image",
+                            "url": {
+                                "@call": "formatString",
+                                "args": {"value": "https://example.com${/arr/0/a}${/arr/2/b}"},
+                            },
+                        }
+                    ],
+                    "dataModel": {
+                        "arr": [
+                            {"a": ""},
+                            {"b": "/safe.png"},
+                            {"b": "/good.png"},
+                            {"b": "@evil.example/x"},
+                        ]
+                    },
+                },
+            },
+            # Popping /arr/1 shifts /arr/3 into /arr/2; max_cidx=2 >= 1 must trigger re-validation
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_shift_multi", "path": "/arr/1", "value": None}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_shift_multi", "path": "/arr/2/b", "value": "/clean.png"}},
+        ]
+        res_sm = validate_payload(json.dumps(shifted_multi), version="1.0", strict=True)
+        self.assertFalse(res_sm["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_sm["errors"]})
+
+        # 7. Cross-item absolute overlap inside nested relative ChildList and raw tilde updates STILL fail closed
+        nested_abs_tilde = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_nest_abs",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "grp", "path": "/groups"}},
+                        {"id": "grp", "component": "List", "children": {"componentId": "row_img", "path": "items"}},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "/${/~0pfx}${u}"}},
+                        },
+                    ],
+                    "dataModel": {
+                        "~pfx": "safe",
+                        "groups": [
+                            {"items": [{"u": "ok.png"}]},
+                            {"items": [{"u": "/evil.example/p.png"}]},
+                        ],
+                    },
+                },
+            },
+            # Update via raw unescaped tilde '/~pfx' must canonicalize to '/~0pfx' and catch the overlap
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_nest_abs", "path": "/~pfx", "value": ""}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_nest_abs", "path": "/~0pfx", "value": "safe"}},
+        ]
+        res_nat = validate_payload(json.dumps(nested_abs_tilde), version="1.0", strict=True)
+        self.assertFalse(res_nat["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_nat["errors"]})
+
+        # 8. Item-internal array pop shifting a relative ChildList slot STILL fails closed
+        item_arr_pop = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_item_pop",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "r", "path": "/items"}},
+                        {"id": "r", "component": "Image", "url": {"@path": "tags/1"}},
+                    ],
+                    "dataModel": {"items": [{"tags": ["/a.png", "/b.png", "javascript:alert(1)"]}]},
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_item_pop", "path": "/items/0/tags/0", "value": None}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_item_pop", "path": "/items/0/tags/1", "value": "/safe.png"}},
+        ]
+        res_iap = validate_payload(json.dumps(item_arr_pop), version="1.0", strict=True)
+        self.assertFalse(res_iap["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_iap["errors"]})
+
+        # 9. _parse_format_string_template memoizes short templates and never pins >2048-char templates
+        _parse_format_string_template_cached.cache_clear()
+        short_tpl = "https://example.com/${/id}.png"
+        _parse_format_string_template(short_tpl)
+        _parse_format_string_template(short_tpl)
+        info_short = _parse_format_string_template_cached.cache_info()
+        self.assertEqual(info_short.currsize, 1)
+        self.assertGreaterEqual(info_short.hits, 1)
+
+        for idx in range(20):
+            big_tpl = f"data:image/png;base64,{idx:04d}" + ("A" * 250_000) + "${u}"
+            big_payload = json.dumps(
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": f"s_lru_{idx}",
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [
+                            {
+                                "id": "root",
+                                "component": "Image",
+                                "url": {"@call": "formatString", "args": {"value": big_tpl}},
+                            }
+                        ],
+                        "dataModel": {},
+                    },
+                },
+                separators=(",", ":"),
+            )
+            validate_payload(big_payload, version="1.0", strict=True)
+        info_after = _parse_format_string_template_cached.cache_info()
+        self.assertEqual(info_after.currsize, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
