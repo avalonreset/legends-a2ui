@@ -280,35 +280,144 @@ def _scan_str_for_secrets(
             )
 
 
-def scan_for_secrets(obj: Any, path: str = "$") -> list[dict[str, str]]:
+def _format_secret_path(root_path: str, path_segs: list[str | int], leaf: str | int | None = None) -> str:
+    parts: list[str] = [root_path]
+    for seg in path_segs:
+        parts.append(f"[{seg}]" if isinstance(seg, int) else f".{seg}")
+    if leaf is not None:
+        parts.append(f"[{leaf}]" if isinstance(leaf, int) else f".{leaf}")
+    return "".join(parts)
+
+
+def scan_for_secrets(obj: Any, path: str = "$", *, max_findings: int = 256) -> list[dict[str, str]]:
     """Iteratively scan JSON-compatible objects for leaked API keys, tokens, or private keys."""
     findings: list[dict[str, str]] = []
-    stack: list[tuple[Any, str]] = [(obj, path)]
-    while stack:
-        current, cur_path = stack.pop()
-        if isinstance(current, str):
-            _scan_str_for_secrets(
-                current,
-                cur_path,
-                "Potential secret detected ({rule_name}); redacted and refused.",
-                findings,
-            )
-        elif isinstance(current, dict):
-            for key, val in current.items():
-                if isinstance(val, (str, dict, list)):
-                    stack.append((val, f"{cur_path}.{key}"))
-                if isinstance(key, str) and len(key) >= 15:
+    if isinstance(obj, str):
+        _scan_str_for_secrets(
+            obj,
+            path,
+            "Potential secret detected ({rule_name}); redacted and refused.",
+            findings,
+        )
+        return findings[:max_findings]
+    if not isinstance(obj, (dict, list)) or not obj:
+        return findings
+
+    # Frame kinds: 0 = enumerate(list), 1 = iter(dict.items()), 2 = pre-scanned nested (key, container) iter
+    frames: list[tuple[int, Any]] = [
+        (1, iter(obj.items())) if isinstance(obj, dict) else (0, enumerate(obj))
+    ]
+    path_segs: list[str | int] = []
+
+    while frames and len(findings) < max_findings:
+        kind, it = frames[-1]
+        pushed = False
+        if kind == 0:
+            for cur_idx, item in it:
+                it_t = type(item)
+                if it_t is str:
+                    if len(item) >= 15:
+                        _scan_str_for_secrets(
+                            item,
+                            _format_secret_path(path, path_segs, cur_idx),
+                            "Potential secret detected ({rule_name}); redacted and refused.",
+                            findings,
+                        )
+                        if len(findings) >= max_findings:
+                            break
+                elif it_t is dict:
+                    if item:
+                        nested_children: list[tuple[str, Any]] | None = None
+                        for dk, dv in item.items():
+                            if type(dk) is str and len(dk) >= 15:
+                                _scan_str_for_secrets(
+                                    dk,
+                                    _format_secret_path(path, path_segs, cur_idx) + f".{dk}",
+                                    "Potential secret in key ({rule_name}); redacted and refused.",
+                                    findings,
+                                )
+                                if len(findings) >= max_findings:
+                                    break
+                            vt = type(dv)
+                            if vt is str:
+                                if len(dv) >= 15:
+                                    _scan_str_for_secrets(
+                                        dv,
+                                        _format_secret_path(path, path_segs, cur_idx) + f".{dk}",
+                                        "Potential secret detected ({rule_name}); redacted and refused.",
+                                        findings,
+                                    )
+                                    if len(findings) >= max_findings:
+                                        break
+                            elif (vt is dict or vt is list) and dv:
+                                if nested_children is None:
+                                    nested_children = [(dk, dv)]
+                                else:
+                                    nested_children.append((dk, dv))
+                        if len(findings) >= max_findings:
+                            break
+                        if nested_children is not None:
+                            path_segs.append(cur_idx)
+                            frames.append((2, iter(nested_children)))
+                            pushed = True
+                            break
+                elif it_t is list and item:
+                    path_segs.append(cur_idx)
+                    frames.append((0, enumerate(item)))
+                    pushed = True
+                    break
+        elif kind == 1:
+            for key, val in it:
+                if type(key) is str and len(key) >= 15:
                     _scan_str_for_secrets(
                         key,
-                        f"{cur_path}.{key}",
+                        _format_secret_path(path, path_segs, key),
                         "Potential secret in key ({rule_name}); redacted and refused.",
                         findings,
                     )
-        elif isinstance(current, list):
-            for idx in range(len(current) - 1, -1, -1):
-                item = current[idx]
-                if isinstance(item, (str, dict, list)):
-                    stack.append((item, f"{cur_path}[{idx}]"))
+                    if len(findings) >= max_findings:
+                        break
+                vt = type(val)
+                if vt is str:
+                    if len(val) >= 15:
+                        _scan_str_for_secrets(
+                            val,
+                            _format_secret_path(path, path_segs, key),
+                            "Potential secret detected ({rule_name}); redacted and refused.",
+                            findings,
+                        )
+                        if len(findings) >= max_findings:
+                            break
+                elif vt is dict and val:
+                    path_segs.append(key)
+                    frames.append((1, iter(val.items())))
+                    pushed = True
+                    break
+                elif vt is list and val:
+                    path_segs.append(key)
+                    frames.append((0, enumerate(val)))
+                    pushed = True
+                    break
+        else:
+            for key, val in it:
+                vt = type(val)
+                if vt is dict:
+                    path_segs.append(key)
+                    frames.append((1, iter(val.items())))
+                    pushed = True
+                    break
+                if vt is list:
+                    path_segs.append(key)
+                    frames.append((0, enumerate(val)))
+                    pushed = True
+                    break
+        if not pushed:
+            frames.pop()
+            if path_segs:
+                path_segs.pop()
+
+    if len(findings) > max_findings:
+        return findings[:max_findings]
     return findings
 
 

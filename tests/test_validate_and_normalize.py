@@ -5296,6 +5296,206 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertLess(time.perf_counter() - t6, 0.25)
         self.assertEqual(len([e for e in res_choice_inv["errors"] if e["code"] == "INVALID_CHOICE_OPTION"]), 64)
 
+    def test_parser_bounds_unmaskable_priority_issues_and_dynamic_array_fast_paths(self) -> None:
+        """Bounded parsing, unmaskable priority security codes, and dynamic-value fast paths stay fast and fail closed."""
+        from legends_a2ui.parser import parse_payload
+
+        fake_secret = "sk_" + "live_" + ("0" * 20)
+        evil_msg = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "sec_s",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["img1", "btn1", "tf1", "cyc1"]},
+                    {"id": "img1", "component": "Image", "url": "javascript:alert(1)"},
+                    {
+                        "id": "btn1",
+                        "component": "Button",
+                        "child": "cyc1",
+                        "action": {"functionCall": {"@call": "openUrl", "args": {"url": "javascript:evil()"}}},
+                    },
+                    {
+                        "id": "tf1",
+                        "component": "TextField",
+                        "label": "Input",
+                        "value": {"@path": "/v"},
+                        "@checks": [{"condition": {"@call": "regex", "args": {"value": "a", "pattern": "(a+)+"}}}],
+                    },
+                    {"id": "cyc1", "component": "Column", "children": ["cyc2"]},
+                    {"id": "cyc2", "component": "Column", "children": ["cyc1"]},
+                ],
+                "dataModel": {"apiKey": fake_secret},
+            },
+        }
+        evil_json = json.dumps(evil_msg, separators=(",", ":"))
+
+        # 1a. 512 malformed JSONL lines preceding an unsafe surface cannot mask any priority security code
+        raw_jsonl_mask = ("x\n" * 512) + evil_json + "\n"
+        res_jsonl_mask = validate_payload(raw_jsonl_mask, version="1.0", strict=True)
+        self.assertFalse(res_jsonl_mask["ok"])
+        jsonl_codes = {e["code"] for e in res_jsonl_mask["errors"]}
+        for expected in (
+            "JSON_PARSE_ERROR",
+            "SECRET_LEAK",
+            "UNSAFE_MEDIA_URL",
+            "UNSAFE_OPEN_URL",
+            "UNSAFE_REGEX",
+            "COMPONENT_CYCLE",
+        ):
+            self.assertIn(expected, jsonl_codes)
+        self.assertLessEqual(len([e for e in res_jsonl_mask["errors"] if e["code"] == "JSON_PARSE_ERROR"]), 64)
+
+        # 1b. 512 empty Markdown fenced blocks preceding an unsafe surface cannot mask any priority security code
+        raw_md_mask = ("```a2ui\n```\n" * 512) + "```a2ui\n" + evil_json + "\n```\n"
+        res_md_mask = validate_payload(raw_md_mask, version="1.0", strict=True, extract_markdown=True)
+        self.assertFalse(res_md_mask["ok"])
+        md_codes = {e["code"] for e in res_md_mask["errors"]}
+        for expected in (
+            "EMPTY_PAYLOAD",
+            "SECRET_LEAK",
+            "UNSAFE_MEDIA_URL",
+            "UNSAFE_OPEN_URL",
+            "UNSAFE_REGEX",
+            "COMPONENT_CYCLE",
+        ):
+            self.assertIn(expected, md_codes)
+        self.assertLessEqual(len([e for e in res_md_mask["errors"] if e["code"] == "EMPTY_PAYLOAD"]), 64)
+
+        # 1c. Pure-JSON intra-priority flood (512 INVALID_REGEX on s0) cannot mask distinct priority codes on s1
+        s0_regex_flood = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s0",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {
+                        "id": "root",
+                        "component": "TextField",
+                        "label": "Field",
+                        "value": {"@path": "/v"},
+                        "@checks": [
+                            {"condition": {"@call": "regex", "args": {"value": "a", "pattern": "["}}}
+                            for _ in range(512)
+                        ],
+                    }
+                ],
+            },
+        }
+        s1_unsafe = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s1",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["img1", "btn1", "cyc1"]},
+                    {"id": "img1", "component": "Image", "url": "javascript:alert(1)"},
+                    {
+                        "id": "btn1",
+                        "component": "Button",
+                        "child": "cyc1",
+                        "action": {"functionCall": {"@call": "openUrl", "args": {"url": "javascript:evil()"}}},
+                    },
+                    {"id": "cyc1", "component": "Column", "children": ["cyc2"]},
+                    {"id": "cyc2", "component": "Column", "children": ["cyc1"]},
+                ],
+            },
+        }
+        raw_intra = json.dumps(
+            [s0_regex_flood, {"version": "1.0", "deleteSurface": {"surfaceId": "s0"}}, s1_unsafe],
+            separators=(",", ":"),
+        )
+        res_intra = validate_payload(raw_intra, version="1.0", strict=True)
+        self.assertFalse(res_intra["ok"])
+        intra_codes = {e["code"] for e in res_intra["errors"]}
+        for expected in ("INVALID_REGEX", "UNSAFE_MEDIA_URL", "UNSAFE_OPEN_URL", "COMPONENT_CYCLE"):
+            self.assertIn(expected, intra_codes)
+        self.assertEqual(len([e for e in res_intra["errors"] if e["code"] == "INVALID_REGEX"]), 64)
+
+        # 1d. Unclosed quote on JSONL line 1 followed by excessive nesting still reports MAX_DEPTH_EXCEEDED
+        raw_quote_depth = '"\n' + ("[" * 200) + ("]" * 200) + "\n"
+        res_quote_depth = validate_payload(raw_quote_depth, version="1.0", strict=True)
+        self.assertFalse(res_quote_depth["ok"])
+        self.assertIn("MAX_DEPTH_EXCEEDED", {e["code"] for e in res_quote_depth["errors"]})
+
+        # 2. Bounded parse_payload and validate_payload on high-fan-out JSONL, JSON array, and Markdown inputs
+        bounded_cases = [
+            ("0\n" * 524_288, False, "MAX_MESSAGES_EXCEEDED"),
+            ("x\n" * 524_288, False, "MAX_MESSAGES_EXCEEDED"),
+            ("{}\n" * 349_525, False, "MAX_MESSAGES_EXCEEDED"),
+            ("[" + "{}," * 100_000 + "{}]", False, "MAX_MESSAGES_EXCEEDED"),
+            ("```a2ui\n```\n" * 87_381, True, "MAX_BLOCKS_EXCEEDED"),
+        ]
+        for raw_case, ext_md, expected_limit_code in bounded_cases:
+            t_p = time.perf_counter()
+            pres = parse_payload(raw_case, extract_markdown=ext_md)
+            self.assertLess(time.perf_counter() - t_p, 0.35)
+            self.assertFalse(pres["ok"])
+            self.assertLessEqual(len(pres["errors"]), 256)
+            self.assertIn(expected_limit_code, {e["code"] for e in pres["errors"]})
+
+            t_v = time.perf_counter()
+            vres = validate_payload(raw_case, version="1.0", strict=True, extract_markdown=ext_md)
+            self.assertLess(time.perf_counter() - t_v, 0.35)
+            self.assertFalse(vres["ok"])
+            self.assertLessEqual(len(vres["errors"]), 256)
+            self.assertIn(expected_limit_code, {e["code"] for e in vres["errors"]})
+            serialized = json.dumps(vres, indent=2)
+            self.assertLess(len(serialized), 50_000)
+
+        # 3a. DynamicValue fast paths on large scalar, empty-dict, and flat-dict arrays stay fast
+        for sid, text_val in (
+            ("dyn_ints", [0] * 524_000),
+            ("dyn_empty", [{}] * 349_400),
+            ("dyn_flat", [{"a": 1}] * 130_000),
+        ):
+            raw_dyn = json.dumps(
+                {
+                    "version": "1.0",
+                    "createSurface": {
+                        "surfaceId": sid,
+                        "catalogId": CANONICAL_V1_CATALOG_ID,
+                        "components": [{"id": "root", "component": "Text", "text": text_val}],
+                    },
+                },
+                separators=(",", ":"),
+            )
+            t_d = time.perf_counter()
+            res_dyn = validate_payload(raw_dyn, version="1.0", strict=True)
+            self.assertLess(time.perf_counter() - t_d, 0.35)
+            self.assertTrue(res_dyn["ok"], res_dyn["errors"])
+
+        # 3b. Nested unsafe openUrl calls and single-@ reserved keys inside arrays/dicts are still caught
+        raw_nested_bad = json.dumps(
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "dyn_nested_bad",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "Text",
+                            "text": [
+                                0,
+                                {},
+                                {"a": 1},
+                                {"@call": "openUrl", "args": {"url": "javascript:x"}},
+                                {"nested": [{"@bad": 1}]},
+                            ],
+                        }
+                    ],
+                },
+            },
+            separators=(",", ":"),
+        )
+        res_nested_bad = validate_payload(raw_nested_bad, version="1.0", strict=True)
+        self.assertFalse(res_nested_bad["ok"])
+        nested_codes = {e["code"] for e in res_nested_bad["errors"]}
+        self.assertIn("INVALID_FUNCTION_CALL_SITE", nested_codes)
+        self.assertIn("UNSAFE_OPEN_URL", nested_codes)
+        self.assertIn("INVALID_RESERVED_KEY", nested_codes)
+
 
 if __name__ == "__main__":
     unittest.main()

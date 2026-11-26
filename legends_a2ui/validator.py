@@ -1482,6 +1482,7 @@ def _validate_url_function_call(
 
 _MAX_GENERIC_ISSUES_PER_BUCKET = 256
 _MAX_PRIORITY_ISSUES_PER_BUCKET = 512
+_MAX_ISSUES_PER_CODE = 64
 _PRIORITY_ISSUE_CODES = frozenset(
     {
         "UNSAFE_MEDIA_URL",
@@ -1490,6 +1491,9 @@ _PRIORITY_ISSUE_CODES = frozenset(
         "COMPONENT_CYCLE",
         "MAX_DEPTH_EXCEEDED",
         "MAX_COMPONENTS_EXCEEDED",
+        "MAX_BYTES_EXCEEDED",
+        "MAX_MESSAGES_EXCEEDED",
+        "MAX_BLOCKS_EXCEEDED",
         "PAYLOAD_TOO_LARGE",
         "INVALID_REGEX",
         "UNSAFE_REGEX",
@@ -1499,6 +1503,41 @@ _PRIORITY_ISSUE_CODES = frozenset(
 )
 
 
+class _IssueList(list):
+    """List subclass tracking per-code counts in O(1) for bounded issue collection."""
+
+    __slots__ = ("code_counts",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.code_counts: dict[str, int] = {}
+
+    def record_append(self, item: dict[str, Any]) -> None:
+        code = item["code"]
+        self.code_counts[code] = self.code_counts.get(code, 0) + 1
+        super().append(item)
+
+
+def _can_accept_issue(bucket: list[dict[str, Any]], code: str) -> bool:
+    is_priority = code in _PRIORITY_ISSUE_CODES
+    if not is_priority and len(bucket) >= _MAX_GENERIC_ISSUES_PER_BUCKET:
+        return False
+    if isinstance(bucket, _IssueList):
+        code_count = bucket.code_counts.get(code, 0)
+    else:
+        code_count = 0
+        for existing in bucket:
+            if existing["code"] == code:
+                code_count += 1
+                if code_count >= _MAX_ISSUES_PER_CODE:
+                    return False
+    if code_count >= _MAX_ISSUES_PER_CODE:
+        return False
+    if is_priority and len(bucket) >= _MAX_PRIORITY_ISSUES_PER_BUCKET and code_count > 0:
+        return False
+    return True
+
+
 def _add_issue(
     bucket: list[dict[str, Any]],
     code: str,
@@ -1506,21 +1545,18 @@ def _add_issue(
     path: str,
     message: str,
 ) -> None:
-    limit = (
-        _MAX_PRIORITY_ISSUES_PER_BUCKET
-        if code in _PRIORITY_ISSUE_CODES
-        else _MAX_GENERIC_ISSUES_PER_BUCKET
-    )
-    if len(bucket) >= limit:
+    if not _can_accept_issue(bucket, code):
         return
-    bucket.append(
-        {
-            "code": code,
-            "blockIndex": block_index,
-            "path": path,
-            "message": message,
-        }
-    )
+    entry = {
+        "code": code,
+        "blockIndex": block_index,
+        "path": path,
+        "message": message,
+    }
+    if isinstance(bucket, _IssueList):
+        bucket.record_append(entry)
+    else:
+        bucket.append(entry)
 
 
 def _check_regex_safety(pattern: Any, path: str, block_index: int, errors: list[dict[str, Any]]) -> None:
@@ -1551,6 +1587,174 @@ def _check_regex_safety(pattern: Any, path: str, block_index: int, errors: list[
         _add_issue(errors, "INVALID_REGEX", block_index, path, f"Invalid regex pattern: {exc}")
 
 
+def _validate_fn_call_body(
+    fn_name: Any,
+    call_val: dict[str, Any],
+    *,
+    version: str,
+    strict: bool,
+    block_index: int,
+    path: str,
+    errors: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    catalog_functions: set[str],
+    data_model: dict[str, Any],
+    catalog_function_specs: dict[str, dict[str, Any]] | None,
+    catalog_id: str | None,
+    effective_catalog_id: str | None,
+    allow_user_activation: bool,
+    item_ctx: Any,
+    is_historical_snapshot: bool,
+    is_superseded: bool,
+    template_validated_url_paths: frozenset[str] | None,
+    max_segments: int,
+    safe_open_urls: _BoundedUrlCache | set[str] | None,
+    uncached_counter: list[int] | None,
+    eval_counter: list[int] | None,
+    max_evals: int | None,
+    budget_exceeded: list[bool] | None,
+) -> None:
+    if not isinstance(fn_name, str) or not fn_name:
+        _add_issue(
+            errors, "INVALID_FUNCTION_CALL", block_index, path, "FunctionCall name must be a non-empty string."
+        )
+        return
+    raw_fn_cat: Any = None
+    if "catalogId" in call_val:
+        raw_fn_cat = call_val.get("catalogId")
+        if not isinstance(raw_fn_cat, str) or not raw_fn_cat.strip():
+            _add_issue(
+                errors,
+                "INVALID_CATALOG_ID",
+                block_index,
+                f"{path}.catalogId",
+                "FunctionCall.catalogId must be a non-empty string when provided.",
+            )
+        elif raw_fn_cat == BROKEN_V09_CATALOG_ID:
+            _add_issue(
+                warnings,
+                "BROKEN_CATALOG_URI",
+                block_index,
+                f"{path}.catalogId",
+                f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
+            )
+    effective_fn_cat = (
+        raw_fn_cat
+        if isinstance(raw_fn_cat, str) and raw_fn_cat.strip()
+        else effective_catalog_id
+    )
+    is_custom_fn_cat = _is_custom_catalog_id(effective_fn_cat, catalog_id or "")
+    fn_spec = None if is_custom_fn_cat else (catalog_function_specs or {}).get(fn_name)
+    if fn_name != "@index" and catalog_functions and fn_name not in catalog_functions:
+        if not is_custom_fn_cat:
+            _add_issue(
+                warnings if not strict else errors,
+                "UNKNOWN_FUNCTION",
+                block_index,
+                path,
+                f"Function '{fn_name}' is not in the Basic Catalog.",
+            )
+    requires_activation = bool(fn_spec and fn_spec.get("requiresUserActivation")) or fn_name == "openUrl"
+    if requires_activation and not allow_user_activation:
+        _add_issue(
+            errors,
+            "INVALID_FUNCTION_CALL_SITE",
+            block_index,
+            path,
+            f"Function '{fn_name}' requires user activation and is only permitted in Button.action.functionCall.",
+        )
+    args = call_val.get("args")
+    req_args = list(fn_spec.get("requiredArgs", [])) if fn_spec else []
+    if fn_name == "openUrl" and "url" not in req_args:
+        req_args.append("url")
+    allowed_args = set((fn_spec.get("args") or {}).keys()) if fn_spec else set()
+
+    if args is None:
+        if req_args:
+            _add_issue(
+                errors,
+                "MISSING_REQUIRED_FUNCTION_ARG",
+                block_index,
+                f"{path}.args",
+                f"Function '{fn_name}' requires arguments: {req_args}.",
+            )
+    elif not isinstance(args, dict):
+        _add_issue(errors, "INVALID_FUNCTION_ARGS", block_index, f"{path}.args", "'args' must be an object.")
+    else:
+        for req_arg in req_args:
+            if req_arg not in args:
+                _add_issue(
+                    errors,
+                    "MISSING_REQUIRED_FUNCTION_ARG",
+                    block_index,
+                    f"{path}.args.{req_arg}",
+                    f"Function '{fn_name}' requires argument '{req_arg}'.",
+                )
+        if allowed_args:
+            extra_args = set(args.keys()) - allowed_args
+            if extra_args:
+                _add_issue(
+                    errors if strict else warnings,
+                    "UNKNOWN_FUNCTION_ARG",
+                    block_index,
+                    f"{path}.args",
+                    f"Unexpected arguments for function '{fn_name}': {sorted(extra_args)}.",
+                )
+        if fn_name == "regex" and "pattern" in args:
+            _check_regex_safety(args["pattern"], f"{path}.args.pattern", block_index, errors)
+        if fn_name == "openUrl" and "url" in args:
+            open_url_path = f"{path}.args.url"
+            _validate_open_url_arg(
+                args.get("url"),
+                block_index,
+                open_url_path,
+                errors,
+                data_model,
+                strict=strict,
+                warnings=warnings,
+                item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot
+                or (
+                    template_validated_url_paths is not None
+                    and open_url_path in template_validated_url_paths
+                ),
+                is_superseded=is_superseded,
+                safe_url_cache=safe_open_urls,
+                uncached_counter=uncached_counter,
+                max_segments=max_segments,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
+            )
+        for ak, av in args.items():
+            if isinstance(av, (dict, list)):
+                _validate_dynamic_value(
+                    av,
+                    version=version,
+                    strict=strict,
+                    block_index=block_index,
+                    path=f"{path}.args.{ak}",
+                    errors=errors,
+                    warnings=warnings,
+                    catalog_functions=catalog_functions,
+                    data_model=data_model,
+                    catalog_function_specs=catalog_function_specs,
+                    catalog_id=catalog_id,
+                    effective_catalog_id=effective_catalog_id,
+                    allow_user_activation=False,
+                    item_ctx=item_ctx,
+                    is_historical_snapshot=is_historical_snapshot,
+                    is_superseded=is_superseded,
+                    template_validated_url_paths=template_validated_url_paths,
+                    max_segments=max_segments,
+                    safe_open_urls=safe_open_urls,
+                    uncached_counter=uncached_counter,
+                    eval_counter=eval_counter,
+                    max_evals=max_evals,
+                    budget_exceeded=budget_exceeded,
+                )
+
+
 def _validate_dynamic_value(
     val: Any,
     *,
@@ -1579,187 +1783,31 @@ def _validate_dynamic_value(
 ) -> None:
     """Validate DynamicValue, DataBinding (@path), FunctionCall (@call), arrays, and single-@ escape."""
     if isinstance(val, list):
+        is_v1 = version == "1.0"
         for idx, item in enumerate(val):
-            _validate_dynamic_value(
-                item,
-                version=version,
-                strict=strict,
-                block_index=block_index,
-                path=f"{path}[{idx}]",
-                errors=errors,
-                warnings=warnings,
-                catalog_functions=catalog_functions,
-                data_model=data_model,
-                catalog_function_specs=catalog_function_specs,
-                catalog_id=catalog_id,
-                effective_catalog_id=effective_catalog_id,
-                allow_user_activation=False,
-                item_ctx=item_ctx,
-                is_historical_snapshot=is_historical_snapshot,
-                is_superseded=is_superseded,
-                template_validated_url_paths=template_validated_url_paths,
-                max_segments=max_segments,
-                safe_open_urls=safe_open_urls,
-                uncached_counter=uncached_counter,
-                eval_counter=eval_counter,
-                max_evals=max_evals,
-                budget_exceeded=budget_exceeded,
-            )
-        return
-
-    if not isinstance(val, dict):
-        return
-
-    keys = set(val.keys())
-
-    # v1.0 canonical DataBinding
-    if "@path" in keys:
-        if version != "1.0":
-            _add_issue(
-                warnings if not strict else errors,
-                "VERSION_BINDING_MISMATCH",
-                block_index,
-                path,
-                "@path binding used in pre-1.0 payload.",
-            )
-        if keys != {"@path"}:
-            _add_issue(
-                errors,
-                "INVALID_DATA_BINDING",
-                block_index,
-                path,
-                "DataBinding with '@path' must not contain extra properties.",
-            )
-        if not isinstance(val.get("@path"), str) or not val["@path"]:
-            _add_issue(
-                errors,
-                "INVALID_DATA_BINDING",
-                block_index,
-                path,
-                "'@path' must be a non-empty string.",
-            )
-        return
-
-    def _validate_fn_call_body(fn_name: Any, call_val: dict[str, Any]) -> None:
-        if not isinstance(fn_name, str) or not fn_name:
-            _add_issue(
-                errors, "INVALID_FUNCTION_CALL", block_index, path, "FunctionCall name must be a non-empty string."
-            )
-            return
-        raw_fn_cat: Any = None
-        if "catalogId" in call_val:
-            raw_fn_cat = call_val.get("catalogId")
-            if not isinstance(raw_fn_cat, str) or not raw_fn_cat.strip():
-                _add_issue(
-                    errors,
-                    "INVALID_CATALOG_ID",
-                    block_index,
-                    f"{path}.catalogId",
-                    "FunctionCall.catalogId must be a non-empty string when provided.",
-                )
-            elif raw_fn_cat == BROKEN_V09_CATALOG_ID:
-                _add_issue(
-                    warnings,
-                    "BROKEN_CATALOG_URI",
-                    block_index,
-                    f"{path}.catalogId",
-                    f"Catalog URI '{BROKEN_V09_CATALOG_ID}' returns HTTP 404 on a2ui.org; use canonical catalogs/basic/catalog.json.",
-                )
-        effective_fn_cat = (
-            raw_fn_cat
-            if isinstance(raw_fn_cat, str) and raw_fn_cat.strip()
-            else effective_catalog_id
-        )
-        is_custom_fn_cat = _is_custom_catalog_id(effective_fn_cat, catalog_id or "")
-        fn_spec = None if is_custom_fn_cat else (catalog_function_specs or {}).get(fn_name)
-        if fn_name != "@index" and catalog_functions and fn_name not in catalog_functions:
-            if not is_custom_fn_cat:
-                _add_issue(
-                    warnings if not strict else errors,
-                    "UNKNOWN_FUNCTION",
-                    block_index,
-                    path,
-                    f"Function '{fn_name}' is not in the Basic Catalog.",
-                )
-        requires_activation = bool(fn_spec and fn_spec.get("requiresUserActivation")) or fn_name == "openUrl"
-        if requires_activation and not allow_user_activation:
-            _add_issue(
-                errors,
-                "INVALID_FUNCTION_CALL_SITE",
-                block_index,
-                path,
-                f"Function '{fn_name}' requires user activation and is only permitted in Button.action.functionCall.",
-            )
-        args = call_val.get("args")
-        req_args = list(fn_spec.get("requiredArgs", [])) if fn_spec else []
-        if fn_name == "openUrl" and "url" not in req_args:
-            req_args.append("url")
-        allowed_args = set((fn_spec.get("args") or {}).keys()) if fn_spec else set()
-
-        if args is None:
-            if req_args:
-                _add_issue(
-                    errors,
-                    "MISSING_REQUIRED_FUNCTION_ARG",
-                    block_index,
-                    f"{path}.args",
-                    f"Function '{fn_name}' requires arguments: {req_args}.",
-                )
-        elif not isinstance(args, dict):
-            _add_issue(errors, "INVALID_FUNCTION_ARGS", block_index, f"{path}.args", "'args' must be an object.")
-        else:
-            for req_arg in req_args:
-                if req_arg not in args:
-                    _add_issue(
-                        errors,
-                        "MISSING_REQUIRED_FUNCTION_ARG",
-                        block_index,
-                        f"{path}.args.{req_arg}",
-                        f"Function '{fn_name}' requires argument '{req_arg}'.",
-                    )
-            if allowed_args:
-                extra_args = set(args.keys()) - allowed_args
-                if extra_args:
-                    _add_issue(
-                        errors if strict else warnings,
-                        "UNKNOWN_FUNCTION_ARG",
-                        block_index,
-                        f"{path}.args",
-                        f"Unexpected arguments for function '{fn_name}': {sorted(extra_args)}.",
-                    )
-            if fn_name == "regex" and "pattern" in args:
-                _check_regex_safety(args["pattern"], f"{path}.args.pattern", block_index, errors)
-            if fn_name == "openUrl" and "url" in args:
-                open_url_path = f"{path}.args.url"
-                _validate_open_url_arg(
-                    args.get("url"),
-                    block_index,
-                    open_url_path,
-                    errors,
-                    data_model,
-                    strict=strict,
-                    warnings=warnings,
-                    item_ctx=item_ctx,
-                    is_historical_snapshot=is_historical_snapshot
-                    or (
-                        template_validated_url_paths is not None
-                        and open_url_path in template_validated_url_paths
-                    ),
-                    is_superseded=is_superseded,
-                    safe_url_cache=safe_open_urls,
-                    uncached_counter=uncached_counter,
-                    max_segments=max_segments,
-                    eval_counter=eval_counter,
-                    max_evals=max_evals,
-                    budget_exceeded=budget_exceeded,
-                )
-            for ak, av in args.items():
+            it_type = type(item)
+            if it_type is dict:
+                if not item:
+                    continue
+                if "@path" not in item and "@call" not in item and "call" not in item:
+                    if not (is_v1 and len(item) == 1 and "path" in item):
+                        needs_recurse = False
+                        for ik, iv in item.items():
+                            if is_v1 and type(ik) is str and ik and ik[0] == "@":
+                                needs_recurse = True
+                                break
+                            vt = type(iv)
+                            if (vt is dict or vt is list) and iv:
+                                needs_recurse = True
+                                break
+                        if not needs_recurse:
+                            continue
                 _validate_dynamic_value(
-                    av,
+                    item,
                     version=version,
                     strict=strict,
                     block_index=block_index,
-                    path=f"{path}.args.{ak}",
+                    path=f"{path}[{idx}]",
                     errors=errors,
                     warnings=warnings,
                     catalog_functions=catalog_functions,
@@ -1779,10 +1827,68 @@ def _validate_dynamic_value(
                     max_evals=max_evals,
                     budget_exceeded=budget_exceeded,
                 )
+            elif it_type is list and item:
+                _validate_dynamic_value(
+                    item,
+                    version=version,
+                    strict=strict,
+                    block_index=block_index,
+                    path=f"{path}[{idx}]",
+                    errors=errors,
+                    warnings=warnings,
+                    catalog_functions=catalog_functions,
+                    data_model=data_model,
+                    catalog_function_specs=catalog_function_specs,
+                    catalog_id=catalog_id,
+                    effective_catalog_id=effective_catalog_id,
+                    allow_user_activation=False,
+                    item_ctx=item_ctx,
+                    is_historical_snapshot=is_historical_snapshot,
+                    is_superseded=is_superseded,
+                    template_validated_url_paths=template_validated_url_paths,
+                    max_segments=max_segments,
+                    safe_open_urls=safe_open_urls,
+                    uncached_counter=uncached_counter,
+                    eval_counter=eval_counter,
+                    max_evals=max_evals,
+                    budget_exceeded=budget_exceeded,
+                )
+        return
+
+    if not isinstance(val, dict) or not val:
+        return
+
+    # v1.0 canonical DataBinding
+    if "@path" in val:
+        if version != "1.0":
+            _add_issue(
+                warnings if not strict else errors,
+                "VERSION_BINDING_MISMATCH",
+                block_index,
+                path,
+                "@path binding used in pre-1.0 payload.",
+            )
+        if len(val) != 1:
+            _add_issue(
+                errors,
+                "INVALID_DATA_BINDING",
+                block_index,
+                path,
+                "DataBinding with '@path' must not contain extra properties.",
+            )
+        if not isinstance(val.get("@path"), str) or not val["@path"]:
+            _add_issue(
+                errors,
+                "INVALID_DATA_BINDING",
+                block_index,
+                path,
+                "'@path' must be a non-empty string.",
+            )
+        return
 
     # v1.0 canonical FunctionCall
-    if "@call" in keys:
-        extra = keys - {"@call", "args", "catalogId"}
+    if "@call" in val:
+        extra = set(val.keys()) - {"@call", "args", "catalogId"}
         if extra:
             _add_issue(
                 errors,
@@ -1791,55 +1897,13 @@ def _validate_dynamic_value(
                 path,
                 f"Unexpected properties on FunctionCall: {sorted(extra)}.",
             )
-        _validate_fn_call_body(val.get("@call"), val)
-        return
-
-    # Transitional v0.9 bindings in v1.0 payloads
-    if version == "1.0":
-        if keys == {"path"} and isinstance(val.get("path"), str):
-            target = errors if strict else warnings
-            _add_issue(
-                target,
-                "TRANSITIONAL_PATH_BINDING",
-                block_index,
-                path,
-                "Transitional {'path': ...} used in v1.0 DynamicValue; use {'@path': ...}.",
-            )
-            return
-        if "call" in keys and isinstance(val.get("call"), str):
-            target = errors if strict else warnings
-            _add_issue(
-                target,
-                "TRANSITIONAL_FUNCTION_CALL",
-                block_index,
-                path,
-                "Transitional {'call': ...} used in v1.0 FunctionCall; use {'@call': ...}.",
-            )
-            _validate_fn_call_body(val.get("call"), val)
-            return
-        # Single-@ reserved key check in literal dynamic objects
-        for key in keys:
-            if _SINGLE_AT_KEY_RE.match(key):
-                _add_issue(
-                    errors,
-                    "INVALID_RESERVED_KEY",
-                    block_index,
-                    f"{path}.{key}",
-                    f"Unrecognized single-'@' key '{key}' in dynamic object; escape literal '@' keys with '@@'.",
-                )
-    else:
-        if "call" in keys and isinstance(val.get("call"), str):
-            _validate_fn_call_body(val.get("call"), val)
-            return
-
-    # Recurse into literal dict values
-    for k, v in val.items():
-        _validate_dynamic_value(
-            v,
+        _validate_fn_call_body(
+            val.get("@call"),
+            val,
             version=version,
             strict=strict,
             block_index=block_index,
-            path=f"{path}.{k}",
+            path=path,
             errors=errors,
             warnings=warnings,
             catalog_functions=catalog_functions,
@@ -1847,7 +1911,7 @@ def _validate_dynamic_value(
             catalog_function_specs=catalog_function_specs,
             catalog_id=catalog_id,
             effective_catalog_id=effective_catalog_id,
-            allow_user_activation=False,
+            allow_user_activation=allow_user_activation,
             item_ctx=item_ctx,
             is_historical_snapshot=is_historical_snapshot,
             is_superseded=is_superseded,
@@ -1859,6 +1923,124 @@ def _validate_dynamic_value(
             max_evals=max_evals,
             budget_exceeded=budget_exceeded,
         )
+        return
+
+    # Transitional v0.9 bindings in v1.0 payloads
+    if version == "1.0":
+        if len(val) == 1 and "path" in val and isinstance(val.get("path"), str):
+            target = errors if strict else warnings
+            _add_issue(
+                target,
+                "TRANSITIONAL_PATH_BINDING",
+                block_index,
+                path,
+                "Transitional {'path': ...} used in v1.0 DynamicValue; use {'@path': ...}.",
+            )
+            return
+        if "call" in val and isinstance(val.get("call"), str):
+            target = errors if strict else warnings
+            _add_issue(
+                target,
+                "TRANSITIONAL_FUNCTION_CALL",
+                block_index,
+                path,
+                "Transitional {'call': ...} used in v1.0 FunctionCall; use {'@call': ...}.",
+            )
+            _validate_fn_call_body(
+                val.get("call"),
+                val,
+                version=version,
+                strict=strict,
+                block_index=block_index,
+                path=path,
+                errors=errors,
+                warnings=warnings,
+                catalog_functions=catalog_functions,
+                data_model=data_model,
+                catalog_function_specs=catalog_function_specs,
+                catalog_id=catalog_id,
+                effective_catalog_id=effective_catalog_id,
+                allow_user_activation=allow_user_activation,
+                item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot,
+                is_superseded=is_superseded,
+                template_validated_url_paths=template_validated_url_paths,
+                max_segments=max_segments,
+                safe_open_urls=safe_open_urls,
+                uncached_counter=uncached_counter,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
+            )
+            return
+        # Single-@ reserved key check in literal dynamic objects
+        for key in val:
+            if isinstance(key, str) and key.startswith("@") and _SINGLE_AT_KEY_RE.match(key):
+                _add_issue(
+                    errors,
+                    "INVALID_RESERVED_KEY",
+                    block_index,
+                    f"{path}.{key}",
+                    f"Unrecognized single-'@' key '{key}' in dynamic object; escape literal '@' keys with '@@'.",
+                )
+    else:
+        if "call" in val and isinstance(val.get("call"), str):
+            _validate_fn_call_body(
+                val.get("call"),
+                val,
+                version=version,
+                strict=strict,
+                block_index=block_index,
+                path=path,
+                errors=errors,
+                warnings=warnings,
+                catalog_functions=catalog_functions,
+                data_model=data_model,
+                catalog_function_specs=catalog_function_specs,
+                catalog_id=catalog_id,
+                effective_catalog_id=effective_catalog_id,
+                allow_user_activation=allow_user_activation,
+                item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot,
+                is_superseded=is_superseded,
+                template_validated_url_paths=template_validated_url_paths,
+                max_segments=max_segments,
+                safe_open_urls=safe_open_urls,
+                uncached_counter=uncached_counter,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
+            )
+            return
+
+    # Recurse into literal dict values
+    for k, v in val.items():
+        if isinstance(v, (dict, list)):
+            _validate_dynamic_value(
+                v,
+                version=version,
+                strict=strict,
+                block_index=block_index,
+                path=f"{path}.{k}",
+                errors=errors,
+                warnings=warnings,
+                catalog_functions=catalog_functions,
+                data_model=data_model,
+                catalog_function_specs=catalog_function_specs,
+                catalog_id=catalog_id,
+                effective_catalog_id=effective_catalog_id,
+                allow_user_activation=False,
+                item_ctx=item_ctx,
+                is_historical_snapshot=is_historical_snapshot,
+                is_superseded=is_superseded,
+                template_validated_url_paths=template_validated_url_paths,
+                max_segments=max_segments,
+                safe_open_urls=safe_open_urls,
+                uncached_counter=uncached_counter,
+                eval_counter=eval_counter,
+                max_evals=max_evals,
+                budget_exceeded=budget_exceeded,
+            )
 
 
 def _validate_open_url_arg(
@@ -2102,20 +2284,89 @@ def _validate_media_prop(
 def _iter_open_url_slots(obj: Any, base_path: str) -> list[tuple[str, Any]]:
     """Collect (path, url_arg) pairs for every openUrl FunctionCall inside a component."""
     found: list[tuple[str, Any]] = []
-    stack: list[tuple[Any, str]] = [(obj, base_path)]
-    while stack:
-        cur, cur_path = stack.pop()
-        if isinstance(cur, dict):
-            fn_name = cur.get("@call") if "@call" in cur else cur.get("call")
-            if fn_name == "openUrl" and isinstance(cur.get("args"), dict) and "url" in cur["args"]:
-                found.append((f"{cur_path}.args.url", cur["args"]["url"]))
-            for k, v in cur.items():
-                if isinstance(v, (dict, list)):
-                    stack.append((v, f"{cur_path}.{k}"))
-        elif isinstance(cur, list):
-            for idx, item in enumerate(cur):
-                if isinstance(item, (dict, list)):
-                    stack.append((item, f"{cur_path}[{idx}]"))
+    if not isinstance(obj, (dict, list)) or not obj:
+        return found
+
+    # Frames: [is_list, iterator]
+    frames: list[tuple[bool, Any]] = [
+        (True, enumerate(obj)) if isinstance(obj, list) else (False, iter(obj.items()))
+    ]
+    path_segs: list[str | int] = []
+
+    def _fmt_path() -> str:
+        parts: list[str] = [base_path]
+        for seg in path_segs:
+            parts.append(f"[{seg}]" if isinstance(seg, int) else f".{seg}")
+        return "".join(parts)
+
+    if isinstance(obj, dict):
+        fn_name = obj.get("@call") if "@call" in obj else obj.get("call")
+        if fn_name == "openUrl" and isinstance(obj.get("args"), dict) and "url" in obj["args"]:
+            found.append((f"{base_path}.args.url", obj["args"]["url"]))
+
+    while frames:
+        is_list, it = frames[-1]
+        pushed = False
+        if is_list:
+            for cur_idx, item in it:
+                it_t = type(item)
+                if it_t is dict:
+                    if not item:
+                        continue
+                    if "@call" in item or "call" in item:
+                        fn_name = item.get("@call") if "@call" in item else item.get("call")
+                        if fn_name == "openUrl" and isinstance(item.get("args"), dict) and "url" in item["args"]:
+                            path_segs.append(cur_idx)
+                            found.append((f"{_fmt_path()}.args.url", item["args"]["url"]))
+                            path_segs.pop()
+                    has_nested = False
+                    for v in item.values():
+                        vt = type(v)
+                        if (vt is dict or vt is list) and v:
+                            has_nested = True
+                            break
+                    if has_nested:
+                        path_segs.append(cur_idx)
+                        frames.append((False, iter(item.items())))
+                        pushed = True
+                        break
+                elif it_t is list and item:
+                    path_segs.append(cur_idx)
+                    frames.append((True, enumerate(item)))
+                    pushed = True
+                    break
+        else:
+            for k, v in it:
+                vt = type(v)
+                if vt is dict:
+                    if not v:
+                        continue
+                    if "@call" in v or "call" in v:
+                        fn_name = v.get("@call") if "@call" in v else v.get("call")
+                        if fn_name == "openUrl" and isinstance(v.get("args"), dict) and "url" in v["args"]:
+                            path_segs.append(k)
+                            found.append((f"{_fmt_path()}.args.url", v["args"]["url"]))
+                            path_segs.pop()
+                    has_nested = False
+                    for sub_v in v.values():
+                        svt = type(sub_v)
+                        if (svt is dict or svt is list) and sub_v:
+                            has_nested = True
+                            break
+                    if has_nested:
+                        path_segs.append(k)
+                        frames.append((False, iter(v.items())))
+                        pushed = True
+                        break
+                elif vt is list and v:
+                    path_segs.append(k)
+                    frames.append((True, enumerate(v)))
+                    pushed = True
+                    break
+        if not pushed:
+            frames.pop()
+            if path_segs:
+                path_segs.pop()
     return found
 
 
@@ -2124,19 +2375,18 @@ def _append_unique_issues(
     new_issues: list[dict[str, Any]],
     seen: set[tuple[str, int, str, str]],
 ) -> None:
+    is_indexed = isinstance(target, _IssueList)
     for issue in new_issues:
         code = issue["code"]
-        limit = (
-            _MAX_PRIORITY_ISSUES_PER_BUCKET
-            if code in _PRIORITY_ISSUE_CODES
-            else _MAX_GENERIC_ISSUES_PER_BUCKET
-        )
-        if len(target) >= limit:
+        if not _can_accept_issue(target, code):
             continue
         key = (code, issue["blockIndex"], issue["path"], issue["message"])
         if key not in seen:
             seen.add(key)
-            target.append(issue)
+            if is_indexed:
+                target.record_append(issue)
+            else:
+                target.append(issue)
 
 
 def _validate_action(
@@ -3086,35 +3336,40 @@ def _validate_surface_components(
                         errors, "INVALID_CHECKS", block_index, f"{cpath}.@checks", "@checks must be a list."
                     )
                 else:
+                    invalid_check_rule_errs = 0
+                    invalid_check_cond_errs = 0
                     for ch_idx, rule in enumerate(checks_val):
-                        rpath = f"{cpath}.@checks[{ch_idx}]"
-                        if not isinstance(rule, dict) or "condition" not in rule:
-                            _add_issue(
-                                errors,
-                                "INVALID_CHECK_RULE",
-                                block_index,
-                                rpath,
-                                "CheckRule must be an object containing 'condition'.",
-                            )
+                        if type(rule) is not dict or "condition" not in rule:
+                            if invalid_check_rule_errs < _MAX_ISSUES_PER_CODE:
+                                invalid_check_rule_errs += 1
+                                _add_issue(
+                                    errors,
+                                    "INVALID_CHECK_RULE",
+                                    block_index,
+                                    f"{cpath}.@checks[{ch_idx}]",
+                                    "CheckRule must be an object containing 'condition'.",
+                                )
                             continue
                         cond = rule["condition"]
                         if not isinstance(cond, dict) or not (
                             "@path" in cond or "@call" in cond or "path" in cond or "call" in cond
                         ):
-                            _add_issue(
-                                errors,
-                                "INVALID_CHECK_CONDITION",
-                                block_index,
-                                f"{rpath}.condition",
-                                "CheckRule.condition must be a DataBinding or FunctionCall.",
-                            )
+                            if invalid_check_cond_errs < _MAX_ISSUES_PER_CODE:
+                                invalid_check_cond_errs += 1
+                                _add_issue(
+                                    errors,
+                                    "INVALID_CHECK_CONDITION",
+                                    block_index,
+                                    f"{cpath}.@checks[{ch_idx}].condition",
+                                    "CheckRule.condition must be a DataBinding or FunctionCall.",
+                                )
                         else:
                             _validate_dynamic_value(
                                 cond,
                                 version=version,
                                 strict=strict,
                                 block_index=block_index,
-                                path=f"{rpath}.condition",
+                                path=f"{cpath}.@checks[{ch_idx}].condition",
                                 errors=errors,
                                 warnings=warnings,
                                 catalog_functions=catalog_functions,
@@ -3350,8 +3605,10 @@ def validate_payload(
         max_bytes=max_bytes,
         max_depth=max_depth,
     )
-    errors: list[dict[str, Any]] = list(parsed["errors"])
-    warnings: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = _IssueList()
+    for perr in parsed["errors"]:
+        _add_issue(errors, perr["code"], perr["blockIndex"], perr["path"], perr["message"])
+    warnings: list[dict[str, Any]] = _IssueList()
     detected_versions: list[str] = []
     surface_ids: list[str] = []
     total_components = 0
@@ -4348,8 +4605,8 @@ def validate_payload(
             slots_by_cid = surface_url_slots.setdefault(sid_ing, {})
             tpl_map = surface_childlist_templates.setdefault(sid_ing, {})
             dm = surface_data_models.get(sid_ing, {})
-            tmp_errors: list[dict[str, Any]] = []
-            tmp_warnings: list[dict[str, Any]] = []
+            tmp_errors: list[dict[str, Any]] = _IssueList()
+            tmp_warnings: list[dict[str, Any]] = _IssueList()
 
             # Pre-parse incoming components before mutating any surface graph state
             parsed_incoming: list[
@@ -4871,8 +5128,8 @@ def validate_payload(
             if isinstance(ptr, str):
                 ptr = _canonicalize_json_pointer(ptr, max_segments=max_ptr_segments)
             dm = surface_data_models.get(sid_upd, {})
-            tmp_errors: list[dict[str, Any]] = []
-            tmp_warnings: list[dict[str, Any]] = []
+            tmp_errors: list[dict[str, Any]] = _IssueList()
+            tmp_warnings: list[dict[str, Any]] = _IssueList()
             ptr_is_root = ptr in {"", "/"}
             strict_ptr_ancs: list[str] | tuple[str, ...] = ()
             if not ptr_is_root and isinstance(ptr, str) and ptr.find("/", 1) != -1:
@@ -6457,8 +6714,8 @@ def validate_payload(
         "blockCount": parsed["blockCount"],
         "surfaceIds": surface_ids,
         "componentCount": total_components,
-        "errors": errors,
-        "warnings": warnings,
+        "errors": list(errors),
+        "warnings": list(warnings),
         "stats": {
             "byteLength": parsed["byteLength"],
             "messageCount": total_messages,
