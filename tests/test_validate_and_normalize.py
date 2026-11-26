@@ -2487,6 +2487,451 @@ class TestValidateAndNormalize(unittest.TestCase):
         res_add = validate_payload(json.dumps(additive_ok), version="1.0", strict=True)
         self.assertTrue(res_add["ok"], res_add["errors"])
 
+    def test_surface_url_eval_cap_shared_template_dedup_and_v08_root_merge_timing(self) -> None:
+        """Shared-template dedup, unified surface URL eval cap, and v0.8 per-key root merge keep fan-out storms bounded."""
+        shared_comps = (
+            [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(249)]}]
+            + [
+                {"id": f"l{k}", "component": "List", "children": {"componentId": "tpl", "path": "/items"}}
+                for k in range(249)
+            ]
+            + [{"id": "tpl", "component": "Column", "children": [f"v{k}" for k in range(249)]}]
+            + [
+                {
+                    "id": f"v{k}",
+                    "component": "Video",
+                    "url": {"@call": "formatString", "args": {"value": "https://example.com/${u}"}},
+                    "posterUrl": {"@call": "formatString", "args": {"value": "https://example.com/${u}"}},
+                }
+                for k in range(249)
+            ]
+        )
+
+        # 1. Shared-template single-item streaming fan-out (deduped)
+        shared_stream = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fan_shared_stream",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": shared_comps,
+                    "dataModel": {"items": [{"u": "a"}]},
+                },
+            }
+        ] + [
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "fan_shared_stream", "path": "/items/0/u", "value": f"b{k}"},
+            }
+            for k in range(10)
+        ]
+        raw_ss = json.dumps(shared_stream)
+        t0 = time.perf_counter()
+        res_ss = validate_payload(raw_ss, version="1.0", strict=True)
+        self.assertTrue(res_ss["ok"], res_ss["errors"])
+        self.assertLess(time.perf_counter() - t0, 0.5)
+
+        # 2. Shared-template createSurface fan-out (deduped)
+        shared_cs = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fan_shared_cs",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": shared_comps,
+                    "dataModel": {"items": [{"u": "a"} for _ in range(20)]},
+                },
+            }
+        ]
+        raw_sc = json.dumps(shared_cs)
+        t1 = time.perf_counter()
+        res_sc = validate_payload(raw_sc, version="1.0", strict=True)
+        self.assertTrue(res_sc["ok"], res_sc["errors"])
+        self.assertLess(time.perf_counter() - t1, 0.5)
+
+        # 3a. Single-List 498-Video fan-out (valid small list + large list hitting surface URL eval cap)
+        single_list_comps = (
+            [
+                {"id": "root", "component": "List", "children": {"componentId": "tpl", "path": "/items"}},
+                {"id": "tpl", "component": "Column", "children": [f"v{k}" for k in range(498)]},
+            ]
+            + [
+                {
+                    "id": f"v{k}",
+                    "component": "Video",
+                    "url": {"@call": "formatString", "args": {"value": "https://example.com/${u}"}},
+                    "posterUrl": {"@call": "formatString", "args": {"value": "https://example.com/${u}"}},
+                }
+                for k in range(498)
+            ]
+        )
+        single_50 = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fan_single_50",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": single_list_comps,
+                    "dataModel": {"items": [{"u": "a"} for _ in range(50)]},
+                },
+            }
+        ]
+        raw_s50 = json.dumps(single_50)
+        t2 = time.perf_counter()
+        res_s50 = validate_payload(raw_s50, version="1.0", strict=True)
+        self.assertTrue(res_s50["ok"], res_s50["errors"])
+        self.assertLess(time.perf_counter() - t2, 0.5)
+
+        single_cap = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fan_single_cap",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": single_list_comps,
+                    "dataModel": {"items": [{"u": f"a{k}"} for k in range(300)]},
+                },
+            }
+        ]
+        raw_scap = json.dumps(single_cap, separators=(",", ":"))
+        t3 = time.perf_counter()
+        res_scap = validate_payload(raw_scap, version="1.0", strict=True)
+        self.assertFalse(res_scap["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_scap["errors"]})
+        self.assertLess(time.perf_counter() - t3, 0.5)
+
+        # 3b. Direct 499-Video fan-out (50 updates pass fast; 200 updates trip surface URL eval cap)
+        direct_comps = (
+            [{"id": "root", "component": "Column", "children": [f"v{k}" for k in range(499)]}]
+            + [
+                {
+                    "id": f"v{k}",
+                    "component": "Video",
+                    "url": {"@call": "formatString", "args": {"value": "https://example.com/${/u}"}},
+                    "posterUrl": {"@call": "formatString", "args": {"value": "https://example.com/${/u}"}},
+                }
+                for k in range(499)
+            ]
+        )
+        direct_50 = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "fan_direct_50",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": direct_comps,
+                    "dataModel": {"u": "a"},
+                },
+            }
+        ] + [
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "fan_direct_50", "path": "/u", "value": f"v{k}"},
+            }
+            for k in range(50)
+        ]
+        raw_d50 = json.dumps(direct_50)
+        t4 = time.perf_counter()
+        res_d50 = validate_payload(raw_d50, version="1.0", strict=True)
+        self.assertTrue(res_d50["ok"], res_d50["errors"])
+        self.assertLess(time.perf_counter() - t4, 0.5)
+
+        direct_cap = direct_50[:1] + [
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "fan_direct_50", "path": "/u", "value": f"v{k}"},
+            }
+            for k in range(200)
+        ]
+        raw_dcap = json.dumps(direct_cap, separators=(",", ":"))
+        t5 = time.perf_counter()
+        res_dcap = validate_payload(raw_dcap, version="1.0", strict=True)
+        self.assertFalse(res_dcap["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_dcap["errors"]})
+        self.assertLess(time.perf_counter() - t5, 0.5)
+
+        # 4. v0.8 root-merge dataModelUpdate.contents scoped per key (unrelated key avoids full list rescan)
+        v08_storm = [
+            {"beginRendering": {"surfaceId": "v8_merge", "root": "root"}},
+            {
+                "surfaceUpdate": {
+                    "surfaceId": "v8_merge",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": {
+                                "List": {"children": {"template": {"componentId": "r", "dataBinding": "/items"}}}
+                            },
+                        },
+                        {"id": "r", "component": {"Image": {"url": {"path": "u"}}}},
+                    ],
+                }
+            },
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "v8_merge",
+                    "path": "/",
+                    "value": {"items": [{"u": f"https://example.com/{k}"} for k in range(10_000)]},
+                }
+            },
+        ] + [
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "v8_merge",
+                    "path": "/",
+                    "contents": [{"key": "c", "valueString": f"y{k}"}],
+                }
+            }
+            for k in range(50)
+        ]
+        raw_v08 = json.dumps(v08_storm, separators=(",", ":"))
+        t6 = time.perf_counter()
+        res_v08 = validate_payload(raw_v08, version="0.8", strict=False)
+        self.assertTrue(res_v08["ok"], res_v08["errors"])
+        self.assertLess(time.perf_counter() - t6, 0.5)
+
+        # v0.8 root-merge updating the actual list key still catches unsafe URLs
+        v08_bad_merge = [
+            {"beginRendering": {"surfaceId": "v8_bad", "root": "root"}},
+            {
+                "surfaceUpdate": {
+                    "surfaceId": "v8_bad",
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": {
+                                "List": {"children": {"template": {"componentId": "r", "dataBinding": "/items"}}}
+                            },
+                        },
+                        {"id": "r", "component": {"Image": {"url": {"path": "u"}}}},
+                    ],
+                }
+            },
+            {
+                "dataModelUpdate": {
+                    "surfaceId": "v8_bad",
+                    "path": "/",
+                    "contents": [
+                        {
+                            "key": "items",
+                            "valueArray": [{"valueMap": [{"key": "u", "valueString": "javascript:alert(1)"}]}],
+                        }
+                    ],
+                }
+            },
+        ]
+        res_v08_bad = validate_payload(json.dumps(v08_bad_merge), version="0.8", strict=False)
+        self.assertFalse(res_v08_bad["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_v08_bad["errors"]})
+
+    def test_rfc6901_tilde_pointer_aliasing_fails_closed(self) -> None:
+        """Unescaped '~' and canonical '~0' JSON Pointers normalize identically across ChildLists and direct slots."""
+        # 1. ChildList bound to /~0 mutated via /~/0/u fails closed
+        childlist_tilde = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "tilde_list",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/~0"}},
+                        {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {"~": [{"u": "https://example.com/ok.png"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "tilde_list",
+                    "path": "/~/0/u",
+                    "value": "javascript:alert(1)",
+                },
+            },
+        ]
+        res_cl = validate_payload(json.dumps(childlist_tilde), version="1.0", strict=True)
+        self.assertFalse(res_cl["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_cl["errors"]})
+
+        # 2. Direct slot bound to /~0 mutated via /~ then overwritten via /~0 fails closed
+        direct_tilde = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "tilde_direct",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Image", "url": {"@path": "/~0"}}],
+                    "dataModel": {"~": "https://example.com/ok.png"},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "tilde_direct", "path": "/~", "value": "javascript:alert(1)"},
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "tilde_direct",
+                    "path": "/~0",
+                    "value": "https://example.com/clean.png",
+                },
+            },
+        ]
+        res_dir = validate_payload(json.dumps(direct_tilde), version="1.0", strict=True)
+        self.assertFalse(res_dir["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_dir["errors"]})
+
+        # 3. openUrl bound to /~0 inside ChildList mutated via /~/0/href fails closed with UNSAFE_OPEN_URL
+        openurl_tilde = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "tilde_open",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_btn", "path": "/~0"}},
+                        {
+                            "id": "row_btn",
+                            "component": "Button",
+                            "child": "row_lbl",
+                            "action": {
+                                "functionCall": {"@call": "openUrl", "args": {"url": {"@path": "href"}}}
+                            },
+                        },
+                        {"id": "row_lbl", "component": "Text", "text": "Go"},
+                    ],
+                    "dataModel": {"~": [{"href": "https://example.com/ok"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "tilde_open",
+                    "path": "/~/0/href",
+                    "value": "https://example.com@evil.example/phish",
+                },
+            },
+        ]
+        res_open = validate_payload(json.dumps(openurl_tilde), version="1.0", strict=True)
+        self.assertFalse(res_open["ok"])
+        self.assertIn("UNSAFE_OPEN_URL", {e["code"] for e in res_open["errors"]})
+
+    def test_reparented_components_with_deferred_data_pass_while_detached_fail_closed(self) -> None:
+        """Re-parenting active components with deferred data passes while detached/changed template bindings fail closed."""
+        # 1. Direct component wrapped under a new Card with deferred /hero_url passes strict validation
+        direct_reparent = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "rep_direct_ok",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["img_a"]},
+                        {
+                            "id": "img_a",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${/hero_url}"}},
+                        },
+                    ],
+                    "dataModel": {},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "rep_direct_ok",
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["card_wrap"]},
+                        {"id": "card_wrap", "component": "Card", "child": "img_a"},
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "rep_direct_ok",
+                    "path": "/hero_url",
+                    "value": "https://example.com/hero.png",
+                },
+            },
+        ]
+        res_dr = validate_payload(json.dumps(direct_reparent), version="1.0", strict=True)
+        self.assertTrue(res_dr["ok"], res_dr["errors"])
+
+        # 2. Template component wrapped under a new Card with deferred /items/0/u passes strict validation
+        tpl_reparent = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "rep_tpl_ok",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "mid", "path": "/items"}},
+                        {"id": "mid", "component": "Column", "children": ["row_img"]},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${u}"}},
+                        },
+                    ],
+                    "dataModel": {"items": [{}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "rep_tpl_ok",
+                    "components": [
+                        {"id": "mid", "component": "Column", "children": ["card_wrap"]},
+                        {"id": "card_wrap", "component": "Card", "child": "row_img"},
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "rep_tpl_ok",
+                    "path": "/items/0/u",
+                    "value": "https://example.com/item.png",
+                },
+            },
+        ]
+        res_tr = validate_payload(json.dumps(tpl_reparent), version="1.0", strict=True)
+        self.assertTrue(res_tr["ok"], res_tr["errors"])
+
+        # 3. Rebinding ChildList to a different path while pre-batch list item was unresolved still fails closed
+        rebind_lost_chain = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "rep_lost_chain",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "mid", "path": "/items_a"}},
+                        {"id": "mid", "component": "Column", "children": ["row_img"]},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${u}"}},
+                        },
+                    ],
+                    "dataModel": {"items_a": [{}], "items_b": [{"u": "https://example.com/ok.png"}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "rep_lost_chain",
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "mid", "path": "/items_b"}},
+                    ],
+                },
+            },
+        ]
+        res_lost = validate_payload(json.dumps(rebind_lost_chain), version="1.0", strict=True)
+        self.assertFalse(res_lost["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_lost["errors"]})
+
 
 if __name__ == "__main__":
     unittest.main()

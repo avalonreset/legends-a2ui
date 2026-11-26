@@ -1,6 +1,7 @@
 """Offline A2UI protocol, Basic Catalog, graph, URL safety, and secret validator."""
 from __future__ import annotations
 
+from functools import lru_cache
 import re
 from typing import Any
 
@@ -137,10 +138,27 @@ def _parse_rfc6901_array_index(seg: str) -> int | None:
     return int(seg)
 
 
+def _canonicalize_json_pointer(ptr: str) -> str:
+    """Canonicalize an RFC 6901 JSON Pointer (absolute or relative) so '~' and '~0' map identically."""
+    if not isinstance(ptr, str) or ptr in {"", "/"} or "~" not in ptr:
+        return ptr
+    if ptr.startswith("/"):
+        return "/" + "/".join(
+            s.replace("~1", "/").replace("~0", "~").replace("~", "~0").replace("/", "~1")
+            for s in ptr[1:].split("/")
+        )
+    return "/".join(
+        s.replace("~1", "/").replace("~0", "~").replace("~", "~0").replace("/", "~1")
+        for s in ptr.split("/")
+    )
+
+
 def _child_index_under(parent_ptr: str, target_ptr: str) -> int | None:
     """Extract the immediate child array index of target_ptr under parent_ptr, if valid."""
     if not isinstance(target_ptr, str) or not target_ptr.startswith("/"):
         return None
+    parent_ptr = _canonicalize_json_pointer(parent_ptr)
+    target_ptr = _canonicalize_json_pointer(target_ptr)
     if parent_ptr in {"", "/"}:
         rest = target_ptr[1:]
     else:
@@ -162,33 +180,34 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> tupl
     """
     if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
         return (pointer if isinstance(pointer, str) else "/", None)
-    raw_parts = pointer[1:].split("/")
+    canon_pointer = _canonicalize_json_pointer(pointer)
+    raw_parts = canon_pointer[1:].split("/")
     parts = [p.replace("~1", "/").replace("~0", "~") for p in raw_parts]
     if not parts:
-        return (pointer, None)
+        return (canon_pointer, None)
     cur: Any = root
     for seg in parts[:-1]:
         if isinstance(cur, dict):
             nxt = cur.get(seg)
             if not isinstance(nxt, (dict, list)):
                 if value is None:
-                    return (pointer, None)
+                    return (canon_pointer, None)
                 nxt = {}
                 cur[seg] = nxt
             cur = nxt
         elif isinstance(cur, list):
             idx = _parse_rfc6901_array_index(seg)
             if idx is None or idx >= len(cur):
-                return (pointer, None)
+                return (canon_pointer, None)
             nxt = cur[idx]
             if not isinstance(nxt, (dict, list)):
                 if value is None:
-                    return (pointer, None)
+                    return (canon_pointer, None)
                 nxt = {}
                 cur[idx] = nxt
             cur = nxt
         else:
-            return (pointer, None)
+            return (canon_pointer, None)
     last = parts[-1]
     parent_ptr = "" if len(raw_parts) == 1 else "/" + "/".join(raw_parts[:-1])
     if isinstance(cur, dict):
@@ -196,7 +215,7 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> tupl
             cur.pop(last, None)
         else:
             cur[last] = value
-        return (pointer, None)
+        return (canon_pointer, None)
     if isinstance(cur, list):
         idx = _parse_rfc6901_array_index(last)
         if idx is not None:
@@ -209,12 +228,12 @@ def _mutate_json_pointer(root: dict[str, Any], pointer: str, value: Any) -> tupl
                     cur[idx] = value
                 elif idx == len(cur):
                     cur.append(value)
-            return (pointer, None)
+            return (canon_pointer, None)
         if last == "-" and value is not None:
             new_idx = len(cur)
             cur.append(value)
             return (f"{parent_ptr}/{new_idx}", None)
-    return (pointer, None)
+    return (canon_pointer, None)
 
 
 def _convert_v08_typed_value(entry: dict[str, Any]) -> Any:
@@ -246,6 +265,7 @@ def _pointer_ancestors(pointer: str) -> list[str]:
     """Return all non-root ancestor prefixes of an RFC 6901 pointer, including itself."""
     if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
         return []
+    pointer = _canonicalize_json_pointer(pointer)
     parts = pointer[1:].split("/")
     ancestors: list[str] = []
     cur = ""
@@ -258,6 +278,8 @@ def _pointer_ancestors(pointer: str) -> list[str]:
 
 def _pointers_overlap(p1: str, p2: str) -> bool:
     """Return True when two RFC 6901 JSON Pointers are identical or ancestor/descendant."""
+    p1 = _canonicalize_json_pointer(p1)
+    p2 = _canonicalize_json_pointer(p2)
     if p1 in {"", "/"} or p2 in {"", "/"}:
         return True
     return p1 == p2 or p1.startswith(p2 + "/") or p2.startswith(p1 + "/")
@@ -287,7 +309,7 @@ def _extract_url_slot_pointers(val: Any) -> tuple[frozenset[str], frozenset[str]
         args = val.get("args")
         if fn_name == "formatString" and isinstance(args, dict) and isinstance(args.get("value"), str):
             for match in _FORMAT_EXPR_RE.finditer(args["value"]):
-                expr = match.group(1)
+                expr = _canonicalize_json_pointer(match.group(1))
                 if expr.startswith("/"):
                     abs_ptrs.add(expr)
                 elif expr:
@@ -295,10 +317,11 @@ def _extract_url_slot_pointers(val: Any) -> tuple[frozenset[str], frozenset[str]
     else:
         ptr = val.get("@path") if "@path" in val else val.get("path")
         if isinstance(ptr, str) and ptr:
-            if ptr.startswith("/"):
-                abs_ptrs.add(ptr)
+            canon = _canonicalize_json_pointer(ptr)
+            if canon.startswith("/"):
+                abs_ptrs.add(canon)
             else:
-                rel_ptrs.add(ptr)
+                rel_ptrs.add(canon)
     return frozenset(abs_ptrs), frozenset(rel_ptrs)
 
 
@@ -401,6 +424,56 @@ def _resolve_pointer_with_context(
 _FORMAT_EXPR_RE = re.compile(r"\$\{([^}]+)\}")
 
 
+@lru_cache(maxsize=512)
+def _parse_format_string_template(
+    tpl: str,
+) -> tuple[str, tuple[str, ...], tuple[str, ...], bool, str]:
+    """Parse and validate a formatString URL template once into literal segments and pointer expressions."""
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in tpl):
+        return ("err_ctrl", (), (), False, "")
+    if "${" not in tpl:
+        return ("static", (tpl,), (), bool(tpl.strip()), tpl)
+    if r"\${" in tpl:
+        return ("err_esc", (), (), False, "")
+    parts: list[str] = []
+    exprs: list[str] = []
+    pos = 0
+    while True:
+        start = tpl.find("${", pos)
+        if start == -1:
+            parts.append(tpl[pos:])
+            break
+        end = tpl.find("}", start + 2)
+        if end == -1:
+            return ("err_unclosed", (), (), False, "")
+        inner = tpl[start + 2 : end]
+        if not _SIMPLE_FORMAT_PTR_RE.fullmatch(inner):
+            return ("err_expr", (inner,), (), False, "")
+        parts.append(tpl[pos:start])
+        exprs.append(inner)
+        pos = end + 1
+    parts_t = tuple(parts)
+    exprs_t = tuple(exprs)
+    return ("ok", parts_t, exprs_t, bool(parts_t[0].strip()), "placeholder".join(parts_t))
+
+
+def _check_url_with_cache(
+    candidate_url: str,
+    validator_fn: Any,
+    safe_url_cache: set[str] | None,
+    uncached_counter: list[int] | None,
+) -> tuple[bool, str | None]:
+    """Validate candidate_url using validator_fn with optional bounded safe-URL memoization."""
+    if safe_url_cache is not None and candidate_url in safe_url_cache:
+        return True, None
+    if uncached_counter is not None:
+        uncached_counter[0] += 1
+    ok_u, reason_u = validator_fn(candidate_url)
+    if ok_u and safe_url_cache is not None and len(safe_url_cache) < 2048:
+        safe_url_cache.add(candidate_url)
+    return ok_u, reason_u
+
+
 def _validate_url_function_call(
     fn_obj: dict[str, Any],
     *,
@@ -414,6 +487,8 @@ def _validate_url_function_call(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
+    safe_url_cache: set[str] | None = None,
+    uncached_counter: list[int] | None = None,
 ) -> None:
     fn_name = fn_obj.get("@call") if "@call" in fn_obj else fn_obj.get("call")
     args = fn_obj.get("args") if isinstance(fn_obj.get("args"), dict) else {}
@@ -431,7 +506,9 @@ def _validate_url_function_call(
                 f"formatString in {kind} URL requires a static string 'value' template.",
             )
             return
-        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in tpl):
+
+        status, parts, exprs, prefix_nonempty, placeholder_str = _parse_format_string_template(tpl)
+        if status == "err_ctrl":
             _add_issue(
                 errors,
                 code,
@@ -440,13 +517,12 @@ def _validate_url_function_call(
                 f"formatString {kind} URL template contains disallowed control characters.",
             )
             return
-        if "${" not in tpl:
-            ok, reason = validator_fn(tpl)
+        if status == "static":
+            ok, reason = _check_url_with_cache(tpl, validator_fn, safe_url_cache, uncached_counter)
             if not ok:
                 _add_issue(errors, code, block_index, path, reason or f"Unsafe {kind} URL in formatString.")
             return
-
-        if r"\${" in tpl:
+        if status == "err_esc":
             _add_issue(
                 errors,
                 code,
@@ -455,71 +531,74 @@ def _validate_url_function_call(
                 f"formatString {kind} URL template must not contain escaped '\\${{' sequences.",
             )
             return
+        if status == "err_unclosed":
+            _add_issue(
+                errors,
+                code,
+                block_index,
+                path,
+                f"formatString {kind} URL template contains an unclosed '${{' expression.",
+            )
+            return
+        if status == "err_expr":
+            inner = parts[0]
+            _add_issue(
+                errors,
+                code,
+                block_index,
+                path,
+                f"formatString {kind} URL placeholder '${{{inner}}}' must be a simple JSON Pointer path.",
+            )
+            return
 
-        # Require every ${...} placeholder to be a closed simple JSON Pointer (no nesting, calls, or whitespace)
-        pos = 0
-        while True:
-            start = tpl.find("${", pos)
-            if start == -1:
-                break
-            end = tpl.find("}", start + 2)
-            if end == -1:
-                _add_issue(
-                    errors,
-                    code,
-                    block_index,
-                    path,
-                    f"formatString {kind} URL template contains an unclosed '${{' expression.",
-                )
-                return
-            inner = tpl[start + 2 : end]
-            if not _SIMPLE_FORMAT_PTR_RE.fullmatch(inner):
-                _add_issue(
-                    errors,
-                    code,
-                    block_index,
-                    path,
-                    f"formatString {kind} URL placeholder '${{{inner}}}' must be a simple JSON Pointer path.",
-                )
-                return
-            pos = end + 1
-
-        # Interpolate resolvable placeholders and validate placeholder, resolved, and empty-unresolved forms.
-        all_resolved = True
-        any_resolved = False
-
-        def _subst_resolved(match: re.Match[str]) -> str:
-            nonlocal all_resolved, any_resolved
-            expr = match.group(1)
-            found, val = _resolve_pointer_with_context(data_model, expr, item_ctx)
+        # Interpolate resolvable placeholders in a single pass and validate placeholder, resolved, and empty-unresolved forms.
+        if len(exprs) == 1:
+            found, val = _resolve_pointer_with_context(data_model, exprs[0], item_ctx)
             if found:
+                all_resolved = True
                 any_resolved = True
-                return "" if val is None else str(val)
-            all_resolved = False
-            return "placeholder"
+                s_val = "" if val is None else str(val)
+                resolved_str = f"{parts[0]}{s_val}{parts[1]}"
+                empty_unresolved_str = resolved_str
+            else:
+                all_resolved = False
+                any_resolved = False
+                resolved_str = placeholder_str
+                empty_unresolved_str = f"{parts[0]}{parts[1]}"
+        else:
+            all_resolved = True
+            any_resolved = False
+            res_chunks: list[str] = [parts[0]]
+            emp_chunks: list[str] = [parts[0]]
+            for idx_e, expr in enumerate(exprs):
+                found, val = _resolve_pointer_with_context(data_model, expr, item_ctx)
+                if found:
+                    any_resolved = True
+                    s_val = "" if val is None else str(val)
+                    res_chunks.append(s_val)
+                    emp_chunks.append(s_val)
+                else:
+                    all_resolved = False
+                    res_chunks.append("placeholder")
+                res_chunks.append(parts[idx_e + 1])
+                emp_chunks.append(parts[idx_e + 1])
+            resolved_str = "".join(res_chunks)
+            empty_unresolved_str = resolved_str if all_resolved else "".join(emp_chunks)
 
-        def _subst_empty_unresolved(match: re.Match[str]) -> str:
-            expr = match.group(1)
-            found, val = _resolve_pointer_with_context(data_model, expr, item_ctx)
-            if found and val is not None:
-                return str(val)
-            return ""
-
-        resolved_str = _FORMAT_EXPR_RE.sub(_subst_resolved, tpl)
-        empty_unresolved_str = _FORMAT_EXPR_RE.sub(_subst_empty_unresolved, tpl)
-        prefix = tpl.split("${", 1)[0].strip()
-        if not prefix:
+        if not prefix_nonempty:
             if all_resolved:
-                ok, reason = validator_fn(resolved_str)
+                ok, reason = _check_url_with_cache(resolved_str, validator_fn, safe_url_cache, uncached_counter)
                 if not ok:
                     _add_issue(errors, code, block_index, path, reason or f"Unsafe resolved {kind} URL.")
             elif is_historical_snapshot:
                 if any_resolved:
-                    ok, reason = validator_fn(resolved_str)
+                    ok, reason = _check_url_with_cache(resolved_str, validator_fn, safe_url_cache, uncached_counter)
                     if not ok:
                         _add_issue(errors, code, block_index, path, reason or f"Unsafe resolved {kind} URL.")
                     elif empty_unresolved_str != resolved_str:
-                        ok_emp, reason_emp = validator_fn(empty_unresolved_str)
+                        ok_emp, reason_emp = _check_url_with_cache(
+                            empty_unresolved_str, validator_fn, safe_url_cache, uncached_counter
+                        )
                         if not ok_emp:
                             _add_issue(
                                 errors,
@@ -539,19 +618,20 @@ def _validate_url_function_call(
             return
 
         # Validate placeholder, resolved, and empty-unresolved candidate strings unconditionally
-        placeholder_str = _FORMAT_EXPR_RE.sub("placeholder", tpl)
-        ok_tpl, reason_tpl = validator_fn(placeholder_str)
+        ok_tpl, reason_tpl = _check_url_with_cache(placeholder_str, validator_fn, safe_url_cache, uncached_counter)
         if not ok_tpl:
             _add_issue(errors, code, block_index, path, reason_tpl or f"Unsafe {kind} URL template in formatString.")
             return
         if is_superseded:
             return
-        ok_res, reason_res = validator_fn(resolved_str)
+        ok_res, reason_res = _check_url_with_cache(resolved_str, validator_fn, safe_url_cache, uncached_counter)
         if not ok_res:
             _add_issue(errors, code, block_index, path, reason_res or f"Unsafe resolved {kind} URL.")
             return
         if empty_unresolved_str != resolved_str:
-            ok_emp, reason_emp = validator_fn(empty_unresolved_str)
+            ok_emp, reason_emp = _check_url_with_cache(
+                empty_unresolved_str, validator_fn, safe_url_cache, uncached_counter
+            )
             if not ok_emp:
                 _add_issue(
                     errors,
@@ -634,6 +714,7 @@ def _validate_dynamic_value(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
+    template_validated_url_paths: frozenset[str] | None = None,
 ) -> None:
     """Validate DynamicValue, DataBinding (@path), FunctionCall (@call), arrays, and single-@ escape."""
     if isinstance(val, list):
@@ -655,6 +736,7 @@ def _validate_dynamic_value(
                 item_ctx=item_ctx,
                 is_historical_snapshot=is_historical_snapshot,
                 is_superseded=is_superseded,
+                template_validated_url_paths=template_validated_url_paths,
             )
         return
 
@@ -781,16 +863,21 @@ def _validate_dynamic_value(
             if fn_name == "regex" and "pattern" in args:
                 _check_regex_safety(args["pattern"], f"{path}.args.pattern", block_index, errors)
             if fn_name == "openUrl" and "url" in args:
+                open_url_path = f"{path}.args.url"
                 _validate_open_url_arg(
                     args.get("url"),
                     block_index,
-                    f"{path}.args.url",
+                    open_url_path,
                     errors,
                     data_model,
                     strict=strict,
                     warnings=warnings,
                     item_ctx=item_ctx,
-                    is_historical_snapshot=is_historical_snapshot,
+                    is_historical_snapshot=is_historical_snapshot
+                    or (
+                        template_validated_url_paths is not None
+                        and open_url_path in template_validated_url_paths
+                    ),
                     is_superseded=is_superseded,
                 )
             for ak, av in args.items():
@@ -811,6 +898,7 @@ def _validate_dynamic_value(
                     item_ctx=item_ctx,
                     is_historical_snapshot=is_historical_snapshot,
                     is_superseded=is_superseded,
+                    template_validated_url_paths=template_validated_url_paths,
                 )
 
     # v1.0 canonical FunctionCall
@@ -899,6 +987,8 @@ def _validate_open_url_arg(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
+    safe_url_cache: set[str] | None = None,
+    uncached_counter: list[int] | None = None,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = raw_url_val
@@ -916,6 +1006,8 @@ def _validate_open_url_arg(
                 item_ctx=item_ctx,
                 is_historical_snapshot=is_historical_snapshot,
                 is_superseded=is_superseded,
+                safe_url_cache=safe_url_cache,
+                uncached_counter=uncached_counter,
             )
             return
         ptr = raw_url_val.get("@path") if "@path" in raw_url_val else raw_url_val.get("path")
@@ -928,9 +1020,16 @@ def _validate_open_url_arg(
         else:
             _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, "openUrl target must be a URL string, DataBinding, or safe formatString call.")
             return
+    if safe_url_cache is not None and type(candidate) is str and candidate in safe_url_cache:
+        return
+    if uncached_counter is not None:
+        uncached_counter[0] += 1
     ok, reason = validate_open_url(candidate)
-    if not ok:
-        _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, reason or "Unsafe openUrl target.")
+    if ok:
+        if safe_url_cache is not None and type(candidate) is str and len(safe_url_cache) < 2048:
+            safe_url_cache.add(candidate)
+        return
+    _add_issue(errors, "UNSAFE_OPEN_URL", block_index, path, reason or "Unsafe openUrl target.")
 
 
 def _validate_media_prop(
@@ -945,6 +1044,8 @@ def _validate_media_prop(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
+    safe_url_cache: set[str] | None = None,
+    uncached_counter: list[int] | None = None,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = val
@@ -964,6 +1065,8 @@ def _validate_media_prop(
                 item_ctx=item_ctx,
                 is_historical_snapshot=is_historical_snapshot,
                 is_superseded=is_superseded,
+                safe_url_cache=safe_url_cache,
+                uncached_counter=uncached_counter,
             )
             return
         else:
@@ -977,9 +1080,16 @@ def _validate_media_prop(
             else:
                 _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, "Media URL must be a string, DataBinding, or safe formatString call.")
                 return
+    if safe_url_cache is not None and type(candidate) is str and candidate in safe_url_cache:
+        return
+    if uncached_counter is not None:
+        uncached_counter[0] += 1
     ok, reason = validate_media_url(candidate)
-    if not ok:
-        _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason or "Unsafe media URL.")
+    if ok:
+        if safe_url_cache is not None and type(candidate) is str and len(safe_url_cache) < 2048:
+            safe_url_cache.add(candidate)
+        return
+    _add_issue(errors, "UNSAFE_MEDIA_URL", block_index, path, reason or "Unsafe media URL.")
 
 
 def _iter_open_url_slots(obj: Any, base_path: str) -> list[tuple[str, Any]]:
@@ -1031,6 +1141,7 @@ def _validate_action(
     item_ctx: Any = None,
     is_historical_snapshot: bool = False,
     is_superseded: bool = False,
+    template_validated_url_paths: frozenset[str] | None = None,
 ) -> None:
     if not isinstance(action, dict):
         _add_issue(errors, "INVALID_ACTION", block_index, path, "Button action must be an object.")
@@ -1134,6 +1245,7 @@ def _validate_action(
             item_ctx=item_ctx,
             is_historical_snapshot=is_historical_snapshot,
             is_superseded=is_superseded,
+            template_validated_url_paths=template_validated_url_paths,
         )
 
 
@@ -1240,6 +1352,7 @@ def _validate_surface_components(
     warnings: list[dict[str, Any]],
     data_model: dict[str, Any],
     surface_catalog_id: str | None = None,
+    template_validated_url_paths: frozenset[str] | None = None,
 ) -> int:
     catalog = load_catalog_spec(version)
     catalog_components = catalog["components"]
@@ -1838,34 +1951,45 @@ def _validate_surface_components(
                     effective_catalog_id=effective_comp_catalog,
                     is_historical_snapshot=comp_hist,
                     is_superseded=is_superseded,
+                    template_validated_url_paths=template_validated_url_paths,
                 )
 
             if comp_type in _MEDIA_URL_PROPS:
                 for media_prop in _MEDIA_URL_PROPS[comp_type]:
                     if media_prop in props:
+                        media_path = f"{cpath}.{media_prop}"
                         _validate_media_prop(
                             props[media_prop],
                             block_index,
-                            f"{cpath}.{media_prop}",
+                            media_path,
                             errors,
                             comp_dm,
                             strict=strict,
                             warnings=warnings,
-                            is_historical_snapshot=comp_hist,
+                            is_historical_snapshot=comp_hist
+                            or (
+                                template_validated_url_paths is not None
+                                and media_path in template_validated_url_paths
+                            ),
                             is_superseded=is_superseded,
                         )
             elif is_custom_catalog:
                 for media_prop in ("url", "posterUrl"):
                     if media_prop in props:
+                        media_path = f"{cpath}.{media_prop}"
                         _validate_media_prop(
                             props[media_prop],
                             block_index,
-                            f"{cpath}.{media_prop}",
+                            media_path,
                             errors,
                             comp_dm,
                             strict=strict,
                             warnings=warnings,
-                            is_historical_snapshot=comp_hist,
+                            is_historical_snapshot=comp_hist
+                            or (
+                                template_validated_url_paths is not None
+                                and media_path in template_validated_url_paths
+                            ),
                             is_superseded=is_superseded,
                         )
 
@@ -2022,6 +2146,11 @@ def validate_payload(
         surface_total_comp_entries: dict[str, int] = {}
         surface_tpl_abs_eval_count: dict[str, int] = {}
         surface_tpl_rescan_evals: dict[str, int] = {}
+        max_surface_url_evals = max(100_000, max_bytes // 8)
+        max_surface_uncached_url_checks = max(30_000, max_bytes // 35)
+        surface_url_slot_evals: dict[str, int] = {}
+        surface_uncached_url_checks: dict[str, list[int]] = {}
+        surface_url_slot_cap_hit: set[str] = set()
         surface_tpl_summary_cache: dict[
             str,
             dict[
@@ -2046,6 +2175,9 @@ def validate_payload(
             surface_total_comp_entries.pop(sid_clear, None)
             surface_tpl_abs_eval_count.pop(sid_clear, None)
             surface_tpl_rescan_evals.pop(sid_clear, None)
+            surface_url_slot_evals.pop(sid_clear, None)
+            surface_uncached_url_checks.pop(sid_clear, None)
+            surface_url_slot_cap_hit.discard(sid_clear)
             surface_tpl_summary_cache.pop(sid_clear, None)
 
         def _emit_surface_issues(
@@ -2064,6 +2196,7 @@ def validate_payload(
         safe_open_urls: set[str] = set()
 
         def _validate_single_url_slot(
+            sid_slot: str,
             slot: tuple[str, str, Any, frozenset[str], frozenset[str], str, str],
             dm: dict[str, Any],
             tmp_errors: list[dict[str, Any]],
@@ -2072,32 +2205,61 @@ def validate_payload(
             item_ctx: Any = None,
             item_idx: int | None = None,
             is_historical_snapshot: bool = True,
-        ) -> None:
+        ) -> bool:
+            cur_evals = surface_url_slot_evals.get(sid_slot, 0)
+            uncached_ctr = surface_uncached_url_checks.get(sid_slot)
+            if uncached_ctr is None:
+                uncached_ctr = [0]
+                surface_uncached_url_checks[sid_slot] = uncached_ctr
+            if cur_evals >= max_surface_url_evals or uncached_ctr[0] >= max_surface_uncached_url_checks:
+                if sid_slot not in surface_url_slot_cap_hit:
+                    surface_url_slot_cap_hit.add(sid_slot)
+                    _add_issue(
+                        tmp_errors,
+                        "MAX_TEMPLATE_EVALS_EXCEEDED",
+                        bidx,
+                        f"surface:{sid_slot}",
+                        f"Surface URL slot evaluations exceeded limit ({max_surface_url_evals}).",
+                    )
+                return False
+            surface_url_slot_evals[sid_slot] = cur_evals + 1
+
             kind, slot_path, raw_val, _abs_p, _rel_p, comp_cpath, slot_suffix = slot
-            if (
-                isinstance(raw_val, dict)
-                and "@call" not in raw_val
-                and "call" not in raw_val
-                and "literalString" not in raw_val
-            ):
-                ptr = raw_val.get("@path") if "@path" in raw_val else raw_val.get("path")
-                if isinstance(ptr, str):
-                    found, resolved = _resolve_pointer_with_context(dm, ptr, item_ctx)
-                    if not found:
-                        return
-                    if type(resolved) is str:
-                        cache = safe_media_urls if kind == "media" else safe_open_urls
-                        if resolved in cache:
-                            return
-                        ok_u, _reason_u = (
-                            validate_media_url(resolved)
-                            if kind == "media"
-                            else validate_open_url(resolved)
-                        )
-                        if ok_u:
-                            if len(cache) < 2048:
-                                cache.add(resolved)
-                            return
+            cache = safe_media_urls if kind == "media" else safe_open_urls
+            if isinstance(raw_val, dict):
+                if "@call" in raw_val or "call" in raw_val:
+                    fn_name = raw_val.get("@call") if "@call" in raw_val else raw_val.get("call")
+                    if fn_name == "formatString":
+                        args_d = raw_val.get("args")
+                        if isinstance(args_d, dict):
+                            tpl_s = args_d.get("value")
+                            if isinstance(tpl_s, str):
+                                st, pts, exs, pfx_ne, ph_s = _parse_format_string_template(tpl_s)
+                                if st == "ok" and pfx_ne and len(exs) == 1 and ph_s in cache:
+                                    f_ex, v_ex = _resolve_pointer_with_context(dm, exs[0], item_ctx)
+                                    if f_ex:
+                                        r_str = f"{pts[0]}{'' if v_ex is None else v_ex}{pts[1]}"
+                                        if r_str in cache:
+                                            return True
+                elif "literalString" not in raw_val:
+                    ptr = raw_val.get("@path") if "@path" in raw_val else raw_val.get("path")
+                    if isinstance(ptr, str):
+                        found, resolved = _resolve_pointer_with_context(dm, ptr, item_ctx)
+                        if not found:
+                            return True
+                        if type(resolved) is str:
+                            if resolved in cache:
+                                return True
+                            uncached_ctr[0] += 1
+                            ok_u, _reason_u = (
+                                validate_media_url(resolved)
+                                if kind == "media"
+                                else validate_open_url(resolved)
+                            )
+                            if ok_u:
+                                if len(cache) < 2048:
+                                    cache.add(resolved)
+                                return True
             target_path = f"{comp_cpath}[item:{item_idx}]{slot_suffix}" if item_idx is not None else slot_path
             if kind == "media":
                 _validate_media_prop(
@@ -2110,6 +2272,8 @@ def validate_payload(
                     warnings=tmp_warnings,
                     item_ctx=item_ctx,
                     is_historical_snapshot=is_historical_snapshot,
+                    safe_url_cache=cache,
+                    uncached_counter=uncached_ctr,
                 )
             else:
                 _validate_open_url_arg(
@@ -2122,7 +2286,10 @@ def validate_payload(
                     warnings=tmp_warnings,
                     item_ctx=item_ctx,
                     is_historical_snapshot=is_historical_snapshot,
+                    safe_url_cache=cache,
+                    uncached_counter=uncached_ctr,
                 )
+            return True
 
         def _get_surface_ptr_index(
             sid_idx: str,
@@ -2183,6 +2350,7 @@ def validate_payload(
                 t_queue.extend(adj_map.get(cur_id, []))
             direct_rel_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
             nested_rel_children: list[tuple[str, str]] = []
+            seen_nested_rel: set[tuple[str, str]] = set()
             for tcid in direct_nodes:
                 for slot in slots_by_cid.get(tcid, ()):
                     if slot[4]:  # has relative pointers that depend on item_ctx
@@ -2191,8 +2359,65 @@ def validate_payload(
                 if child_tpl is not None:
                     inner_tpl_id, inner_list_ptr = child_tpl
                     if isinstance(inner_list_ptr, str) and inner_list_ptr and not inner_list_ptr.startswith("/"):
-                        nested_rel_children.append((inner_tpl_id, inner_list_ptr))
+                        nested_pair = (inner_tpl_id, inner_list_ptr)
+                        if nested_pair not in seen_nested_rel:
+                            seen_nested_rel.add(nested_pair)
+                            nested_rel_children.append(nested_pair)
             return direct_nodes, direct_rel_slots, nested_rel_children
+
+        def _collect_template_binding_chains(
+            g_comp_map: dict[str, tuple[str, dict[str, Any], str]],
+            g_adj_map: dict[str, list[str]],
+            g_tpl_map: dict[str, tuple[str, str]],
+        ) -> tuple[set[tuple[str, tuple[str, ...]]], bool]:
+            """Compute all active (cid, chain_tuple) bindings reachable from absolute ChildList templates."""
+            active_chains: set[tuple[str, tuple[str, ...]]] = set()
+            seen_states: set[tuple[str, tuple[str, ...]]] = set()
+            work: list[tuple[str, tuple[str, ...], frozenset[str]]] = []
+            max_states = max(4096, max_components * 8)
+            for _owner_cid, (tpl_root_id, list_ptr) in g_tpl_map.items():
+                if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
+                    continue
+                if tpl_root_id not in g_comp_map:
+                    continue
+                init_chain = (list_ptr,)
+                root_key = (tpl_root_id, init_chain)
+                if root_key in seen_states:
+                    continue
+                seen_states.add(root_key)
+                work.append((tpl_root_id, init_chain, frozenset({tpl_root_id})))
+
+            while work:
+                cur_root, chain, visited_tpls = work.pop()
+                seen_nodes: set[str] = set()
+                n_stack = [cur_root]
+                while n_stack:
+                    nid = n_stack.pop()
+                    if nid in seen_nodes or nid not in g_comp_map:
+                        continue
+                    seen_nodes.add(nid)
+                    active_chains.add((nid, chain))
+                    for nxt in g_adj_map.get(nid, ()):
+                        if nxt not in seen_nodes:
+                            n_stack.append(nxt)
+                    child_tpl = g_tpl_map.get(nid)
+                    if child_tpl is not None:
+                        inner_tpl_id, inner_list_ptr = child_tpl
+                        if (
+                            isinstance(inner_list_ptr, str)
+                            and inner_list_ptr
+                            and not inner_list_ptr.startswith("/")
+                            and inner_tpl_id in g_comp_map
+                            and inner_tpl_id not in visited_tpls
+                        ):
+                            next_chain = chain + (inner_list_ptr,)
+                            next_key = (inner_tpl_id, next_chain)
+                            if next_key not in seen_states:
+                                if len(seen_states) >= max_states:
+                                    return active_chains, True
+                                seen_states.add(next_key)
+                                work.append((inner_tpl_id, next_chain, visited_tpls | {inner_tpl_id}))
+            return active_chains, False
 
         def _collect_template_tree_summary(
             sid_tpl: str, tpl_root_id: str
@@ -2297,7 +2522,8 @@ def validate_payload(
                     eval_budget[0] += 1
                 if evaluated_slot_ids is not None:
                     evaluated_slot_ids.add(id(slot))
-                _validate_single_url_slot(
+                if not _validate_single_url_slot(
+                    sid_tpl,
                     slot,
                     dm,
                     tmp_errors,
@@ -2305,7 +2531,8 @@ def validate_payload(
                     item_ctx=item_ctx,
                     item_idx=item_idx,
                     is_historical_snapshot=is_historical_snapshot,
-                )
+                ):
+                    return True
 
             if nested_rel_children:
                 local_budget = eval_budget
@@ -2436,155 +2663,26 @@ def validate_payload(
                     if sver == "0.8" and isinstance(ch.get("template"), dict):
                         tpl = ch["template"]
                         if isinstance(tpl.get("componentId"), str) and isinstance(tpl.get("dataBinding"), str):
-                            tpl_binding = (tpl["componentId"], tpl["dataBinding"])
+                            tpl_binding = (tpl["componentId"], _canonicalize_json_pointer(tpl["dataBinding"]))
                     elif isinstance(ch.get("componentId"), str) and isinstance(ch.get("path"), str):
-                        tpl_binding = (ch["componentId"], ch["path"])
+                        tpl_binding = (ch["componentId"], _canonicalize_json_pointer(ch["path"]))
                 parsed_incoming.append((cid, c_type, c_props, cpath, new_adj, tpl_binding))
 
-            # Pre-mutation check: before mutating comp_map/adj_map/slots_by_cid/tpl_map, validate any
-            # outgoing prefix-less formatString URL slots on replaced components or severed subtrees
-            # (including nested relative ChildLists) against the intact pre-batch graph.
+            # Snapshot lightweight pre-batch graph state only when replacing existing components
             replaced_entries = [entry for entry in parsed_incoming if entry[0] in comp_map]
+            replaced_cids: set[str] = set()
+            old_comp_map: dict[str, tuple[str, dict[str, Any], str]] | None = None
+            old_adj_map: dict[str, list[str]] | None = None
+            old_slots_by_cid: dict[
+                str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]
+            ] | None = None
+            old_tpl_map: dict[str, tuple[str, str]] | None = None
             if replaced_entries:
-                affected_outgoing_cids: set[str] = set()
-                detached_roots: list[str] = []
-                for cid, _ct, _cp, _cpath, new_adj, new_tpl in replaced_entries:
-                    affected_outgoing_cids.add(cid)
-                    new_adj_set = set(new_adj)
-                    for old_child in adj_map.get(cid, ()):
-                        if old_child not in new_adj_set:
-                            detached_roots.append(old_child)
-                    old_tpl = tpl_map.get(cid)
-                    if old_tpl is not None and old_tpl != new_tpl:
-                        detached_roots.append(old_tpl[0])
-
-                walk_stack = detached_roots
-                while walk_stack:
-                    cur_cid = walk_stack.pop()
-                    if cur_cid in affected_outgoing_cids or cur_cid not in comp_map:
-                        continue
-                    affected_outgoing_cids.add(cur_cid)
-                    for nxt in adj_map.get(cur_cid, ()):
-                        if nxt not in affected_outgoing_cids:
-                            walk_stack.append(nxt)
-                    cur_tpl = tpl_map.get(cur_cid)
-                    if cur_tpl is not None and cur_tpl[0] not in affected_outgoing_cids:
-                        walk_stack.append(cur_tpl[0])
-
-                outgoing_direct_slots: list[
-                    tuple[str, str, Any, frozenset[str], frozenset[str], str, str]
-                ] = []
-                outgoing_rel_slots: list[
-                    tuple[str, str, Any, frozenset[str], frozenset[str], str, str]
-                ] = []
-                outgoing_rel_cids: set[str] = set()
-                for ocid in affected_outgoing_cids:
-                    for slot in slots_by_cid.get(ocid, ()):
-                        if not _is_prefixless_format_string_url(slot[2]):
-                            continue
-                        if slot[4]:
-                            outgoing_rel_slots.append(slot)
-                            outgoing_rel_cids.add(ocid)
-                        else:
-                            outgoing_direct_slots.append(slot)
-
-                for out_slot in outgoing_direct_slots:
-                    _validate_single_url_slot(
-                        out_slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=False
-                    )
-
-                if outgoing_rel_slots:
-                    outgoing_rel_slot_ids = {id(s) for s in outgoing_rel_slots}
-                    evaluated_slot_ids: set[int] = set()
-                    pre_rescan_budget = [surface_tpl_rescan_evals.get(sid_ing, 0)]
-                    pre_cap_hit = False
-                    for _o_cid, (o_tpl_root, o_list_ptr) in tpl_map.items():
-                        if not isinstance(o_list_ptr, str) or not o_list_ptr.startswith("/"):
-                            continue
-                        o_nodes, o_rel_slots, o_has_nested_rel = _collect_template_tree_summary(
-                            sid_ing, o_tpl_root
-                        )
-                        if not (o_nodes & outgoing_rel_cids):
-                            continue
-                        matching_rel_slots = [s for s in o_rel_slots if id(s) in outgoing_rel_slot_ids]
-                        if not matching_rel_slots:
-                            continue
-                        found_l, l_items = _resolve_json_pointer(dm, o_list_ptr)
-                        if not found_l or not isinstance(l_items, list) or not l_items:
-                            continue
-                        if not o_has_nested_rel:
-                            for li_idx, li_item in enumerate(l_items):
-                                for slot in matching_rel_slots:
-                                    if pre_rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
-                                        pre_cap_hit = True
-                                        break
-                                    evaluated_slot_ids.add(id(slot))
-                                    _validate_single_url_slot(
-                                        slot,
-                                        dm,
-                                        tmp_errors,
-                                        tmp_warnings,
-                                        item_ctx=li_item,
-                                        item_idx=li_idx,
-                                        is_historical_snapshot=False,
-                                    )
-                                    pre_rescan_budget[0] += 1
-                                if pre_cap_hit:
-                                    break
-                            if pre_cap_hit:
-                                _add_issue(
-                                    tmp_errors,
-                                    "MAX_TEMPLATE_EVALS_EXCEEDED",
-                                    bidx,
-                                    f"surface:{sid_ing}",
-                                    f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
-                                )
-                                break
-                        else:
-                            out_sc: dict[str, Any] = {}
-                            out_tc: dict[str, bool] = {}
-                            for li_idx, li_item in enumerate(l_items):
-                                if pre_rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
-                                    _add_issue(
-                                        tmp_errors,
-                                        "MAX_TEMPLATE_EVALS_EXCEEDED",
-                                        bidx,
-                                        f"surface:{sid_ing}",
-                                        f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
-                                    )
-                                    pre_cap_hit = True
-                                    break
-                                before = pre_rescan_budget[0]
-                                if _validate_template_item_urls(
-                                    sid_ing,
-                                    o_tpl_root,
-                                    dm,
-                                    li_item,
-                                    li_idx,
-                                    tmp_errors,
-                                    tmp_warnings,
-                                    is_historical_snapshot=False,
-                                    only_prefixless=True,
-                                    target_slot_ids=outgoing_rel_slot_ids,
-                                    evaluated_slot_ids=evaluated_slot_ids,
-                                    eval_budget=pre_rescan_budget,
-                                    eval_limit=_MAX_TEMPLATE_RESCAN_EVALS,
-                                    scope_cache=out_sc,
-                                    tree_has_slots_cache=out_tc,
-                                ):
-                                    pre_cap_hit = True
-                                    break
-                                if pre_rescan_budget[0] == before:
-                                    pre_rescan_budget[0] += 1
-                            if pre_cap_hit:
-                                break
-                    surface_tpl_rescan_evals[sid_ing] = pre_rescan_budget[0]
-                    if not pre_cap_hit:
-                        for out_slot in outgoing_rel_slots:
-                            if id(out_slot) not in evaluated_slot_ids:
-                                _validate_single_url_slot(
-                                    out_slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=False
-                                )
+                replaced_cids = {entry[0] for entry in replaced_entries}
+                old_comp_map = dict(comp_map)
+                old_adj_map = {k: list(v) for k, v in adj_map.items()}
+                old_slots_by_cid = dict(slots_by_cid)
+                old_tpl_map = dict(tpl_map)
 
             updated_cids: set[str] = set()
             for cid, c_type, c_props, cpath, new_adj, tpl_binding in parsed_incoming:
@@ -2628,15 +2726,179 @@ def validate_payload(
                 _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
 
+            if sid_ing in surface_url_slot_cap_hit:
+                _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
+                return
+
+            # Validate genuinely outgoing prefix-less formatString URL slots by exact pre-vs-post batch diff
+            if replaced_cids and old_comp_map is not None and old_adj_map is not None and old_slots_by_cid is not None and old_tpl_map is not None:
+                # 1. Direct prefix-less formatString slots: validate only slots on replaced components
+                direct_out_cap = False
+                for rcid in replaced_cids:
+                    for slot in old_slots_by_cid.get(rcid, ()):
+                        if not slot[4] and _is_prefixless_format_string_url(slot[2]):
+                            if not _validate_single_url_slot(
+                                sid_ing, slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=False
+                            ):
+                                direct_out_cap = True
+                                break
+                    if direct_out_cap:
+                        break
+
+                # 2. Relative prefix-less formatString slots: exact pre-batch vs post-batch template chain diff
+                if not direct_out_cap:
+                    old_pfx_rel_by_cid: dict[
+                        str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]
+                    ] = {}
+                    for ocid, oslots in old_slots_by_cid.items():
+                        pfx_rel = [s for s in oslots if s[4] and _is_prefixless_format_string_url(s[2])]
+                        if pfx_rel:
+                            old_pfx_rel_by_cid[ocid] = pfx_rel
+
+                    if old_pfx_rel_by_cid:
+                        old_chains, old_chain_cap = _collect_template_binding_chains(
+                            old_comp_map, old_adj_map, old_tpl_map
+                        )
+                        new_chains, new_chain_cap = _collect_template_binding_chains(
+                            comp_map, adj_map, tpl_map
+                        )
+                        if old_chain_cap or new_chain_cap:
+                            _add_issue(
+                                tmp_errors,
+                                "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                bidx,
+                                f"surface:{sid_ing}",
+                                f"Template binding chain traversal exceeded limit ({max(4096, max_components * 8)}).",
+                            )
+                        else:
+                            outgoing_by_chain: dict[
+                                tuple[str, ...],
+                                list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
+                            ] = {}
+                            seen_chain_slot_ids: dict[tuple[str, ...], set[int]] = {}
+                            for ocid, chain in old_chains:
+                                pfx_slots = old_pfx_rel_by_cid.get(ocid)
+                                if not pfx_slots:
+                                    continue
+                                if ocid in replaced_cids or (ocid, chain) not in new_chains:
+                                    c_bucket = outgoing_by_chain.setdefault(chain, [])
+                                    c_seen = seen_chain_slot_ids.setdefault(chain, set())
+                                    for slot in pfx_slots:
+                                        if id(slot) not in c_seen:
+                                            c_seen.add(id(slot))
+                                            c_bucket.append(slot)
+
+                            replaced_rel_slots: list[
+                                tuple[str, str, Any, frozenset[str], frozenset[str], str, str]
+                            ] = []
+                            for rcid in replaced_cids:
+                                replaced_rel_slots.extend(old_pfx_rel_by_cid.get(rcid, ()))
+
+                            evaluated_slot_ids: set[int] = set()
+                            pre_rescan_budget = [surface_tpl_rescan_evals.get(sid_ing, 0)]
+                            pre_cap_hit = False
+
+                            def _validate_chain_items(
+                                chain_ptrs: tuple[str, ...],
+                                depth: int,
+                                cur_ctx: Any,
+                                chain_slots: list[
+                                    tuple[str, str, Any, frozenset[str], frozenset[str], str, str]
+                                ],
+                            ) -> bool:
+                                if depth == 0:
+                                    found_l, items_l = _resolve_json_pointer(dm, chain_ptrs[0])
+                                else:
+                                    found_l, items_l = _resolve_pointer_with_context(
+                                        dm, chain_ptrs[depth], cur_ctx
+                                    )
+                                if not found_l or not isinstance(items_l, list) or not items_l:
+                                    return False
+                                if depth == len(chain_ptrs) - 1:
+                                    for li_idx, li_item in enumerate(items_l):
+                                        for slot in chain_slots:
+                                            if pre_rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
+                                                _add_issue(
+                                                    tmp_errors,
+                                                    "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                                    bidx,
+                                                    f"surface:{sid_ing}",
+                                                    f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
+                                                )
+                                                return True
+                                            evaluated_slot_ids.add(id(slot))
+                                            if not _validate_single_url_slot(
+                                                sid_ing,
+                                                slot,
+                                                dm,
+                                                tmp_errors,
+                                                tmp_warnings,
+                                                item_ctx=li_item,
+                                                item_idx=li_idx,
+                                                is_historical_snapshot=False,
+                                            ):
+                                                return True
+                                            pre_rescan_budget[0] += 1
+                                    return False
+                                for li_item in items_l:
+                                    if pre_rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
+                                        _add_issue(
+                                            tmp_errors,
+                                            "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                            bidx,
+                                            f"surface:{sid_ing}",
+                                            f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
+                                        )
+                                        return True
+                                    before = pre_rescan_budget[0]
+                                    if _validate_chain_items(chain_ptrs, depth + 1, li_item, chain_slots):
+                                        return True
+                                    if pre_rescan_budget[0] == before:
+                                        pre_rescan_budget[0] += 1
+                                return False
+
+                            for chain_ptrs, chain_slots in outgoing_by_chain.items():
+                                if _validate_chain_items(chain_ptrs, 0, None, chain_slots):
+                                    pre_cap_hit = True
+                                    break
+                            surface_tpl_rescan_evals[sid_ing] = pre_rescan_budget[0]
+                            if not pre_cap_hit:
+                                for out_slot in replaced_rel_slots:
+                                    if id(out_slot) not in evaluated_slot_ids:
+                                        if not _validate_single_url_slot(
+                                            sid_ing,
+                                            out_slot,
+                                            dm,
+                                            tmp_errors,
+                                            tmp_warnings,
+                                            is_historical_snapshot=False,
+                                        ):
+                                            break
+
+            if sid_ing in surface_url_slot_cap_hit:
+                _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
+                return
+
             # Eagerly validate newly added/updated direct component URL slots against current dataModel
+            direct_eager_cap = False
             for cid in updated_cids:
                 for slot in slots_by_cid.get(cid, ()):
-                    _validate_single_url_slot(
-                        slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
-                    )
+                    if not _validate_single_url_slot(
+                        sid_ing, slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
+                    ):
+                        direct_eager_cap = True
+                        break
+                if direct_eager_cap:
+                    break
+
+            if direct_eager_cap or sid_ing in surface_url_slot_cap_hit:
+                _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
+                return
 
             # Eagerly validate any affected absolute ChildList template (including nested relative ChildLists)
             rescan_budget = [surface_tpl_rescan_evals.get(sid_ing, 0)] if b_idx > 0 else None
+            seen_tpl_pairs_ing: set[tuple[str, str]] = set()
+            ing_tpl_cap = False
             for owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
                 if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
                     continue
@@ -2645,6 +2907,10 @@ def validate_payload(
                     continue
                 if owner_cid not in updated_cids and not any(n in updated_cids for n in tpl_nodes):
                     continue
+                tpl_pair = (tpl_root_id, list_ptr)
+                if tpl_pair in seen_tpl_pairs_ing:
+                    continue
+                seen_tpl_pairs_ing.add(tpl_pair)
                 found_list, items_val = _resolve_json_pointer(dm, list_ptr)
                 if not found_list or not isinstance(items_val, list):
                     continue
@@ -2656,7 +2922,8 @@ def validate_payload(
                                 if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
                                     cap_hit = True
                                     break
-                                _validate_single_url_slot(
+                                if not _validate_single_url_slot(
+                                    sid_ing,
                                     slot,
                                     dm,
                                     tmp_errors,
@@ -2664,9 +2931,11 @@ def validate_payload(
                                     item_ctx=item,
                                     item_idx=item_idx,
                                     is_historical_snapshot=True,
-                                )
+                                ):
+                                    ing_tpl_cap = True
+                                    break
                                 rescan_budget[0] += 1
-                            if cap_hit:
+                            if cap_hit or ing_tpl_cap:
                                 break
                         if cap_hit:
                             _add_issue(
@@ -2676,10 +2945,12 @@ def validate_payload(
                                 f"surface:{sid_ing}",
                                 f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
                             )
+                            ing_tpl_cap = True
                     else:
                         for item_idx, item in enumerate(items_val):
                             for slot in rel_slots:
-                                _validate_single_url_slot(
+                                if not _validate_single_url_slot(
+                                    sid_ing,
                                     slot,
                                     dm,
                                     tmp_errors,
@@ -2687,7 +2958,11 @@ def validate_payload(
                                     item_ctx=item,
                                     item_idx=item_idx,
                                     is_historical_snapshot=True,
-                                )
+                                ):
+                                    ing_tpl_cap = True
+                                    break
+                            if ing_tpl_cap:
+                                break
                 else:
                     sc_ing: dict[str, Any] = {}
                     tc_ing: dict[str, bool] = {}
@@ -2701,6 +2976,7 @@ def validate_payload(
                                     f"surface:{sid_ing}",
                                     f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
                                 )
+                                ing_tpl_cap = True
                                 break
                             before = rescan_budget[0]
                             if _validate_template_item_urls(
@@ -2717,6 +2993,7 @@ def validate_payload(
                                 scope_cache=sc_ing,
                                 tree_has_slots_cache=tc_ing,
                             ):
+                                ing_tpl_cap = True
                                 break
                             if rescan_budget[0] == before:
                                 rescan_budget[0] += 1
@@ -2733,7 +3010,11 @@ def validate_payload(
                                 scope_cache=sc_ing,
                                 tree_has_slots_cache=tc_ing,
                             ):
+                                if sid_ing in surface_url_slot_cap_hit:
+                                    ing_tpl_cap = True
                                 break
+                if ing_tpl_cap or sid_ing in surface_url_slot_cap_hit:
+                    break
             if rescan_budget is not None:
                 surface_tpl_rescan_evals[sid_ing] = rescan_budget[0]
 
@@ -2743,8 +3024,10 @@ def validate_payload(
             sid_upd: str, ptr: str, *, popped_idx: int | None = None
         ) -> None:
             comp_map = surface_active_comp_map.get(sid_upd)
-            if not comp_map:
+            if not comp_map or sid_upd in surface_url_slot_cap_hit:
                 return
+            if isinstance(ptr, str):
+                ptr = _canonicalize_json_pointer(ptr)
             dm = surface_data_models.get(sid_upd, {})
             tmp_errors: list[dict[str, Any]] = []
             tmp_warnings: list[dict[str, Any]] = []
@@ -2792,16 +3075,26 @@ def validate_payload(
                                 seen_slot_ids.add(sid_obj)
                                 affected_slots.append(slot)
                 for slot in affected_slots:
-                    _validate_single_url_slot(
-                        slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
-                    )
+                    if not _validate_single_url_slot(
+                        sid_upd, slot, dm, tmp_errors, tmp_warnings, is_historical_snapshot=True
+                    ):
+                        break
+
+            if sid_upd in surface_url_slot_cap_hit:
+                _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
+                return
 
             # 2. Re-validate affected absolute ChildList templates (and nested relative ChildLists)
             tpl_map = surface_childlist_templates.get(sid_upd)
             if tpl_map:
+                seen_tpl_pairs_upd: set[tuple[str, str]] = set()
                 for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
                     if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
                         continue
+                    tpl_pair = (tpl_root_id, list_ptr)
+                    if tpl_pair in seen_tpl_pairs_upd:
+                        continue
+                    seen_tpl_pairs_upd.add(tpl_pair)
                     _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_upd, tpl_root_id)
                     if not rel_slots:
                         continue
@@ -2816,6 +3109,7 @@ def validate_payload(
                     list_resolved = False
                     checked_target_idx: int | None = None
                     is_full_list_target = False
+                    surf_cap_hit = False
 
                     if is_single_item_target:
                         found_list, items_val = _resolve_json_pointer(dm, list_ptr)
@@ -2837,7 +3131,8 @@ def validate_payload(
                                 item = items_val[target_idx]
                                 if not has_nested_rel:
                                     for slot in rel_slots:
-                                        _validate_single_url_slot(
+                                        if not _validate_single_url_slot(
+                                            sid_upd,
                                             slot,
                                             dm,
                                             tmp_errors,
@@ -2845,9 +3140,11 @@ def validate_payload(
                                             item_ctx=item,
                                             item_idx=target_idx,
                                             is_historical_snapshot=True,
-                                        )
+                                        ):
+                                            surf_cap_hit = True
+                                            break
                                 else:
-                                    _validate_template_item_urls(
+                                    if _validate_template_item_urls(
                                         sid_upd,
                                         tpl_root_id,
                                         dm,
@@ -2856,7 +3153,9 @@ def validate_payload(
                                         tmp_errors,
                                         tmp_warnings,
                                         is_historical_snapshot=True,
-                                    )
+                                    ):
+                                        if sid_upd in surface_url_slot_cap_hit:
+                                            surf_cap_hit = True
                     else:
                         is_shifted_descendant = (
                             isinstance(ptr, str)
@@ -2888,7 +3187,8 @@ def validate_payload(
                                                 if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
                                                     cap_hit = True
                                                     break
-                                                _validate_single_url_slot(
+                                                if not _validate_single_url_slot(
+                                                    sid_upd,
                                                     slot,
                                                     dm,
                                                     tmp_errors,
@@ -2896,9 +3196,11 @@ def validate_payload(
                                                     item_ctx=item,
                                                     item_idx=item_idx,
                                                     is_historical_snapshot=True,
-                                                )
+                                                ):
+                                                    surf_cap_hit = True
+                                                    break
                                                 rescan_budget[0] += 1
-                                            if cap_hit:
+                                            if cap_hit or surf_cap_hit:
                                                 break
                                         if cap_hit:
                                             _add_issue(
@@ -2936,6 +3238,8 @@ def validate_payload(
                                                 scope_cache=sc_pop,
                                                 tree_has_slots_cache=tc_pop,
                                             ):
+                                                if sid_upd in surface_url_slot_cap_hit:
+                                                    surf_cap_hit = True
                                                 break
                                             if rescan_budget[0] == before:
                                                 rescan_budget[0] += 1
@@ -2943,7 +3247,8 @@ def validate_payload(
                                 elif not has_nested_rel:
                                     for item_idx, item in enumerate(items_val):
                                         for slot in rel_slots:
-                                            _validate_single_url_slot(
+                                            if not _validate_single_url_slot(
+                                                sid_upd,
                                                 slot,
                                                 dm,
                                                 tmp_errors,
@@ -2951,7 +3256,11 @@ def validate_payload(
                                                 item_ctx=item,
                                                 item_idx=item_idx,
                                                 is_historical_snapshot=True,
-                                            )
+                                            ):
+                                                surf_cap_hit = True
+                                                break
+                                        if surf_cap_hit:
+                                            break
                                 else:
                                     sc_full: dict[str, Any] = {}
                                     tc_full: dict[str, bool] = {}
@@ -2968,7 +3277,12 @@ def validate_payload(
                                             scope_cache=sc_full,
                                             tree_has_slots_cache=tc_full,
                                         ):
+                                            if sid_upd in surface_url_slot_cap_hit:
+                                                surf_cap_hit = True
                                             break
+
+                    if surf_cap_hit or sid_upd in surface_url_slot_cap_hit:
+                        break
 
                     # Check cross-item absolute pointer overlaps independently of is_single_item_target
                     if not is_full_list_target:
@@ -2986,14 +3300,19 @@ def validate_payload(
                                 continue
                             # Always run O(1) absolute check with item_ctx=None first
                             for slot in abs_overlap_slots:
-                                _validate_single_url_slot(
+                                if not _validate_single_url_slot(
+                                    sid_upd,
                                     slot,
                                     dm,
                                     tmp_errors,
                                     tmp_warnings,
                                     item_ctx=None,
                                     is_historical_snapshot=True,
-                                )
+                                ):
+                                    surf_cap_hit = True
+                                    break
+                            if surf_cap_hit or sid_upd in surface_url_slot_cap_hit:
+                                break
                             budget = [surface_tpl_abs_eval_count.get(sid_upd, 0)]
                             if not has_nested_rel:
                                 cap_hit = False
@@ -3004,7 +3323,8 @@ def validate_payload(
                                         if budget[0] >= _MAX_TEMPLATE_ABS_RESCAN_EVALS:
                                             cap_hit = True
                                             break
-                                        _validate_single_url_slot(
+                                        if not _validate_single_url_slot(
+                                            sid_upd,
                                             slot,
                                             dm,
                                             tmp_errors,
@@ -3012,9 +3332,11 @@ def validate_payload(
                                             item_ctx=item,
                                             item_idx=item_idx,
                                             is_historical_snapshot=True,
-                                        )
+                                        ):
+                                            surf_cap_hit = True
+                                            break
                                         budget[0] += 1
-                                    if cap_hit:
+                                    if cap_hit or surf_cap_hit:
                                         break
                                 if cap_hit:
                                     _add_issue(
@@ -3056,10 +3378,14 @@ def validate_payload(
                                         scope_cache=sc_abs,
                                         tree_has_slots_cache=tc_abs,
                                     ):
+                                        if sid_upd in surface_url_slot_cap_hit:
+                                            surf_cap_hit = True
                                         break
                                     if budget[0] == before:
                                         budget[0] += 1
                             surface_tpl_abs_eval_count[sid_upd] = budget[0]
+                            if surf_cap_hit or sid_upd in surface_url_slot_cap_hit:
+                                break
 
             _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
 
@@ -3076,50 +3402,93 @@ def validate_payload(
             # Final non-historical check for rare prefix-less formatString URL slots inside ChildList templates
             final_tpl_errors: list[dict[str, Any]] = []
             final_tpl_warnings: list[dict[str, Any]] = []
-            for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
-                if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
-                    continue
-                _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_to_flush, tpl_root_id)
-                prefixless_slots = [s for s in rel_slots if _is_prefixless_format_string_url(s[2])]
-                if not prefixless_slots:
-                    continue
-                found_list, items_val = _resolve_json_pointer(dm, list_ptr)
-                if not found_list or not isinstance(items_val, list):
-                    continue
-                if not has_nested_rel:
-                    for item_idx, item in enumerate(items_val):
-                        for slot in prefixless_slots:
-                            _validate_single_url_slot(
-                                slot,
+            flushed_tpl_slot_ids: set[int] = set()
+            if sid_to_flush not in surface_url_slot_cap_hit:
+                seen_tpl_pairs_fl: set[tuple[str, str]] = set()
+                fl_cap_hit = False
+                for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
+                    if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
+                        continue
+                    tpl_pair = (tpl_root_id, list_ptr)
+                    if tpl_pair in seen_tpl_pairs_fl:
+                        continue
+                    seen_tpl_pairs_fl.add(tpl_pair)
+                    _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_to_flush, tpl_root_id)
+                    prefixless_slots = [s for s in rel_slots if _is_prefixless_format_string_url(s[2])]
+                    if not prefixless_slots:
+                        continue
+                    found_list, items_val = _resolve_json_pointer(dm, list_ptr)
+                    if not found_list or not isinstance(items_val, list):
+                        continue
+                    if not has_nested_rel:
+                        for item_idx, item in enumerate(items_val):
+                            for slot in prefixless_slots:
+                                flushed_tpl_slot_ids.add(id(slot))
+                                if not _validate_single_url_slot(
+                                    sid_to_flush,
+                                    slot,
+                                    dm,
+                                    final_tpl_errors,
+                                    final_tpl_warnings,
+                                    item_ctx=item,
+                                    item_idx=item_idx,
+                                    is_historical_snapshot=False,
+                                ):
+                                    fl_cap_hit = True
+                                    break
+                            if fl_cap_hit:
+                                break
+                    else:
+                        sc_fl: dict[str, Any] = {}
+                        tc_fl: dict[str, bool] = {}
+                        for item_idx, item in enumerate(items_val):
+                            if _validate_template_item_urls(
+                                sid_to_flush,
+                                tpl_root_id,
                                 dm,
+                                item,
+                                item_idx,
                                 final_tpl_errors,
                                 final_tpl_warnings,
-                                item_ctx=item,
-                                item_idx=item_idx,
                                 is_historical_snapshot=False,
-                            )
-                else:
-                    sc_fl: dict[str, Any] = {}
-                    tc_fl: dict[str, bool] = {}
-                    for item_idx, item in enumerate(items_val):
-                        if _validate_template_item_urls(
-                            sid_to_flush,
-                            tpl_root_id,
-                            dm,
-                            item,
-                            item_idx,
-                            final_tpl_errors,
-                            final_tpl_warnings,
-                            is_historical_snapshot=False,
-                            only_prefixless=True,
-                            scope_cache=sc_fl,
-                            tree_has_slots_cache=tc_fl,
-                        ):
-                            break
+                                only_prefixless=True,
+                                evaluated_slot_ids=flushed_tpl_slot_ids,
+                                scope_cache=sc_fl,
+                                tree_has_slots_cache=tc_fl,
+                            ):
+                                if sid_to_flush in surface_url_slot_cap_hit:
+                                    fl_cap_hit = True
+                                break
+                    if fl_cap_hit or sid_to_flush in surface_url_slot_cap_hit:
+                        break
             _emit_surface_issues(sid_to_flush, final_tpl_errors, final_tpl_warnings)
 
             sver = surface_versions.get(sid_to_flush, "1.0")
             sroot = surface_roots.get(sid_to_flush, "root")
+
+            # Compute slot paths already validated against concrete ChildList items on template-only components
+            template_only_validated_paths: frozenset[str] = frozenset()
+            if flushed_tpl_slot_ids:
+                fl_comp_map = surface_active_comp_map.get(sid_to_flush, {})
+                fl_adj_map = surface_active_adj.get(sid_to_flush, {})
+                direct_reachable: set[str] = set()
+                if sroot in fl_comp_map:
+                    d_stack = [sroot]
+                    while d_stack:
+                        dcid = d_stack.pop()
+                        if dcid in direct_reachable:
+                            continue
+                        direct_reachable.add(dcid)
+                        d_stack.extend(fl_adj_map.get(dcid, ()))
+                tpl_validated: set[str] = set()
+                for scid, cslots in surface_url_slots.get(sid_to_flush, {}).items():
+                    if scid in direct_reachable:
+                        continue
+                    for slot in cslots:
+                        if id(slot) in flushed_tpl_slot_ids:
+                            tpl_validated.add(slot[1])
+                template_only_validated_paths = frozenset(tpl_validated)
+
             flush_errors: list[dict[str, Any]] = []
             flush_warnings: list[dict[str, Any]] = []
             total_components += _validate_surface_components(
@@ -3134,6 +3503,7 @@ def validate_payload(
                 warnings=flush_warnings,
                 data_model=dm,
                 surface_catalog_id=scat,
+                template_validated_url_paths=template_only_validated_paths,
             )
             _emit_surface_issues(sid_to_flush, flush_errors, flush_warnings)
             _clear_surface_stream_state(sid_to_flush)
@@ -3575,12 +3945,13 @@ def validate_payload(
                     popped_idx: int | None = None
                     contents = body.get("contents")
                     mutated = False
+                    v08_merged_keys: list[str] | None = None
                     if isinstance(contents, list):
                         conv_val = _convert_v08_contents(contents)
                         if ptr in {"", "/"}:
                             dm = surface_data_models.setdefault(sid, {})
                             dm.update(conv_val)
-                            mutated = True
+                            v08_merged_keys = list(conv_val.keys())
                         elif isinstance(ptr, str) and ptr.startswith("/"):
                             dm = surface_data_models.setdefault(sid, {})
                             effective_ptr, popped_idx = _mutate_json_pointer(dm, ptr, conv_val)
@@ -3597,7 +3968,13 @@ def validate_payload(
                             dm = surface_data_models.setdefault(sid, {})
                             effective_ptr, popped_idx = _mutate_json_pointer(dm, ptr, body["value"])
                             mutated = True
-                    if mutated and isinstance(effective_ptr, str):
+                    if v08_merged_keys is not None:
+                        for merged_k in v08_merged_keys:
+                            if sid in surface_url_slot_cap_hit:
+                                break
+                            key_ptr = "/" + merged_k.replace("~", "~0").replace("/", "~1")
+                            _validate_streaming_data_update(sid, key_ptr, popped_idx=None)
+                    elif mutated and isinstance(effective_ptr, str):
                         _validate_streaming_data_update(sid, effective_ptr, popped_idx=popped_idx)
 
             elif env_key == "deleteSurface":
