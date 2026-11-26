@@ -2181,6 +2181,312 @@ class TestValidateAndNormalize(unittest.TestCase):
         res_omit = validate_payload(json.dumps(cs_omit), version="1.0", strict=True)
         self.assertTrue(res_omit["ok"], res_omit["errors"])
 
+    def test_cross_message_template_rescan_budgets_and_unshifted_pop_skips(self) -> None:
+        """Unshifted ancestor array pops skip unchanged subtrees; shifted pops and repeated batch updates enforce eval caps."""
+        # 1. Unshifted pop sibling skip: 25,000 items at /outer/0/items + 6,000 pops at /outer/1 = null
+        unshifted_msgs: list[dict] = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "spop_unshifted",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "List",
+                            "children": {"componentId": "r", "path": "/outer/0/items"},
+                        },
+                        {"id": "r", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {
+                        "outer": [{"items": [{"u": "/a"} for _ in range(25_000)]}] + [0] * 6_000,
+                    },
+                },
+            }
+        ]
+        for _ in range(6_000):
+            unshifted_msgs.append(
+                {
+                    "version": "1.0",
+                    "updateDataModel": {"surfaceId": "spop_unshifted", "path": "/outer/1", "value": None},
+                }
+            )
+        raw_unshifted = json.dumps(unshifted_msgs, separators=(",", ":"))
+        t0 = time.perf_counter()
+        res_unshifted = validate_payload(raw_unshifted, version="1.0", strict=True)
+        dt_unshifted = time.perf_counter() - t0
+        self.assertTrue(res_unshifted["ok"], res_unshifted["errors"])
+        self.assertLess(dt_unshifted, 1.5)
+
+        # 2. Shifted pop storm at /outer/0 = null across lists fails closed with MAX_TEMPLATE_EVALS_EXCEEDED
+        pop_storm_msgs: list[dict] = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "spop_storm",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {
+                            "id": "root",
+                            "component": "List",
+                            "children": {"componentId": "r", "path": "/outer/0/items"},
+                        },
+                        {"id": "r", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {
+                        "outer": [
+                            {"items": [{"u": "/a"} for _ in range(18_000)]},
+                            {"items": [{"u": "/a"} for _ in range(18_000)]},
+                            {"items": [{"u": "/a"} for _ in range(18_000)]},
+                            {"items": [{"u": "/a"} for _ in range(18_000)]},
+                        ]
+                    },
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "spop_storm", "path": "/outer/0", "value": None}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "spop_storm", "path": "/outer/0", "value": None}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "spop_storm", "path": "/outer/0", "value": None}},
+        ]
+        raw_pop_storm = json.dumps(pop_storm_msgs, separators=(",", ":"))
+        t1 = time.perf_counter()
+        res_pop_storm = validate_payload(raw_pop_storm, version="1.0", strict=True)
+        dt_pop_storm = time.perf_counter() - t1
+        self.assertFalse(res_pop_storm["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_pop_storm["errors"]})
+        self.assertLess(dt_pop_storm, 1.5)
+
+        # 3. Repeated updateComponents batch storm over 50,000 items fails closed with MAX_TEMPLATE_EVALS_EXCEEDED
+        batch_storm_msgs: list[dict] = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "sbatch_storm",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "r", "path": "/items"}},
+                        {"id": "r", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {"items": [{"u": "/a"} for _ in range(50_000)]},
+                },
+            }
+        ]
+        for _ in range(498):
+            batch_storm_msgs.append(
+                {
+                    "version": "1.0",
+                    "updateComponents": {
+                        "surfaceId": "sbatch_storm",
+                        "components": [{"id": "r", "component": "Image", "url": {"@path": "u"}}],
+                    },
+                }
+            )
+        raw_batch_storm = json.dumps(batch_storm_msgs, separators=(",", ":"))
+        t2 = time.perf_counter()
+        res_batch_storm = validate_payload(raw_batch_storm, version="1.0", strict=True)
+        dt_batch_storm = time.perf_counter() - t2
+        self.assertFalse(res_batch_storm["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_batch_storm["errors"]})
+        self.assertLess(dt_batch_storm, 1.5)
+
+    def test_single_item_childlist_update_checks_cross_item_absolute_overlaps(self) -> None:
+        """Updating an item pointer inside a ChildList still re-validates other items referencing it absolutely."""
+        # 1. openUrl authority-spoof bypass via /items/0/p overlap in items[1]
+        open_url_payload = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "cross_open",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_btn", "path": "/items"}},
+                        {
+                            "id": "row_btn",
+                            "component": "Button",
+                            "child": "row_lbl",
+                            "action": {
+                                "functionCall": {
+                                    "@call": "openUrl",
+                                    "args": {
+                                        "url": {
+                                            "@call": "formatString",
+                                            "args": {"value": "https://example.com${/items/0/p}${rel}"},
+                                        }
+                                    },
+                                }
+                            },
+                        },
+                        {"id": "row_lbl", "component": "Text", "text": "Open"},
+                    ],
+                    "dataModel": {
+                        "items": [
+                            {"p": "/dir", "rel": "/ok"},
+                            {"p": "/dir", "rel": "@evil.example/phish"},
+                        ]
+                    },
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "cross_open", "path": "/items/0/p", "value": ""},
+            },
+        ]
+        res_open = validate_payload(json.dumps(open_url_payload), version="1.0", strict=True)
+        self.assertFalse(res_open["ok"])
+        self.assertIn("UNSAFE_OPEN_URL", {e["code"] for e in res_open["errors"]})
+
+        # 2. Image.url scheme-relative bypass via /items/0/p overlap in items[1]
+        media_url_payload = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "cross_media",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "/items"}},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {
+                                "@call": "formatString",
+                                "args": {"value": "/${/items/0/p}${rel}"},
+                            },
+                        },
+                    ],
+                    "dataModel": {
+                        "items": [
+                            {"p": "safe", "rel": "ok.png"},
+                            {"p": "safe", "rel": "/evil.example/x.png"},
+                        ]
+                    },
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {"surfaceId": "cross_media", "path": "/items/0/p", "value": ""},
+            },
+        ]
+        res_media = validate_payload(json.dumps(media_url_payload), version="1.0", strict=True)
+        self.assertFalse(res_media["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_media["errors"]})
+
+    def test_pre_mutation_replaced_subtree_and_nested_childlist_prefixless_checks(self) -> None:
+        """Replacing containers before leaves or detaching nested ChildLists still catches unresolved prefix-less formatStrings."""
+        # 1. Same-batch container-before-leaf replacement [mid -> Text, row_img -> Text, root -> Column]
+        same_batch = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "pre_mut_same",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "mid", "path": "/items"}},
+                        {"id": "mid", "component": "Column", "children": ["row_img"]},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${never_set}"}},
+                        },
+                    ],
+                    "dataModel": {"items": [{}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "pre_mut_same",
+                    "components": [
+                        {"id": "mid", "component": "Text", "text": "m"},
+                        {"id": "row_img", "component": "Text", "text": "r"},
+                        {"id": "root", "component": "Column", "children": ["mid", "row_img"]},
+                    ],
+                },
+            },
+        ]
+        res_same = validate_payload(json.dumps(same_batch), version="1.0", strict=True)
+        self.assertFalse(res_same["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_same["errors"]})
+
+        # 2. Two-batch nested relative ChildList replacement (inner -> Text, then row_img + root)
+        two_batch_nested = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "pre_mut_nested",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "inner", "path": "/groups"}},
+                        {"id": "inner", "component": "List", "children": {"componentId": "row_img", "path": "items"}},
+                        {
+                            "id": "row_img",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${never_set}"}},
+                        },
+                    ],
+                    "dataModel": {"groups": [{"items": [{}]}]},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "pre_mut_nested",
+                    "components": [{"id": "inner", "component": "Text", "text": "replaced"}],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "pre_mut_nested",
+                    "components": [
+                        {"id": "row_img", "component": "Text", "text": "clean"},
+                        {"id": "root", "component": "Column", "children": ["inner", "row_img"]},
+                    ],
+                },
+            },
+        ]
+        res_nested = validate_payload(json.dumps(two_batch_nested), version="1.0", strict=True)
+        self.assertFalse(res_nested["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_nested["errors"]})
+
+        # 3. Additive container update keeping an active child with deferred data does not falsely fail
+        additive_ok = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "pre_mut_add_ok",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["img_a"]},
+                        {
+                            "id": "img_a",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "${/late_url}"}},
+                        },
+                    ],
+                    "dataModel": {},
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "pre_mut_add_ok",
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["img_a", "footer"]},
+                        {"id": "footer", "component": "Text", "text": "Footer"},
+                    ],
+                },
+            },
+            {
+                "version": "1.0",
+                "updateDataModel": {
+                    "surfaceId": "pre_mut_add_ok",
+                    "path": "/late_url",
+                    "value": "https://example.com/ok.png",
+                },
+            },
+        ]
+        res_add = validate_payload(json.dumps(additive_ok), version="1.0", strict=True)
+        self.assertTrue(res_add["ok"], res_add["errors"])
+
 
 if __name__ == "__main__":
     unittest.main()
