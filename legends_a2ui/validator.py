@@ -416,35 +416,35 @@ def _index_pointer_prefixes(
     item_key: Any,
     item: Any,
     max_segments: int,
-) -> None:
+    ptr_anc_cache: dict[str, list[tuple[str, int | None]]] | None = None,
+) -> int:
     """Index strict ancestor prefixes of pointer into prefix_map with immediate numeric child indices."""
-    ancs = _pointer_ancestors(pointer, max_segments=max_segments)
-    n_ancs = len(ancs)
-    if n_ancs == 0:
-        return
-    for i in range(n_ancs - 1):
-        anc = ancs[i]
-        next_seg = ancs[i + 1][len(anc) + 1 :]
-        cidx = _parse_rfc6901_array_index(next_seg)
+    pairs = ptr_anc_cache.get(pointer) if ptr_anc_cache is not None else None
+    if pairs is None:
+        ancs = _pointer_ancestors(pointer, max_segments=max_segments)
+        n_ancs = len(ancs)
+        pairs = []
+        for i in range(n_ancs - 1):
+            anc = ancs[i]
+            next_seg = ancs[i + 1][len(anc) + 1 :]
+            pairs.append((anc, _parse_rfc6901_array_index(next_seg)))
+        if n_ancs == max_segments and pointer.count("/") > max_segments:
+            pairs.append((ancs[-1], None))
+        if pointer.startswith("//"):
+            pairs.append((_EMPTY_ROOT_KEY_PTR, _parse_rfc6901_array_index(pointer[2:].split("/", 1)[0])))
+        if ptr_anc_cache is not None:
+            if len(ptr_anc_cache) >= 4096:
+                ptr_anc_cache.clear()
+            ptr_anc_cache[pointer] = pairs
+    if not pairs:
+        return 0
+    for anc, cidx in pairs:
         bucket = prefix_map.get(anc)
         if bucket is None:
             bucket = _PrefixBucket()
             prefix_map[anc] = bucket
         bucket.add(item_key, item, cidx)
-    if n_ancs == max_segments and pointer.count("/") > max_segments:
-        last_anc = ancs[-1]
-        bucket = prefix_map.get(last_anc)
-        if bucket is None:
-            bucket = _PrefixBucket()
-            prefix_map[last_anc] = bucket
-        bucket.add(item_key, item, None)
-    if pointer.startswith("//"):
-        cidx = _parse_rfc6901_array_index(pointer[2:].split("/", 1)[0])
-        bucket = prefix_map.get(_EMPTY_ROOT_KEY_PTR)
-        if bucket is None:
-            bucket = _PrefixBucket()
-            prefix_map[_EMPTY_ROOT_KEY_PTR] = bucket
-        bucket.add(item_key, item, cidx)
+    return len(pairs)
 
 
 def _summarize_abs_ptrs_prefixes(
@@ -482,6 +482,8 @@ def _summarize_abs_ptrs_prefixes(
                 prev = anc_map[_EMPTY_ROOT_KEY_PTR]
                 if prev is not None and (cidx is None or cidx > prev):
                     anc_map[_EMPTY_ROOT_KEY_PTR] = cidx
+    if len(summary_cache) >= 4096:
+        summary_cache.clear()
     summary_cache[abs_ptrs] = anc_map
     return anc_map
 
@@ -586,7 +588,7 @@ def _detect_message_version(msg: dict[str, Any]) -> str:
     return "1.0"
 
 
-@lru_cache(maxsize=2048)
+@lru_cache(maxsize=4096)
 def _split_tilde_pointer_cached(pointer: str) -> tuple[str, ...]:
     """Decode and cache RFC 6901 pointer segments for bounded-length pointers containing '~'."""
     raw = pointer[1:] if pointer.startswith("/") else pointer
@@ -892,11 +894,10 @@ def _is_pointer_too_deep(ptr: str, max_segments: int) -> bool:
 def _pointer_eval_cost(ptr: str, *, base: int = 1, depth_div: int = 8) -> int:
     """Estimate evaluation cost of resolving an RFC 6901 pointer by length, tilde escaping, and depth."""
     plen = len(ptr)
-    kb_cost = (
-        (plen // 128)
-        if (plen > _SAFE_URL_CACHE_MAX_ITEM_LEN and "~" in ptr)
-        else (plen // 1024)
-    )
+    if "~" in ptr:
+        kb_cost = (plen // 128) if plen > _SAFE_URL_CACHE_MAX_ITEM_LEN else (plen // 256)
+    else:
+        kb_cost = plen // 1024
     if depth_div == 1:
         return max(base, ptr.count("/")) + kb_cost
     return base + kb_cost + (ptr.count("/") // depth_div)
@@ -1099,6 +1100,7 @@ def _validate_url_function_call(
     eval_counter: list[int] | None = None,
     max_evals: int | None = None,
     budget_exceeded: list[bool] | None = None,
+    parsed_fmt: tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str] | None = None,
 ) -> None:
     fn_name = fn_obj.get("@call") if "@call" in fn_obj else fn_obj.get("call")
     args = fn_obj.get("args") if isinstance(fn_obj.get("args"), dict) else {}
@@ -1117,7 +1119,9 @@ def _validate_url_function_call(
             )
             return
 
-        status, parts, exprs, prefix_nonempty, placeholder_str, _cost, _emp = _parse_format_string_template(tpl)
+        status, parts, exprs, prefix_nonempty, placeholder_str, _cost, _emp = (
+            parsed_fmt if parsed_fmt is not None else _parse_format_string_template(tpl)
+        )
         if status == "err_too_long":
             _add_issue(
                 errors,
@@ -1848,6 +1852,7 @@ def _validate_open_url_arg(
     eval_counter: list[int] | None = None,
     max_evals: int | None = None,
     budget_exceeded: list[bool] | None = None,
+    parsed_fmt: tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str] | None = None,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = raw_url_val
@@ -1871,6 +1876,7 @@ def _validate_open_url_arg(
                 eval_counter=eval_counter,
                 max_evals=max_evals,
                 budget_exceeded=budget_exceeded,
+                parsed_fmt=parsed_fmt,
             )
             return
         keys = set(raw_url_val.keys())
@@ -1935,6 +1941,7 @@ def _validate_media_prop(
     eval_counter: list[int] | None = None,
     max_evals: int | None = None,
     budget_exceeded: list[bool] | None = None,
+    parsed_fmt: tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str] | None = None,
 ) -> None:
     warn_bucket = warnings if warnings is not None else errors
     candidate: Any = val
@@ -2009,6 +2016,7 @@ def _validate_media_prop(
                 eval_counter=eval_counter,
                 max_evals=max_evals,
                 budget_exceeded=budget_exceeded,
+                parsed_fmt=parsed_fmt,
             )
             return
         elif "literalString" in val:
@@ -2311,6 +2319,7 @@ def _detect_cycles_iterative(adj: dict[str, list[str]]) -> list[list[str]]:
             continue
         stack: list[tuple[str, int]] = [(start, 0)]
         path_nodes: list[str] = [start]
+        pos_in_path: dict[str, int] = {start: 0}
         color[start] = GRAY
         while stack:
             node, idx = stack[-1]
@@ -2321,17 +2330,21 @@ def _detect_cycles_iterative(adj: dict[str, list[str]]) -> list[list[str]]:
                 if nxt not in color:
                     continue
                 if color[nxt] == GRAY:
-                    cycle_start = path_nodes.index(nxt) if nxt in path_nodes else 0
+                    cycle_start = pos_in_path.get(nxt, 0)
                     cycles.append(path_nodes[cycle_start:] + [nxt])
+                    if len(cycles) >= 64:
+                        return cycles
                 elif color[nxt] == WHITE:
                     color[nxt] = GRAY
+                    pos_in_path[nxt] = len(path_nodes)
                     path_nodes.append(nxt)
                     stack.append((nxt, 0))
             else:
                 color[node] = BLACK
                 stack.pop()
                 if path_nodes:
-                    path_nodes.pop()
+                    popped = path_nodes.pop()
+                    pos_in_path.pop(popped, None)
     return cycles
 
 
@@ -3255,6 +3268,12 @@ def validate_payload(
                 dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
             ],
         ] = {}
+        block_abs_prefix_summary_cache: dict[frozenset[str], dict[str, int | None]] = {}
+        block_ptr_prefix_cache: dict[str, list[tuple[str, int | None]]] = {}
+        block_parsed_fmt_cache: dict[
+            str, tuple[str, tuple[str, ...], tuple[str, ...], bool, str, int, str]
+        ] = {}
+        block_parsed_fmt_chars: list[int] = [0]
 
         def _clear_surface_stream_state(sid_clear: str) -> None:
             surface_active_comp_map.pop(sid_clear, None)
@@ -3350,7 +3369,22 @@ def validate_payload(
                         if isinstance(args_d, dict):
                             tpl_s = args_d.get("value")
                             if isinstance(tpl_s, str):
-                                parsed_fmt = _parse_format_string_template(tpl_s)
+                                if len(tpl_s) <= _SAFE_URL_CACHE_MAX_ITEM_LEN:
+                                    parsed_fmt = _parse_format_string_template_cached(tpl_s)
+                                else:
+                                    parsed_fmt = block_parsed_fmt_cache.get(tpl_s)
+                                    if parsed_fmt is None:
+                                        parsed_fmt = _parse_format_string_template_uncached(tpl_s)
+                                        tlen_c = len(tpl_s)
+                                        if tlen_c <= _MAX_FORMAT_URL_DATA_LEN:
+                                            if (
+                                                len(block_parsed_fmt_cache) >= 512
+                                                or block_parsed_fmt_chars[0] + tlen_c > 2_097_152
+                                            ):
+                                                block_parsed_fmt_cache.clear()
+                                                block_parsed_fmt_chars[0] = 0
+                                            block_parsed_fmt_cache[tpl_s] = parsed_fmt
+                                            block_parsed_fmt_chars[0] += tlen_c
                                 eval_cost = parsed_fmt[5]
                 else:
                     ptr_s = raw_val.get("@path") if "@path" in raw_val else raw_val.get("path")
@@ -3470,6 +3504,7 @@ def validate_payload(
                     eval_counter=payload_url_slot_evals,
                     max_evals=max_surface_url_evals,
                     budget_exceeded=payload_budget_flag,
+                    parsed_fmt=parsed_fmt,
                 )
             else:
                 _validate_open_url_arg(
@@ -3488,6 +3523,7 @@ def validate_payload(
                     eval_counter=payload_url_slot_evals,
                     max_evals=max_surface_url_evals,
                     budget_exceeded=payload_budget_flag,
+                    parsed_fmt=parsed_fmt,
                 )
             if payload_budget_flag[0]:
                 payload_budget_exceeded = True
@@ -3496,6 +3532,7 @@ def validate_payload(
 
         def _get_surface_ptr_index(
             sid_idx: str,
+            tmp_errors: list[dict[str, Any]],
         ) -> tuple[
             dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
             dict[str, _PrefixBucket],
@@ -3503,6 +3540,8 @@ def validate_payload(
         ]:
             if sid_idx not in surface_ptr_index_dirty and sid_idx in surface_ptr_index:
                 return surface_ptr_index[sid_idx]
+            if payload_budget_exceeded:
+                return {}, {}, []
             exact_map: dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]] = {}
             prefix_map: dict[str, _PrefixBucket] = {}
             all_dyn: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
@@ -3516,13 +3555,15 @@ def validate_payload(
                         continue
                     all_dyn.append(slot)
                     slots_by_abs.setdefault(abs_ptrs, []).append(slot)
-            abs_prefix_summary_cache: dict[frozenset[str], dict[str, int | None]] = {}
+            bucket_ops = 0
             for abs_ptrs, group_slots in slots_by_abs.items():
+                n_group = len(group_slots)
                 for ap in abs_ptrs:
                     key = "/" if ap in {"", "/"} else ap
                     exact_map.setdefault(key, []).extend(group_slots)
+                bucket_ops += len(abs_ptrs)
                 anc_map = _summarize_abs_ptrs_prefixes(
-                    abs_ptrs, max_ptr_segments, abs_prefix_summary_cache
+                    abs_ptrs, max_ptr_segments, block_abs_prefix_summary_cache
                 )
                 for anc, cidx in anc_map.items():
                     bucket = prefix_map.get(anc)
@@ -3531,6 +3572,14 @@ def validate_payload(
                         prefix_map[anc] = bucket
                     for slot in group_slots:
                         bucket.add(id(slot), slot, cidx)
+                    bucket_ops += n_group
+                    if bucket_ops >= 256:
+                        if not _charge_payload_url_evals(bucket_ops, sid_idx, tmp_errors):
+                            return {}, {}, []
+                        bucket_ops = 0
+            if bucket_ops > 0:
+                if not _charge_payload_url_evals(bucket_ops, sid_idx, tmp_errors):
+                    return {}, {}, []
             res_idx = (exact_map, prefix_map, all_dyn)
             surface_ptr_index[sid_idx] = res_idx
             surface_ptr_index_dirty.discard(sid_idx)
@@ -3538,6 +3587,7 @@ def validate_payload(
 
         def _get_surface_childlist_index(
             sid_idx: str,
+            tmp_errors: list[dict[str, Any]],
         ) -> tuple[
             dict[str, list[tuple[str, str]]],
             dict[str, _PrefixBucket],
@@ -3550,6 +3600,8 @@ def validate_payload(
             cached = surface_childlist_index.get(sid_idx)
             if cached is not None:
                 return cached
+            if payload_budget_exceeded:
+                return {}, {}, [], {}, {}, {}, {}
             exact_list_ptr: dict[str, list[tuple[str, str]]] = {}
             anc_list_ptr: dict[str, _PrefixBucket] = {}
             all_tpl_pairs: list[tuple[str, str]] = []
@@ -3567,7 +3619,7 @@ def validate_payload(
             if tpl_map:
                 seen_pairs: set[tuple[str, str]] = set()
                 indexed_roots: set[str] = set()
-                abs_prefix_summary_cache: dict[frozenset[str], dict[str, int | None]] = {}
+                bucket_ops = 0
                 for _owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
                     if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
                         continue
@@ -3576,18 +3628,30 @@ def validate_payload(
                         continue
                     seen_pairs.add(tpl_pair)
                     _tpl_nodes, rel_slots, _has_nested_rel = _collect_template_tree_summary(
-                        sid_idx, tpl_root_id
+                        sid_idx, tpl_root_id, tmp_errors
                     )
+                    if payload_budget_exceeded:
+                        return {}, {}, [], {}, {}, {}, {}
                     if not rel_slots:
                         continue
                     all_tpl_pairs.append(tpl_pair)
                     pairs_by_tpl_root.setdefault(tpl_root_id, []).append(tpl_pair)
                     canon_lp = "/" if list_ptr in {"", "/"} else list_ptr
                     exact_list_ptr.setdefault(canon_lp, []).append(tpl_pair)
+                    bucket_ops += 1
                     if canon_lp != "/":
-                        _index_pointer_prefixes(
-                            anc_list_ptr, canon_lp, tpl_pair, tpl_pair, max_ptr_segments
+                        bucket_ops += _index_pointer_prefixes(
+                            anc_list_ptr,
+                            canon_lp,
+                            tpl_pair,
+                            tpl_pair,
+                            max_ptr_segments,
+                            block_ptr_prefix_cache,
                         )
+                    if bucket_ops >= 256:
+                        if not _charge_payload_url_evals(bucket_ops, sid_idx, tmp_errors):
+                            return {}, {}, [], {}, {}, {}, {}
+                        bucket_ops = 0
                     if tpl_root_id not in indexed_roots:
                         indexed_roots.add(tpl_root_id)
                         slots_by_abs: dict[
@@ -3606,6 +3670,7 @@ def validate_payload(
                         if root_abs_slots:
                             tpl_abs_root[tpl_root_id] = root_abs_slots
                         for abs_ptrs, group_slots in slots_by_abs.items():
+                            n_group = len(group_slots)
                             for ap in abs_ptrs:
                                 key = "/" if ap in {"", "/"} else ap
                                 by_root = tpl_abs_exact.get(key)
@@ -3613,8 +3678,9 @@ def validate_payload(
                                     by_root = {}
                                     tpl_abs_exact[key] = by_root
                                 by_root.setdefault(tpl_root_id, []).extend(group_slots)
+                            bucket_ops += len(abs_ptrs)
                             anc_map = _summarize_abs_ptrs_prefixes(
-                                abs_ptrs, max_ptr_segments, abs_prefix_summary_cache
+                                abs_ptrs, max_ptr_segments, block_abs_prefix_summary_cache
                             )
                             for anc, cidx in anc_map.items():
                                 bucket = tpl_abs_prefix.get(anc)
@@ -3623,6 +3689,16 @@ def validate_payload(
                                     tpl_abs_prefix[anc] = bucket
                                 for rslot in group_slots:
                                     bucket.add((tpl_root_id, id(rslot)), (tpl_root_id, rslot), cidx)
+                                bucket_ops += n_group
+                                if bucket_ops >= 256:
+                                    if not _charge_payload_url_evals(
+                                        bucket_ops, sid_idx, tmp_errors
+                                    ):
+                                        return {}, {}, [], {}, {}, {}, {}
+                                    bucket_ops = 0
+                if bucket_ops > 0:
+                    if not _charge_payload_url_evals(bucket_ops, sid_idx, tmp_errors):
+                        return {}, {}, [], {}, {}, {}, {}
 
             res_cl = (
                 exact_list_ptr,
@@ -3681,21 +3757,61 @@ def validate_payload(
             g_comp_map: dict[str, tuple[str, dict[str, Any], str]],
             g_adj_map: dict[str, list[str]],
             g_tpl_map: dict[str, tuple[str, str]],
+            target_cids: set[str],
+            sid_chain: str,
+            tmp_errors: list[dict[str, Any]],
         ) -> tuple[set[tuple[str, tuple[str, ...]]], bool]:
-            """Compute all active (cid, chain_tuple) bindings reachable from absolute ChildList templates."""
+            """Compute active (target_cid, chain_tuple) bindings reachable from absolute ChildList templates."""
+            if not target_cids:
+                return set(), False
+            rev_adj: dict[str, list[str]] = {}
+            rev_edges = 0
+            for parent, children in g_adj_map.items():
+                if parent not in g_comp_map:
+                    continue
+                for child in children:
+                    if child in g_comp_map:
+                        rev_adj.setdefault(child, []).append(parent)
+                        rev_edges += 1
+            for owner_cid, (inner_tpl_id, inner_list_ptr) in g_tpl_map.items():
+                if owner_cid not in g_comp_map:
+                    continue
+                if (
+                    isinstance(inner_list_ptr, str)
+                    and inner_list_ptr
+                    and not inner_list_ptr.startswith("/")
+                    and inner_tpl_id in g_comp_map
+                ):
+                    rev_adj.setdefault(inner_tpl_id, []).append(owner_cid)
+                    rev_edges += 1
+            if not _charge_payload_url_evals(max(1, rev_edges), sid_chain, tmp_errors):
+                return set(), True
+            can_reach_target: set[str] = {tc for tc in target_cids if tc in g_comp_map}
+            rev_stack = list(can_reach_target)
+            while rev_stack:
+                cur = rev_stack.pop()
+                for pred in rev_adj.get(cur, ()):
+                    if pred not in can_reach_target:
+                        can_reach_target.add(pred)
+                        rev_stack.append(pred)
+            if not can_reach_target:
+                return set(), False
+
             active_chains: set[tuple[str, tuple[str, ...]]] = set()
             seen_states: set[tuple[str, tuple[str, ...]]] = set()
             work: list[tuple[str, tuple[str, ...], frozenset[str]]] = []
-            max_states = max(4096, max_components * 8)
+            max_states = min(1024, max(256, max_components * 2))
             for _owner_cid, (tpl_root_id, list_ptr) in g_tpl_map.items():
                 if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
                     continue
-                if tpl_root_id not in g_comp_map:
+                if tpl_root_id not in can_reach_target:
                     continue
                 init_chain = (list_ptr,)
                 root_key = (tpl_root_id, init_chain)
                 if root_key in seen_states:
                     continue
+                if len(seen_states) >= max_states:
+                    return active_chains, True
                 seen_states.add(root_key)
                 work.append((tpl_root_id, init_chain, frozenset({tpl_root_id})))
 
@@ -3703,14 +3819,17 @@ def validate_payload(
                 cur_root, chain, visited_tpls = work.pop()
                 seen_nodes: set[str] = set()
                 n_stack = [cur_root]
+                node_steps = 0
                 while n_stack:
                     nid = n_stack.pop()
-                    if nid in seen_nodes or nid not in g_comp_map:
+                    if nid in seen_nodes or nid not in can_reach_target:
                         continue
                     seen_nodes.add(nid)
-                    active_chains.add((nid, chain))
+                    node_steps += 1
+                    if nid in target_cids:
+                        active_chains.add((nid, chain))
                     for nxt in g_adj_map.get(nid, ()):
-                        if nxt not in seen_nodes:
+                        if nxt not in seen_nodes and nxt in can_reach_target:
                             n_stack.append(nxt)
                     child_tpl = g_tpl_map.get(nid)
                     if child_tpl is not None:
@@ -3719,7 +3838,7 @@ def validate_payload(
                             isinstance(inner_list_ptr, str)
                             and inner_list_ptr
                             and not inner_list_ptr.startswith("/")
-                            and inner_tpl_id in g_comp_map
+                            and inner_tpl_id in can_reach_target
                             and inner_tpl_id not in visited_tpls
                         ):
                             next_chain = chain + (inner_list_ptr,)
@@ -3729,10 +3848,14 @@ def validate_payload(
                                     return active_chains, True
                                 seen_states.add(next_key)
                                 work.append((inner_tpl_id, next_chain, visited_tpls | {inner_tpl_id}))
+                if not _charge_payload_url_evals(1 + (node_steps // 16), sid_chain, tmp_errors):
+                    return active_chains, True
             return active_chains, False
 
         def _collect_template_tree_summary(
-            sid_tpl: str, tpl_root_id: str
+            sid_tpl: str,
+            tpl_root_id: str,
+            tmp_errors: list[dict[str, Any]] | None = None,
         ) -> tuple[
             set[str],
             list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]],
@@ -3743,10 +3866,14 @@ def validate_payload(
             cached = surf_cache.get(tpl_root_id)
             if cached is not None:
                 return cached
+            if payload_budget_exceeded:
+                return set(), [], False
             all_nodes: set[str] = set()
             all_rel_slots: list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]] = []
+            seen_slot_ids: set[int] = set()
             seen_roots: set[str] = set()
             has_nested_rel = False
+            visited_nodes = 0
             stack = [tpl_root_id]
             while stack:
                 cur_root = stack.pop()
@@ -3754,13 +3881,25 @@ def validate_payload(
                     continue
                 seen_roots.add(cur_root)
                 d_nodes, d_rel_slots, nested_rel = _collect_template_scope(sid_tpl, cur_root)
+                visited_nodes += len(d_nodes)
                 all_nodes.update(d_nodes)
-                all_rel_slots.extend(d_rel_slots)
+                for slot in d_rel_slots:
+                    sid_obj = id(slot)
+                    if sid_obj not in seen_slot_ids:
+                        seen_slot_ids.add(sid_obj)
+                        all_rel_slots.append(slot)
                 if nested_rel:
                     has_nested_rel = True
                     for inner_tpl_id, _inner_ptr in nested_rel:
                         if inner_tpl_id not in seen_roots:
                             stack.append(inner_tpl_id)
+                if visited_nodes >= 256 and tmp_errors is not None:
+                    if not _charge_payload_url_evals(visited_nodes, sid_tpl, tmp_errors):
+                        return set(), [], False
+                    visited_nodes = 0
+            if tmp_errors is not None:
+                if not _charge_payload_url_evals(max(1, visited_nodes), sid_tpl, tmp_errors):
+                    return set(), [], False
             res = (all_nodes, all_rel_slots, has_nested_rel)
             surf_cache[tpl_root_id] = res
             return res
@@ -3862,7 +4001,11 @@ def validate_payload(
                         continue
                     has_inner_slots = tree_has_slots_cache.get(inner_tpl_id)
                     if has_inner_slots is None:
-                        _inodes, irel, _inest = _collect_template_tree_summary(sid_tpl, inner_tpl_id)
+                        _inodes, irel, _inest = _collect_template_tree_summary(
+                            sid_tpl, inner_tpl_id, tmp_errors
+                        )
+                        if payload_budget_exceeded:
+                            return True
                         if target_slot_ids is not None:
                             irel = [s for s in irel if id(s) in target_slot_ids]
                         if only_prefixless:
@@ -3946,6 +4089,8 @@ def validate_payload(
             return False
 
         def _ingest_component_batch(sid_ing: str, b_idx: int, comps: list[dict[str, Any]]) -> None:
+            if payload_budget_exceeded:
+                return
             total_seen = surface_total_comp_entries.get(sid_ing, 0) + len(comps)
             surface_total_comp_entries[sid_ing] = total_seen
             if total_seen > max_components:
@@ -4011,8 +4156,25 @@ def validate_payload(
                         )
                 parsed_incoming.append((cid, c_type, c_props, cpath, new_adj, tpl_binding))
 
-            # Snapshot lightweight pre-batch graph state only when replacing existing components
+            # Snapshot lightweight pre-batch graph state only when replaced components may drop/rebind prefix-less slots
             replaced_entries = [entry for entry in parsed_incoming if entry[0] in comp_map]
+            has_replaced_pfx_slot = any(
+                _is_prefixless_format_string_url(s[2])
+                for entry in replaced_entries
+                for s in slots_by_cid.get(entry[0], ())
+            )
+            has_replaced_rel_pfx_slot = any(
+                bool(s[4]) and _is_prefixless_format_string_url(s[2])
+                for entry in replaced_entries
+                for s in slots_by_cid.get(entry[0], ())
+            )
+            replaced_graph_changed = any(
+                (adj_map.get(entry[0]) != entry[4]) or (tpl_map.get(entry[0]) != entry[5])
+                for entry in replaced_entries
+            )
+            need_outgoing_diff = bool(replaced_entries) and (
+                has_replaced_pfx_slot or replaced_graph_changed
+            )
             replaced_cids: set[str] = set()
             old_comp_map: dict[str, tuple[str, dict[str, Any], str]] | None = None
             old_adj_map: dict[str, list[str]] | None = None
@@ -4020,7 +4182,7 @@ def validate_payload(
                 str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]
             ] | None = None
             old_tpl_map: dict[str, tuple[str, str]] | None = None
-            if replaced_entries:
+            if need_outgoing_diff:
                 replaced_cids = {entry[0] for entry in replaced_entries}
                 old_comp_map = dict(comp_map)
                 old_adj_map = {k: list(v) for k, v in adj_map.items()}
@@ -4028,7 +4190,15 @@ def validate_payload(
                 old_tpl_map = dict(tpl_map)
 
             updated_cids: set[str] = set()
+            abs_changed = False
+            tpl_graph_changed = False
+            had_any_tpl = bool(tpl_map)
             for cid, c_type, c_props, cpath, new_adj, tpl_binding in parsed_incoming:
+                was_in_comp_map = cid in comp_map
+                old_adj = adj_map.get(cid)
+                old_tpl = tpl_map.get(cid)
+                old_c_slots = slots_by_cid.get(cid, ())
+
                 comp_map[cid] = (c_type, c_props, cpath)
                 adj_map[cid] = new_adj
                 updated_cids.add(cid)
@@ -4053,6 +4223,21 @@ def validate_payload(
                     suffix = url_path[len(cpath) :] if url_path.startswith(cpath) else url_path
                     comp_slots.append(("openUrl", url_path, url_val, abs_p, rel_p, cpath, suffix))
 
+                old_has_abs = any(s[3] for s in old_c_slots)
+                new_has_abs = any(s[3] for s in comp_slots)
+                old_has_rel = any(s[4] for s in old_c_slots)
+                new_has_rel = any(s[4] for s in comp_slots)
+                if old_has_abs or new_has_abs:
+                    abs_changed = True
+                if (
+                    (not was_in_comp_map and (had_any_tpl or tpl_binding is not None))
+                    or (was_in_comp_map and old_adj != new_adj)
+                    or (old_tpl != tpl_binding)
+                    or old_has_rel
+                    or new_has_rel
+                ):
+                    tpl_graph_changed = True
+
                 if comp_slots:
                     slots_by_cid[cid] = comp_slots
                 else:
@@ -4063,10 +4248,12 @@ def validate_payload(
                 else:
                     tpl_map.pop(cid, None)
 
-            surface_ptr_index_dirty.add(sid_ing)
-            surface_tpl_summary_cache.pop(sid_ing, None)
-            surface_tpl_rel_index_cache.pop(sid_ing, None)
-            surface_childlist_index.pop(sid_ing, None)
+            if abs_changed:
+                surface_ptr_index_dirty.add(sid_ing)
+            if tpl_graph_changed:
+                surface_tpl_summary_cache.pop(sid_ing, None)
+                surface_tpl_rel_index_cache.pop(sid_ing, None)
+                surface_childlist_index.pop(sid_ing, None)
             if not updated_cids:
                 _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
                 return
@@ -4091,7 +4278,7 @@ def validate_payload(
                         break
 
                 # 2. Relative prefix-less formatString slots: exact pre-batch vs post-batch template chain diff
-                if not direct_out_cap:
+                if not direct_out_cap and (has_replaced_rel_pfx_slot or replaced_graph_changed):
                     old_pfx_rel_by_cid: dict[
                         str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]
                     ] = {}
@@ -4101,20 +4288,33 @@ def validate_payload(
                             old_pfx_rel_by_cid[ocid] = pfx_rel
 
                     if old_pfx_rel_by_cid:
+                        target_cids = (
+                            set(old_pfx_rel_by_cid.keys())
+                            if replaced_graph_changed
+                            else {ocid for ocid in replaced_cids if ocid in old_pfx_rel_by_cid}
+                        )
                         old_chains, old_chain_cap = _collect_template_binding_chains(
-                            old_comp_map, old_adj_map, old_tpl_map
+                            old_comp_map, old_adj_map, old_tpl_map, target_cids, sid_ing, tmp_errors
                         )
-                        new_chains, new_chain_cap = _collect_template_binding_chains(
-                            comp_map, adj_map, tpl_map
-                        )
-                        if old_chain_cap or new_chain_cap:
-                            _add_issue(
-                                tmp_errors,
-                                "MAX_TEMPLATE_EVALS_EXCEEDED",
-                                bidx,
-                                f"surface:{sid_ing}",
-                                f"Template binding chain traversal exceeded limit ({max(4096, max_components * 8)}).",
+                        if old_chain_cap:
+                            new_chains: set[tuple[str, tuple[str, ...]]] = set()
+                            new_chain_cap = False
+                        elif replaced_graph_changed:
+                            new_chains, new_chain_cap = _collect_template_binding_chains(
+                                comp_map, adj_map, tpl_map, target_cids, sid_ing, tmp_errors
                             )
+                        else:
+                            new_chains = old_chains
+                            new_chain_cap = False
+                        if old_chain_cap or new_chain_cap:
+                            if not payload_budget_exceeded:
+                                _add_issue(
+                                    tmp_errors,
+                                    "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                    bidx,
+                                    f"surface:{sid_ing}",
+                                    f"Template binding chain traversal exceeded limit ({min(1024, max(256, max_components * 2))}).",
+                                )
                         else:
                             outgoing_by_chain: dict[
                                 tuple[str, ...],
@@ -4246,83 +4446,60 @@ def validate_payload(
                 return
 
             # Eagerly validate any affected absolute ChildList template (including nested relative ChildLists)
-            rescan_budget = payload_tpl_rescan_evals if b_idx > 0 else None
-            seen_tpl_pairs_ing: set[tuple[str, str]] = set()
-            ing_tpl_cap = False
-            for owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
-                if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
-                    continue
-                tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_ing, tpl_root_id)
-                if not rel_slots:
-                    continue
-                if owner_cid not in updated_cids and not any(n in updated_cids for n in tpl_nodes):
-                    continue
-                tpl_pair = (tpl_root_id, list_ptr)
-                if tpl_pair in seen_tpl_pairs_ing:
-                    continue
-                seen_tpl_pairs_ing.add(tpl_pair)
-                ing_list_cost = _pointer_eval_cost(list_ptr, base=1, depth_div=8)
-                if not _charge_payload_url_evals(ing_list_cost, sid_ing, tmp_errors):
-                    ing_tpl_cap = True
-                    break
-                found_list, items_val = _resolve_json_pointer(dm, list_ptr, max_segments=max_ptr_segments)
-                if not found_list or not isinstance(items_val, list):
-                    continue
-                if not has_nested_rel:
-                    if rescan_budget is not None:
-                        cap_hit = False
-                        for item_idx, item in enumerate(items_val):
-                            for slot in rel_slots:
-                                if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
-                                    cap_hit = True
-                                    break
-                                if not _validate_single_url_slot(
-                                    sid_ing,
-                                    slot,
-                                    dm,
-                                    tmp_errors,
-                                    tmp_warnings,
-                                    item_ctx=item,
-                                    item_idx=item_idx,
-                                    is_historical_snapshot=True,
-                                ):
-                                    ing_tpl_cap = True
-                                    break
-                                rescan_budget[0] += 1
-                            if cap_hit or ing_tpl_cap:
-                                break
-                        if cap_hit:
-                            _add_issue(
-                                tmp_errors,
-                                "MAX_TEMPLATE_EVALS_EXCEEDED",
-                                bidx,
-                                f"surface:{sid_ing}",
-                                f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
-                            )
-                            ing_tpl_cap = True
-                    else:
-                        for item_idx, item in enumerate(items_val):
-                            for slot in rel_slots:
-                                if not _validate_single_url_slot(
-                                    sid_ing,
-                                    slot,
-                                    dm,
-                                    tmp_errors,
-                                    tmp_warnings,
-                                    item_ctx=item,
-                                    item_idx=item_idx,
-                                    is_historical_snapshot=True,
-                                ):
-                                    ing_tpl_cap = True
-                                    break
-                            if ing_tpl_cap:
-                                break
-                else:
-                    sc_ing: dict[str, Any] = {}
-                    tc_ing: dict[str, bool] = {}
-                    for item_idx, item in enumerate(items_val):
+            if b_idx == 0 or tpl_graph_changed:
+                rescan_budget = payload_tpl_rescan_evals if b_idx > 0 else None
+                seen_tpl_pairs_ing: set[tuple[str, str]] = set()
+                ing_tpl_cap = False
+                for owner_cid, (tpl_root_id, list_ptr) in tpl_map.items():
+                    if payload_budget_exceeded:
+                        break
+                    if not isinstance(list_ptr, str) or not list_ptr.startswith("/"):
+                        continue
+                    tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(
+                        sid_ing, tpl_root_id, tmp_errors
+                    )
+                    if payload_budget_exceeded:
+                        ing_tpl_cap = True
+                        break
+                    if not rel_slots:
+                        continue
+                    if owner_cid not in updated_cids and not any(n in updated_cids for n in tpl_nodes):
+                        continue
+                    tpl_pair = (tpl_root_id, list_ptr)
+                    if tpl_pair in seen_tpl_pairs_ing:
+                        continue
+                    seen_tpl_pairs_ing.add(tpl_pair)
+                    ing_list_cost = _pointer_eval_cost(list_ptr, base=1, depth_div=8)
+                    if not _charge_payload_url_evals(ing_list_cost, sid_ing, tmp_errors):
+                        ing_tpl_cap = True
+                        break
+                    found_list, items_val = _resolve_json_pointer(dm, list_ptr, max_segments=max_ptr_segments)
+                    if not found_list or not isinstance(items_val, list):
+                        continue
+                    if not has_nested_rel:
                         if rescan_budget is not None:
-                            if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
+                            cap_hit = False
+                            for item_idx, item in enumerate(items_val):
+                                for slot in rel_slots:
+                                    if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
+                                        cap_hit = True
+                                        break
+                                    if not _validate_single_url_slot(
+                                        sid_ing,
+                                        slot,
+                                        dm,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        item_ctx=item,
+                                        item_idx=item_idx,
+                                        is_historical_snapshot=True,
+                                    ):
+                                        ing_tpl_cap = True
+                                        break
+                                    rescan_budget[0] += 1
+                                if cap_hit or ing_tpl_cap:
+                                    break
+                            if cap_hit:
                                 _add_issue(
                                     tmp_errors,
                                     "MAX_TEMPLATE_EVALS_EXCEEDED",
@@ -4331,68 +4508,99 @@ def validate_payload(
                                     f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
                                 )
                                 ing_tpl_cap = True
-                                break
-                            before = rescan_budget[0]
-                            if _validate_template_item_urls(
-                                sid_ing,
-                                tpl_root_id,
-                                dm,
-                                item,
-                                item_idx,
-                                tmp_errors,
-                                tmp_warnings,
-                                is_historical_snapshot=True,
-                                eval_budget=rescan_budget,
-                                eval_limit=_MAX_TEMPLATE_RESCAN_EVALS,
-                                scope_cache=sc_ing,
-                                tree_has_slots_cache=tc_ing,
-                            ):
-                                ing_tpl_cap = True
-                                break
-                            if rescan_budget[0] == before:
-                                rescan_budget[0] += 1
                         else:
-                            root_scope_ing = sc_ing.get(tpl_root_id)
-                            if root_scope_ing is None:
-                                root_scope_ing = _collect_template_scope(sid_ing, tpl_root_id)
-                                sc_ing[tpl_root_id] = root_scope_ing
-                            if not root_scope_ing[1]:
-                                itype = type(item)
-                                skip_empty = itype is not dict and itype is not list
-                                if (
-                                    not skip_empty
-                                    and itype is dict
-                                    and len(root_scope_ing[2]) == 1
-                                ):
-                                    ip0 = root_scope_ing[2][0][1]
-                                    if len(ip0) < 1024 and "/" not in ip0 and "~" not in ip0:
-                                        iv0 = item.get(ip0) if item else None
-                                        skip_empty = type(iv0) is not list or not iv0
-                                if skip_empty:
-                                    nxt_evals = payload_url_slot_evals[0] + 1
-                                    if nxt_evals > max_surface_url_evals:
-                                        _charge_payload_url_evals(1, sid_ing, tmp_errors)
+                            for item_idx, item in enumerate(items_val):
+                                for slot in rel_slots:
+                                    if not _validate_single_url_slot(
+                                        sid_ing,
+                                        slot,
+                                        dm,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        item_ctx=item,
+                                        item_idx=item_idx,
+                                        is_historical_snapshot=True,
+                                    ):
                                         ing_tpl_cap = True
                                         break
-                                    payload_url_slot_evals[0] = nxt_evals
-                                    continue
-                            if _validate_template_item_urls(
-                                sid_ing,
-                                tpl_root_id,
-                                dm,
-                                item,
-                                item_idx,
-                                tmp_errors,
-                                tmp_warnings,
-                                is_historical_snapshot=True,
-                                scope_cache=sc_ing,
-                                tree_has_slots_cache=tc_ing,
-                            ):
-                                if payload_budget_exceeded:
+                                if ing_tpl_cap:
+                                    break
+                    else:
+                        sc_ing: dict[str, Any] = {}
+                        tc_ing: dict[str, bool] = {}
+                        for item_idx, item in enumerate(items_val):
+                            if rescan_budget is not None:
+                                if rescan_budget[0] >= _MAX_TEMPLATE_RESCAN_EVALS:
+                                    _add_issue(
+                                        tmp_errors,
+                                        "MAX_TEMPLATE_EVALS_EXCEEDED",
+                                        bidx,
+                                        f"surface:{sid_ing}",
+                                        f"Template URL re-evaluation exceeded limit ({_MAX_TEMPLATE_RESCAN_EVALS}).",
+                                    )
                                     ing_tpl_cap = True
-                                break
-                if ing_tpl_cap or payload_budget_exceeded:
-                    break
+                                    break
+                                before = rescan_budget[0]
+                                if _validate_template_item_urls(
+                                    sid_ing,
+                                    tpl_root_id,
+                                    dm,
+                                    item,
+                                    item_idx,
+                                    tmp_errors,
+                                    tmp_warnings,
+                                    is_historical_snapshot=True,
+                                    eval_budget=rescan_budget,
+                                    eval_limit=_MAX_TEMPLATE_RESCAN_EVALS,
+                                    scope_cache=sc_ing,
+                                    tree_has_slots_cache=tc_ing,
+                                ):
+                                    ing_tpl_cap = True
+                                    break
+                                if rescan_budget[0] == before:
+                                    rescan_budget[0] += 1
+                            else:
+                                root_scope_ing = sc_ing.get(tpl_root_id)
+                                if root_scope_ing is None:
+                                    root_scope_ing = _collect_template_scope(sid_ing, tpl_root_id)
+                                    sc_ing[tpl_root_id] = root_scope_ing
+                                if not root_scope_ing[1]:
+                                    itype = type(item)
+                                    skip_empty = itype is not dict and itype is not list
+                                    if (
+                                        not skip_empty
+                                        and itype is dict
+                                        and len(root_scope_ing[2]) == 1
+                                    ):
+                                        ip0 = root_scope_ing[2][0][1]
+                                        if len(ip0) < 1024 and "/" not in ip0 and "~" not in ip0:
+                                            iv0 = item.get(ip0) if item else None
+                                            skip_empty = type(iv0) is not list or not iv0
+                                    if skip_empty:
+                                        nxt_evals = payload_url_slot_evals[0] + 1
+                                        if nxt_evals > max_surface_url_evals:
+                                            _charge_payload_url_evals(1, sid_ing, tmp_errors)
+                                            ing_tpl_cap = True
+                                            break
+                                        payload_url_slot_evals[0] = nxt_evals
+                                        continue
+                                if _validate_template_item_urls(
+                                    sid_ing,
+                                    tpl_root_id,
+                                    dm,
+                                    item,
+                                    item_idx,
+                                    tmp_errors,
+                                    tmp_warnings,
+                                    is_historical_snapshot=True,
+                                    scope_cache=sc_ing,
+                                    tree_has_slots_cache=tc_ing,
+                                ):
+                                    if payload_budget_exceeded:
+                                        ing_tpl_cap = True
+                                    break
+                    if ing_tpl_cap or payload_budget_exceeded:
+                        break
 
             _emit_surface_issues(sid_ing, tmp_errors, tmp_warnings)
 
@@ -4414,7 +4622,10 @@ def validate_payload(
                 strict_ptr_ancs = [a for a in ancs if a != ptr]
 
             # 1. Re-validate only direct URL slots whose bound pointer(s) overlap ptr (O(depth + log K))
-            exact_map, prefix_map, all_dyn = _get_surface_ptr_index(sid_upd)
+            exact_map, prefix_map, all_dyn = _get_surface_ptr_index(sid_upd, tmp_errors)
+            if payload_budget_exceeded:
+                _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
+                return
             if all_dyn:
                 if ptr_is_root:
                     if popped_idx is None:
@@ -4466,7 +4677,10 @@ def validate_payload(
                     tpl_abs_exact,
                     tpl_abs_prefix,
                     _tpl_abs_root,
-                ) = _get_surface_childlist_index(sid_upd)
+                ) = _get_surface_childlist_index(sid_upd, tmp_errors)
+                if payload_budget_exceeded:
+                    _emit_surface_issues(sid_upd, tmp_errors, tmp_warnings)
+                    return
                 if all_tpl_pairs:
                     full_list_pairs: list[tuple[str, str]] = []
                     full_list_pair_set: set[tuple[str, str]] = set()
@@ -4550,8 +4764,11 @@ def validate_payload(
                     # 2a. Full-list ChildList targets
                     for tpl_root_id, list_ptr in full_list_pairs:
                         _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(
-                            sid_upd, tpl_root_id
+                            sid_upd, tpl_root_id, tmp_errors
                         )
+                        if payload_budget_exceeded:
+                            surf_cap_hit = True
+                            break
                         cached_res = resolved_list_by_ptr.get(list_ptr)
                         was_cached = cached_res is not None
                         if not was_cached:
@@ -4760,8 +4977,11 @@ def validate_payload(
                                     tpl_root_id = tpl_pair[0]
                                     checked_target_idx_by_pair[tpl_pair] = target_idx
                                     _tpl_nodes, rel_slots, has_nested_rel = (
-                                        _collect_template_tree_summary(sid_upd, tpl_root_id)
+                                        _collect_template_tree_summary(sid_upd, tpl_root_id, tmp_errors)
                                     )
+                                    if payload_budget_exceeded:
+                                        surf_cap_hit = True
+                                        break
                                     if not has_nested_rel:
                                         for slot in rel_slots:
                                             if not _validate_single_url_slot(
@@ -4815,14 +5035,18 @@ def validate_payload(
                                     lp_rel_prefix: dict[str, _PrefixBucket] = {}
                                     lp_nested_exact: dict[str, list[str]] = {}
                                     lp_nested_prefix: dict[str, _PrefixBucket] = {}
-                                    rel_prefix_summary_cache: dict[
-                                        frozenset[str], dict[str, int | None]
-                                    ] = {}
+                                    rel_bucket_ops = 0
+                                    rel_idx_aborted = False
                                     for tpl_pair in exact_list_ptr.get(list_ptr, ()):
                                         tpl_root_id = tpl_pair[0]
                                         _tpl_nodes, rel_slots, has_nested_rel = (
-                                            _collect_template_tree_summary(sid_upd, tpl_root_id)
+                                            _collect_template_tree_summary(
+                                                sid_upd, tpl_root_id, tmp_errors
+                                            )
                                         )
+                                        if payload_budget_exceeded:
+                                            rel_idx_aborted = True
+                                            break
                                         if not has_nested_rel:
                                             direct_rel_slots = rel_slots
                                             nested_rel_children: list[tuple[str, str]] = []
@@ -4853,6 +5077,7 @@ def validate_payload(
                                                         rslot
                                                     )
                                             for rel_ptrs, group_slots in slots_by_rel.items():
+                                                n_group = len(group_slots)
                                                 slash_rel_ptrs = frozenset(
                                                     f"/{rp}" for rp in rel_ptrs
                                                 )
@@ -4863,10 +5088,11 @@ def validate_payload(
                                                     lp_rel_exact.setdefault(rptr, []).extend(
                                                         tagged_slots
                                                     )
+                                                rel_bucket_ops += len(slash_rel_ptrs)
                                                 r_anc_map = _summarize_abs_ptrs_prefixes(
                                                     slash_rel_ptrs,
                                                     max_ptr_segments,
-                                                    rel_prefix_summary_cache,
+                                                    block_abs_prefix_summary_cache,
                                                 )
                                                 for ranc, rcidx in r_anc_map.items():
                                                     rbucket = lp_rel_prefix.get(ranc)
@@ -4879,6 +5105,20 @@ def validate_payload(
                                                             (tpl_root_id, rslot),
                                                             rcidx,
                                                         )
+                                                    rel_bucket_ops += n_group
+                                                    if rel_bucket_ops >= 256:
+                                                        if not _charge_payload_url_evals(
+                                                            rel_bucket_ops,
+                                                            sid_upd,
+                                                            tmp_errors,
+                                                        ):
+                                                            rel_idx_aborted = True
+                                                            break
+                                                        rel_bucket_ops = 0
+                                                if rel_idx_aborted:
+                                                    break
+                                            if rel_idx_aborted:
+                                                break
                                         if nested_rel_children:
                                             seen_inner_slashes: set[str] = set()
                                             for _inner_tpl_id, inner_list_ptr in nested_rel_children:
@@ -4891,13 +5131,34 @@ def validate_payload(
                                                     lp_nested_exact.setdefault(
                                                         slash_inner, []
                                                     ).append(tpl_root_id)
-                                                _index_pointer_prefixes(
+                                                    rel_bucket_ops += 1
+                                                rel_bucket_ops += _index_pointer_prefixes(
                                                     lp_nested_prefix,
                                                     slash_inner,
                                                     tpl_root_id,
                                                     tpl_root_id,
                                                     max_ptr_segments,
+                                                    block_ptr_prefix_cache,
                                                 )
+                                                if rel_bucket_ops >= 256:
+                                                    if not _charge_payload_url_evals(
+                                                        rel_bucket_ops,
+                                                        sid_upd,
+                                                        tmp_errors,
+                                                    ):
+                                                        rel_idx_aborted = True
+                                                        break
+                                                    rel_bucket_ops = 0
+                                            if rel_idx_aborted:
+                                                break
+                                    if not rel_idx_aborted and rel_bucket_ops > 0:
+                                        if not _charge_payload_url_evals(
+                                            rel_bucket_ops, sid_upd, tmp_errors
+                                        ):
+                                            rel_idx_aborted = True
+                                    if rel_idx_aborted or payload_budget_exceeded:
+                                        surf_cap_hit = True
+                                        break
                                     rel_idx_entry = (
                                         lp_rel_exact,
                                         lp_rel_prefix,
@@ -5016,8 +5277,11 @@ def validate_payload(
                     if not surf_cap_hit and not payload_budget_exceeded and matched_abs_by_root:
                         for rt_id, abs_overlap_slots in matched_abs_by_root.items():
                             _tpl_nodes, _rel_slots, has_nested_rel = _collect_template_tree_summary(
-                                sid_upd, rt_id
+                                sid_upd, rt_id, tmp_errors
                             )
+                            if payload_budget_exceeded:
+                                surf_cap_hit = True
+                                break
                             abs_slot_ids = (
                                 {id(s) for s in abs_overlap_slots} if has_nested_rel else None
                             )
@@ -5170,7 +5434,12 @@ def validate_payload(
                     if tpl_pair in seen_tpl_pairs_fl:
                         continue
                     seen_tpl_pairs_fl.add(tpl_pair)
-                    _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(sid_to_flush, tpl_root_id)
+                    _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(
+                        sid_to_flush, tpl_root_id, final_tpl_errors
+                    )
+                    if payload_budget_exceeded:
+                        fl_cap_hit = True
+                        break
                     prefixless_slots = [s for s in rel_slots if _is_prefixless_format_string_url(s[2])]
                     if not prefixless_slots:
                         continue

@@ -4744,6 +4744,284 @@ class TestValidateAndNormalize(unittest.TestCase):
         self.assertFalse(res_ek_l["ok"])
         self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_ek_l["errors"]})
 
+    def test_incremental_template_chain_pruning_index_rebuild_budgets_and_tilde_cache(self) -> None:
+        """Incremental updateComponents chain pruning, budgeted index rebuilds, tilde LRU cap, and cycle cap."""
+        from legends_a2ui.validator import _detect_cycles_iterative, _split_tilde_pointer_cached
+
+        # 1a. Unrelated Divider updates on a deep multi-level ChildList DAG with a relative prefix-less
+        # formatString leaf skip snapshot cloning and chain traversal cleanly
+        comps_dag = [
+            {"id": "root", "component": "Column", "children": ["top", "d"]},
+            {"id": "d", "component": "Divider"},
+            {"id": "top", "component": "List", "children": {"componentId": "c0", "path": "/g"}},
+            {"id": "c0", "component": "Column", "children": [f"a{i}" for i in range(63)]},
+        ]
+        for i in range(63):
+            comps_dag.append({"id": f"a{i}", "component": "List", "children": {"componentId": "c1", "path": f"p{i}"}})
+        comps_dag.append({"id": "c1", "component": "Column", "children": [f"b{j}" for j in range(63)]})
+        for j in range(63):
+            comps_dag.append({"id": f"b{j}", "component": "List", "children": {"componentId": "c2", "path": f"q{j}"}})
+        comps_dag.append({"id": "c2", "component": "Column", "children": ["leaf"] + [f"s{k}" for k in range(177)]})
+        comps_dag.append({"id": "leaf", "component": "Image", "url": {"@call": "formatString", "args": {"value": "${u}"}}})
+        for k in range(177):
+            comps_dag.append({"id": f"s{k}", "component": "Divider"})
+        dm_dag = {"g": [{"p0": [{"q0": [{"u": "https://example.com/1.png"}]}]}]}
+        msgs_dag_unrelated = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_dag_u",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_dag,
+                    "dataModel": dm_dag,
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateComponents": {"surfaceId": "s_dag_u", "components": [{"id": "d", "component": "Divider"}]}}
+            for _ in range(25)
+        ]
+        t0 = time.perf_counter()
+        res_dag_u = validate_payload(json.dumps(msgs_dag_unrelated, separators=(",", ":")), version="1.0", strict=True)
+        self.assertTrue(res_dag_u["ok"], res_dag_u["errors"])
+        self.assertLess(time.perf_counter() - t0, 0.5)
+
+        # 1b. Genuine ChildList binding mutation with a large slotless subgraph prunes dead branches
+        comps_slotless = [
+            {"id": "root", "component": "List", "children": {"componentId": "c0", "path": "/g0"}},
+            {"id": "c0", "component": "Column", "children": ["leaf"] + [f"a{i}" for i in range(63)]},
+            {"id": "leaf", "component": "Image", "url": {"@call": "formatString", "args": {"value": "${u}"}}},
+        ]
+        for i in range(63):
+            comps_slotless.append({"id": f"a{i}", "component": "List", "children": {"componentId": "c1", "path": f"p{i}"}})
+        comps_slotless.append({"id": "c1", "component": "Column", "children": [f"b{j}" for j in range(63)]})
+        for j in range(63):
+            comps_slotless.append({"id": f"b{j}", "component": "List", "children": {"componentId": "c2", "path": f"q{j}"}})
+        comps_slotless.append({"id": "c2", "component": "Column", "children": [f"s{k}" for k in range(177)]})
+        for k in range(177):
+            comps_slotless.append({"id": f"s{k}", "component": "Divider"})
+        dm_slotless = {"g0": [{"u": "https://example.com/1.png"}], "g1": [{"u": "https://example.com/2.png"}]}
+        msgs_slotless = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_dag_m",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_slotless,
+                    "dataModel": dm_slotless,
+                },
+            }
+        ] + [
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "s_dag_m",
+                    "components": [{"id": "root", "component": "List", "children": {"componentId": "c0", "path": f"/g{(u + 1) % 2}"}}],
+                },
+            }
+            for u in range(10)
+        ]
+        t1 = time.perf_counter()
+        res_slotless = validate_payload(json.dumps(msgs_slotless, separators=(",", ":")), version="1.0", strict=True)
+        self.assertTrue(res_slotless["ok"], res_slotless["errors"])
+        self.assertLess(time.perf_counter() - t1, 0.5)
+
+        # 1c. Unlinking a prefix-less formatString template that resolved an unsafe URL still fails closed
+        msgs_unlink_unsafe = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_dag_bad",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "c0", "path": "/g0"}},
+                        {"id": "c0", "component": "Column", "children": ["leaf", "sub"]},
+                        {"id": "leaf", "component": "Image", "url": {"@call": "formatString", "args": {"value": "${u}"}}},
+                        {"id": "sub", "component": "Divider"},
+                    ],
+                    "dataModel": {
+                        "g0": [{"u": "javascript:alert(1)"}],
+                        "g1": [{"u": "https://example.com/ok.png"}],
+                    },
+                },
+            },
+            {
+                "version": "1.0",
+                "updateComponents": {
+                    "surfaceId": "s_dag_bad",
+                    "components": [{"id": "root", "component": "List", "children": {"componentId": "c0", "path": "/g1"}}],
+                },
+            },
+        ]
+        res_unlink_bad = validate_payload(json.dumps(msgs_unlink_unsafe), version="1.0", strict=True)
+        self.assertFalse(res_unlink_bad["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_unlink_bad["errors"]})
+
+        # 2a. Alternating updateComponents + updateDataModel direct abs_ptrs index rebuilds stay budgeted
+        deep55 = "/a" * 55
+        dm55: dict[str, Any] = {}
+        cur55 = dm55
+        for _ in range(55):
+            nxt55: dict[str, Any] = {}
+            cur55["a"] = nxt55
+            cur55 = nxt55
+        comps_idx_dir = (
+            [{"id": "root", "component": "Column", "children": ["d"] + [f"m{k}" for k in range(120)]},
+             {"id": "d", "component": "Image", "url": {"@path": "/u0"}}]
+            + [
+                {
+                    "id": f"m{k}",
+                    "component": "Image",
+                    "url": {
+                        "@call": "formatString",
+                        "args": {"value": "https://a.co/" + "".join(f"${{{deep55}/k{k}_{p}}}" for p in range(16))},
+                    },
+                }
+                for k in range(120)
+            ]
+        )
+        msgs_idx_dir = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_idx_dir",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_idx_dir,
+                    "dataModel": dm55,
+                },
+            }
+        ]
+        for i in range(150):
+            msgs_idx_dir.append(
+                {"version": "1.0", "updateComponents": {"surfaceId": "s_idx_dir", "components": [{"id": "d", "component": "Image", "url": {"@path": f"/u{i % 2}"}}]}}
+            )
+            msgs_idx_dir.append(
+                {"version": "1.0", "updateDataModel": {"surfaceId": "s_idx_dir", "path": "/x", "value": i % 9}}
+            )
+        t2 = time.perf_counter()
+        res_idx_dir = validate_payload(json.dumps(msgs_idx_dir, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_idx_dir["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_idx_dir["errors"]})
+        self.assertLess(time.perf_counter() - t2, 0.5)
+
+        # 2b. Alternating updateComponents + updateDataModel ChildList index rebuilds stay budgeted
+        comps_idx_cl = (
+            [
+                {"id": "root", "component": "Column", "children": ["d"] + [f"l{k}" for k in range(250)]},
+                {"id": "d", "component": "List", "children": {"componentId": "row", "path": "/u0"}},
+                {"id": "row", "component": "Image", "url": {"@path": "u"}},
+            ]
+            + [{"id": f"l{k}", "component": "List", "children": {"componentId": "row", "path": f"{deep55}/l{k}"}} for k in range(250)]
+        )
+        msgs_idx_cl = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_idx_cl",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_idx_cl,
+                    "dataModel": dm55,
+                },
+            }
+        ]
+        for i in range(120):
+            msgs_idx_cl.append(
+                {"version": "1.0", "updateComponents": {"surfaceId": "s_idx_cl", "components": [{"id": "d", "component": "List", "children": {"componentId": "row", "path": f"/u{i % 2}"}}]}}
+            )
+            msgs_idx_cl.append(
+                {"version": "1.0", "updateDataModel": {"surfaceId": "s_idx_cl", "path": "/x", "value": i % 9}}
+            )
+        t3 = time.perf_counter()
+        res_idx_cl = validate_payload(json.dumps(msgs_idx_cl, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_idx_cl["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_idx_cl["errors"]})
+        self.assertLess(time.perf_counter() - t3, 0.5)
+
+        # 2c. Selective cache invalidation still catches UNSAFE_MEDIA_URL on genuinely updated direct and template slots
+        msgs_selective_unsafe = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_sel_bad",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["img", "lst", "div"]},
+                        {"id": "img", "component": "Image", "url": {"@path": "/safe"}},
+                        {"id": "lst", "component": "List", "children": {"componentId": "row", "path": "/items"}},
+                        {"id": "row", "component": "Image", "url": {"@path": "safe_u"}},
+                        {"id": "div", "component": "Divider"},
+                    ],
+                    "dataModel": {"safe": "https://example.com/a.png", "items": [{"safe_u": "https://example.com/b.png"}]},
+                },
+            },
+            {"version": "1.0", "updateComponents": {"surfaceId": "s_sel_bad", "components": [{"id": "div", "component": "Divider"}]}},
+            {"version": "1.0", "updateComponents": {"surfaceId": "s_sel_bad", "components": [{"id": "img", "component": "Image", "url": {"@path": "/bad"}}]}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_sel_bad", "path": "/bad", "value": "javascript:alert(1)"}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_sel_bad", "path": "/bad", "value": "https://example.com/ok.png"}},
+        ]
+        res_sel_bad = validate_payload(json.dumps(msgs_selective_unsafe), version="1.0", strict=True)
+        self.assertFalse(res_sel_bad["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_sel_bad["errors"]})
+
+        msgs_sel_tpl_bad = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_sel_tpl",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "Column", "children": ["lst", "div"]},
+                        {"id": "lst", "component": "List", "children": {"componentId": "row", "path": "/items"}},
+                        {"id": "row", "component": "Image", "url": {"@path": "safe_u"}},
+                        {"id": "div", "component": "Divider"},
+                    ],
+                    "dataModel": {"items": [{"safe_u": "https://example.com/b.png"}]},
+                },
+            },
+            {"version": "1.0", "updateComponents": {"surfaceId": "s_sel_tpl", "components": [{"id": "row", "component": "Image", "url": {"@path": "bad_u"}}]}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_sel_tpl", "path": "/items/0/bad_u", "value": "javascript:alert(1)"}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_sel_tpl", "path": "/items/0/bad_u", "value": "https://example.com/ok.png"}},
+        ]
+        res_sel_tpl = validate_payload(json.dumps(msgs_sel_tpl_bad), version="1.0", strict=True)
+        self.assertFalse(res_sel_tpl["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_sel_tpl["errors"]})
+
+        # 3. 2,112 distinct 458-byte tilde pointers fit in _split_tilde_pointer_cached(maxsize=4096) and stay fast
+        _split_tilde_pointer_cached.cache_clear()
+        ptrs_2112 = ["/" + ("~0" * 224) + f"/k{i:04d}" for i in range(2112)]
+        comps_tilde = [{"id": "root", "component": "Column", "children": [f"m{i}" for i in range(132)]}]
+        for i in range(132):
+            grp = ptrs_2112[i * 16 : (i + 1) * 16]
+            comps_tilde.append(
+                {
+                    "id": f"m{i}",
+                    "component": "Image",
+                    "url": {"@call": "formatString", "args": {"value": "https://a.co/" + "".join(f"${{{p}}}" for p in grp)}},
+                }
+            )
+        msgs_tilde = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_tilde_lru",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_tilde,
+                    "dataModel": {"z": 1},
+                },
+            }
+        ] + [{"version": "1.0", "updateDataModel": {"surfaceId": "s_tilde_lru", "path": "/", "value": {"z": r}}} for r in range(85)]
+        t4 = time.perf_counter()
+        res_tilde = validate_payload(json.dumps(msgs_tilde, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_tilde["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_tilde["errors"]})
+        self.assertLess(time.perf_counter() - t4, 0.5)
+        self.assertEqual(_split_tilde_pointer_cached.cache_info().maxsize, 4096)
+        self.assertEqual(_split_tilde_pointer_cached.cache_info().misses, 2112)
+
+        # 4. _detect_cycles_iterative caps dense cyclic graphs at 64 cycles
+        dense_adj = {f"n{i}": [f"n{j}" for j in range(20)] for i in range(20)}
+        found_cycles = _detect_cycles_iterative(dense_adj)
+        self.assertEqual(len(found_cycles), 64)
+
 
 if __name__ == "__main__":
     unittest.main()
