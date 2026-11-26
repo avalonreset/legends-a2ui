@@ -138,13 +138,18 @@ def _is_custom_catalog_id(cat_id: Any, canonical_catalog_id: str) -> bool:
 _RFC6901_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]{0,6})$")
 _SIMPLE_FORMAT_PTR_RE = re.compile(r"^[^${}()\s]+$")
 _RAW_TILDE_RE = re.compile(r"~(?![01])")
+_EMPTY_ROOT_KEY_PTR = "/\x00"
 
 
 def _parse_rfc6901_array_index(seg: str) -> int | None:
     """Parse a bounded RFC 6901 ASCII array index ('0' or [1-9][0-9]{0,6})."""
-    if not isinstance(seg, str) or not _RFC6901_INDEX_RE.fullmatch(seg):
+    if type(seg) is not str or not seg:
         return None
-    return int(seg)
+    if seg == "0":
+        return 0
+    if seg[0] != "0" and len(seg) <= 7 and seg.isascii() and seg.isdigit():
+        return int(seg)
+    return None
 
 
 def _canonicalize_json_pointer(ptr: str, max_segments: int = DEFAULT_MAX_DEPTH + 4) -> str:
@@ -204,7 +209,11 @@ def _mutate_json_pointer(
         return (pointer, None, False)
     canon_pointer = _canonicalize_json_pointer(pointer, max_segments=max_segments)
     raw_parts = canon_pointer[1:].split("/")
-    parts = [p.replace("~1", "/").replace("~0", "~") for p in raw_parts]
+    parts = (
+        [p.replace("~1", "/").replace("~0", "~") if "~" in p else p for p in raw_parts]
+        if "~" in canon_pointer
+        else raw_parts
+    )
     if not parts:
         return (canon_pointer, None, False)
     cur: Any = root
@@ -246,6 +255,8 @@ def _mutate_json_pointer(
             if value is None:
                 if idx < len(cur):
                     cur.pop(idx)
+                    if len(raw_parts) == 2 and raw_parts[0] == "":
+                        return (_EMPTY_ROOT_KEY_PTR, idx, True)
                     return (parent_ptr or "/", idx, True)
                 return (canon_pointer, None, False)
             if idx < len(cur):
@@ -427,6 +438,13 @@ def _index_pointer_prefixes(
             bucket = _PrefixBucket()
             prefix_map[last_anc] = bucket
         bucket.add(item_key, item, None)
+    if pointer.startswith("//"):
+        cidx = _parse_rfc6901_array_index(pointer[2:].split("/", 1)[0])
+        bucket = prefix_map.get(_EMPTY_ROOT_KEY_PTR)
+        if bucket is None:
+            bucket = _PrefixBucket()
+            prefix_map[_EMPTY_ROOT_KEY_PTR] = bucket
+        bucket.add(item_key, item, cidx)
 
 
 def _summarize_abs_ptrs_prefixes(
@@ -456,6 +474,14 @@ def _summarize_abs_ptrs_prefixes(
                     anc_map[anc] = cidx
         if n_ancs == max_segments and ap.count("/") > max_segments:
             anc_map[ancs[-1]] = None
+        if ap.startswith("//"):
+            cidx = _parse_rfc6901_array_index(ap[2:].split("/", 1)[0])
+            if _EMPTY_ROOT_KEY_PTR not in anc_map:
+                anc_map[_EMPTY_ROOT_KEY_PTR] = cidx
+            else:
+                prev = anc_map[_EMPTY_ROOT_KEY_PTR]
+                if prev is not None and (cidx is None or cidx > prev):
+                    anc_map[_EMPTY_ROOT_KEY_PTR] = cidx
     summary_cache[abs_ptrs] = anc_map
     return anc_map
 
@@ -560,6 +586,13 @@ def _detect_message_version(msg: dict[str, Any]) -> str:
     return "1.0"
 
 
+@lru_cache(maxsize=2048)
+def _split_tilde_pointer_cached(pointer: str) -> tuple[str, ...]:
+    """Decode and cache RFC 6901 pointer segments for bounded-length pointers containing '~'."""
+    raw = pointer[1:] if pointer.startswith("/") else pointer
+    return tuple(s.replace("~1", "/").replace("~0", "~") if "~" in s else s for s in raw.split("/"))
+
+
 def _resolve_json_pointer(
     data: Any, pointer: str, max_segments: int = DEFAULT_MAX_DEPTH + 4
 ) -> tuple[bool, Any]:
@@ -585,17 +618,42 @@ def _resolve_json_pointer(
     if len(pointer) > max_segments and pointer.count("/") > max_segments:
         return False, None
     cur = data
-    for raw_seg in pointer[1:].split("/"):
-        seg = raw_seg.replace("~1", "/").replace("~0", "~")
-        if isinstance(cur, dict) and seg in cur:
-            cur = cur[seg]
-        elif isinstance(cur, list):
-            idx = _parse_rfc6901_array_index(seg)
-            if idx is None or idx >= len(cur):
+    if "~" in pointer:
+        segs: Any = (
+            _split_tilde_pointer_cached(pointer)
+            if len(pointer) <= _SAFE_URL_CACHE_MAX_ITEM_LEN
+            else (
+                s.replace("~1", "/").replace("~0", "~") if "~" in s else s
+                for s in pointer[1:].split("/")
+            )
+        )
+        for seg in segs:
+            if type(cur) is dict:
+                if seg in cur:
+                    cur = cur[seg]
+                else:
+                    return False, None
+            elif type(cur) is list:
+                idx = _parse_rfc6901_array_index(seg)
+                if idx is None or idx >= len(cur):
+                    return False, None
+                cur = cur[idx]
+            else:
                 return False, None
-            cur = cur[idx]
-        else:
-            return False, None
+    else:
+        for seg in pointer[1:].split("/"):
+            if type(cur) is dict:
+                if seg in cur:
+                    cur = cur[seg]
+                else:
+                    return False, None
+            elif type(cur) is list:
+                idx = _parse_rfc6901_array_index(seg)
+                if idx is None or idx >= len(cur):
+                    return False, None
+                cur = cur[idx]
+            else:
+                return False, None
     return True, cur
 
 
@@ -613,11 +671,11 @@ def _resolve_pointer_with_context(
     if item_ctx is None:
         return False, None
     if "/" not in pointer and "~" not in pointer:
-        if isinstance(item_ctx, dict):
+        if type(item_ctx) is dict:
             if pointer in item_ctx:
                 return True, item_ctx[pointer]
             return False, None
-        if isinstance(item_ctx, list):
+        if type(item_ctx) is list:
             idx = _parse_rfc6901_array_index(pointer)
             if idx is None or idx >= len(item_ctx):
                 return False, None
@@ -626,17 +684,42 @@ def _resolve_pointer_with_context(
     if len(pointer) >= max_segments and pointer.count("/") >= max_segments:
         return False, None
     cur = item_ctx
-    for raw_seg in pointer.split("/"):
-        seg = raw_seg.replace("~1", "/").replace("~0", "~")
-        if isinstance(cur, dict) and seg in cur:
-            cur = cur[seg]
-        elif isinstance(cur, list):
-            idx = _parse_rfc6901_array_index(seg)
-            if idx is None or idx >= len(cur):
+    if "~" in pointer:
+        segs: Any = (
+            _split_tilde_pointer_cached(pointer)
+            if len(pointer) <= _SAFE_URL_CACHE_MAX_ITEM_LEN
+            else (
+                s.replace("~1", "/").replace("~0", "~") if "~" in s else s
+                for s in pointer.split("/")
+            )
+        )
+        for seg in segs:
+            if type(cur) is dict:
+                if seg in cur:
+                    cur = cur[seg]
+                else:
+                    return False, None
+            elif type(cur) is list:
+                idx = _parse_rfc6901_array_index(seg)
+                if idx is None or idx >= len(cur):
+                    return False, None
+                cur = cur[idx]
+            else:
                 return False, None
-            cur = cur[idx]
-        else:
-            return False, None
+    else:
+        for seg in pointer.split("/"):
+            if type(cur) is dict:
+                if seg in cur:
+                    cur = cur[seg]
+                else:
+                    return False, None
+            elif type(cur) is list:
+                idx = _parse_rfc6901_array_index(seg)
+                if idx is None or idx >= len(cur):
+                    return False, None
+                cur = cur[idx]
+            else:
+                return False, None
     return True, cur
 
 
@@ -3030,7 +3113,9 @@ def validate_payload(
             dict[
                 str,
                 tuple[
-                    dict[str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]],
+                    dict[str, list[tuple[str, tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]]],
+                    dict[str, _PrefixBucket],
+                    dict[str, list[str]],
                     dict[str, _PrefixBucket],
                 ],
             ],
@@ -3073,6 +3158,30 @@ def validate_payload(
             if tmp_warnings:
                 s_warn = surface_seen_warnings.setdefault(sid_emit, set())
                 _append_unique_issues(warnings, tmp_warnings, s_warn)
+
+        def _charge_payload_url_evals(
+            cost: int,
+            sid_charge: str,
+            tmp_errors: list[dict[str, Any]],
+        ) -> bool:
+            """Charge cost units against payload_url_slot_evals; return False if exceeded."""
+            nonlocal payload_budget_exceeded
+            if payload_budget_exceeded or payload_budget_flag[0]:
+                payload_budget_exceeded = True
+                return False
+            if payload_url_slot_evals[0] + cost > max_surface_url_evals:
+                payload_budget_exceeded = True
+                payload_budget_flag[0] = True
+                _add_issue(
+                    tmp_errors,
+                    "MAX_TEMPLATE_EVALS_EXCEEDED",
+                    bidx,
+                    f"surface:{sid_charge}",
+                    f"Payload URL slot evaluations exceeded limit ({max_surface_url_evals}).",
+                )
+                return False
+            payload_url_slot_evals[0] += cost
+            return True
 
         def _validate_single_url_slot(
             sid_slot: str,
@@ -3559,11 +3668,13 @@ def validate_payload(
         ) -> bool:
             """Validate one ChildList template item and any nested relative ChildList templates.
 
-            Returns True if eval_limit was exceeded (fail-closed).
+            Returns True if eval_limit or payload URL budget was exceeded (fail-closed).
             """
+            if payload_budget_exceeded or payload_budget_flag[0]:
+                return True
             if tpl_root_id in visited_tpls:
                 return False
-            next_visited = visited_tpls | {tpl_root_id}
+            before_url_evals = payload_url_slot_evals[0]
             if scope_cache is None:
                 scope_cache = {}
             if tree_has_slots_cache is None:
@@ -3617,8 +3728,9 @@ def validate_payload(
                 if local_budget is None:
                     local_budget = payload_tpl_abs_eval_count
                     local_limit = _MAX_TEMPLATE_ABS_RESCAN_EVALS
+                next_visited: frozenset[str] | None = None
                 for inner_tpl_id, inner_list_ptr in nested_rel_children:
-                    if inner_tpl_id in next_visited:
+                    if inner_tpl_id == tpl_root_id or inner_tpl_id in visited_tpls:
                         continue
                     has_inner_slots = tree_has_slots_cache.get(inner_tpl_id)
                     if has_inner_slots is None:
@@ -3642,11 +3754,31 @@ def validate_payload(
                         tree_has_slots_cache[inner_tpl_id] = has_inner_slots
                     if not has_inner_slots:
                         continue
-                    found_inner, inner_items = _resolve_pointer_with_context(
-                        dm, inner_list_ptr, item_ctx, max_segments=max_ptr_segments
-                    )
-                    if not found_inner or not isinstance(inner_items, list):
+                    item_is_dict = type(item_ctx) is dict
+                    if item_is_dict and "/" not in inner_list_ptr and "~" not in inner_list_ptr:
+                        inner_items = item_ctx.get(inner_list_ptr)
+                        found_inner = inner_items is not None
+                    elif not item_is_dict and type(item_ctx) is not list:
+                        found_inner = False
+                        inner_items = None
+                    else:
+                        if "/" in inner_list_ptr:
+                            inner_ptr_extra = inner_list_ptr.count("/") // 8
+                            if inner_ptr_extra > 0:
+                                if not _charge_payload_url_evals(inner_ptr_extra, sid_tpl, tmp_errors):
+                                    return True
+                        found_inner, inner_items = _resolve_pointer_with_context(
+                            dm, inner_list_ptr, item_ctx, max_segments=max_ptr_segments
+                        )
+                    if not found_inner or type(inner_items) is not list or not inner_items:
+                        nxt_evals = payload_url_slot_evals[0] + 1
+                        if nxt_evals > max_surface_url_evals:
+                            _charge_payload_url_evals(1, sid_tpl, tmp_errors)
+                            return True
+                        payload_url_slot_evals[0] = nxt_evals
                         continue
+                    if next_visited is None:
+                        next_visited = visited_tpls | {tpl_root_id}
                     for inner_idx, inner_item in enumerate(inner_items):
                         if local_budget[0] >= local_limit:
                             _add_issue(
@@ -3681,6 +3813,9 @@ def validate_payload(
                             return True
                         if local_budget[0] == before:
                             local_budget[0] += 1
+            if payload_url_slot_evals[0] == before_url_evals:
+                if not _charge_payload_url_evals(1, sid_tpl, tmp_errors):
+                    return True
             return False
 
         def _ingest_component_batch(sid_ing: str, b_idx: int, comps: list[dict[str, Any]]) -> None:
@@ -4082,6 +4217,30 @@ def validate_payload(
                             if rescan_budget[0] == before:
                                 rescan_budget[0] += 1
                         else:
+                            root_scope_ing = sc_ing.get(tpl_root_id)
+                            if root_scope_ing is None:
+                                root_scope_ing = _collect_template_scope(sid_ing, tpl_root_id)
+                                sc_ing[tpl_root_id] = root_scope_ing
+                            if not root_scope_ing[1]:
+                                itype = type(item)
+                                skip_empty = itype is not dict and itype is not list
+                                if (
+                                    not skip_empty
+                                    and itype is dict
+                                    and len(root_scope_ing[2]) == 1
+                                ):
+                                    ip0 = root_scope_ing[2][0][1]
+                                    if "/" not in ip0 and "~" not in ip0:
+                                        iv0 = item.get(ip0)
+                                        skip_empty = type(iv0) is not list or not iv0
+                                if skip_empty:
+                                    nxt_evals = payload_url_slot_evals[0] + 1
+                                    if nxt_evals > max_surface_url_evals:
+                                        _charge_payload_url_evals(1, sid_ing, tmp_errors)
+                                        ing_tpl_cap = True
+                                        break
+                                    payload_url_slot_evals[0] = nxt_evals
+                                    continue
                             if _validate_template_item_urls(
                                 sid_ing,
                                 tpl_root_id,
@@ -4190,14 +4349,11 @@ def validate_payload(
                                 full_list_pair_set.add(tp)
                                 full_list_pairs.append(tp)
 
-                    single_item_pairs: list[tuple[str, str]] = []
-                    single_item_pair_set: set[tuple[str, str]] = set()
+                    single_item_list_ptrs: list[str] = []
                     if not ptr_is_root:
                         for anc in strict_ptr_ancs:
-                            for tp in exact_list_ptr.get(anc, ()):
-                                if tp not in full_list_pair_set and tp not in single_item_pair_set:
-                                    single_item_pair_set.add(tp)
-                                    single_item_pairs.append(tp)
+                            if anc in exact_list_ptr:
+                                single_item_list_ptrs.append(anc)
 
                     matched_abs_by_root: dict[
                         str, list[tuple[str, str, Any, frozenset[str], frozenset[str], str, str]]
@@ -4252,15 +4408,20 @@ def validate_payload(
                                 dest.append(rs)
 
                     surf_cap_hit = False
+                    resolved_list_by_ptr: dict[str, tuple[bool, Any]] = {}
 
                     # 2a. Full-list ChildList targets
                     for tpl_root_id, list_ptr in full_list_pairs:
                         _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(
                             sid_upd, tpl_root_id
                         )
-                        found_list, items_val = _resolve_json_pointer(
-                            dm, list_ptr, max_segments=max_ptr_segments
-                        )
+                        cached_res = resolved_list_by_ptr.get(list_ptr)
+                        if cached_res is None:
+                            cached_res = _resolve_json_pointer(
+                                dm, list_ptr, max_segments=max_ptr_segments
+                            )
+                            resolved_list_by_ptr[list_ptr] = cached_res
+                        found_list, items_val = cached_res
                         if found_list and isinstance(items_val, list):
                             if popped_idx is not None:
                                 rescan_budget = payload_tpl_rescan_evals
@@ -4347,7 +4508,34 @@ def validate_payload(
                             else:
                                 sc_full: dict[str, Any] = {}
                                 tc_full: dict[str, bool] = {}
+                                root_scope_full = _collect_template_scope(sid_upd, tpl_root_id)
+                                sc_full[tpl_root_id] = root_scope_full
+                                no_direct_full = not root_scope_full[1]
+                                simple_nested_full = (
+                                    root_scope_full[2][0][1]
+                                    if (
+                                        no_direct_full
+                                        and len(root_scope_full[2]) == 1
+                                        and "/" not in root_scope_full[2][0][1]
+                                        and "~" not in root_scope_full[2][0][1]
+                                    )
+                                    else None
+                                )
                                 for item_idx, item in enumerate(items_val):
+                                    if no_direct_full:
+                                        itype = type(item)
+                                        skip_empty = itype is not dict and itype is not list
+                                        if not skip_empty and itype is dict and simple_nested_full is not None:
+                                            iv0 = item.get(simple_nested_full)
+                                            skip_empty = type(iv0) is not list or not iv0
+                                        if skip_empty:
+                                            nxt_evals = payload_url_slot_evals[0] + 1
+                                            if nxt_evals > max_surface_url_evals:
+                                                _charge_payload_url_evals(1, sid_upd, tmp_errors)
+                                                surf_cap_hit = True
+                                                break
+                                            payload_url_slot_evals[0] = nxt_evals
+                                            continue
                                     if _validate_template_item_urls(
                                         sid_upd,
                                         tpl_root_id,
@@ -4366,134 +4554,50 @@ def validate_payload(
                         if surf_cap_hit or payload_budget_exceeded:
                             break
 
-                    # 2b. Single-item ChildList targets
+                    # 2b. Single-item ChildList targets (grouped and indexed by list_ptr)
                     checked_target_idx_by_pair: dict[tuple[str, str], int] = {}
-                    resolved_list_by_pair: dict[tuple[str, str], tuple[bool, Any]] = {}
-                    if not surf_cap_hit and not payload_budget_exceeded:
-                        for tpl_pair in single_item_pairs:
-                            tpl_root_id, list_ptr = tpl_pair
-                            _tpl_nodes, rel_slots, has_nested_rel = _collect_template_tree_summary(
-                                sid_upd, tpl_root_id
+                    if not surf_cap_hit and not payload_budget_exceeded and single_item_list_ptrs:
+                        for list_ptr in single_item_list_ptrs:
+                            cached_res = resolved_list_by_ptr.get(list_ptr)
+                            if cached_res is None:
+                                cached_res = _resolve_json_pointer(
+                                    dm, list_ptr, max_segments=max_ptr_segments
+                                )
+                                resolved_list_by_ptr[list_ptr] = cached_res
+                            found_list, items_val = cached_res
+                            if not found_list or not isinstance(items_val, list):
+                                continue
+                            rest = ptr[len(list_ptr) + 1 :]
+                            slash_pos = rest.find("/")
+                            seg = rest if slash_pos == -1 else rest[:slash_pos]
+                            if seg == "-":
+                                target_idx = len(items_val) - 1 if items_val else None
+                            else:
+                                idx_parsed = _parse_rfc6901_array_index(seg)
+                                target_idx = (
+                                    idx_parsed
+                                    if idx_parsed is not None and idx_parsed < len(items_val)
+                                    else None
+                                )
+                            if target_idx is None:
+                                continue
+                            item = items_val[target_idx]
+                            item_sub_ptr = (
+                                "/" + rest[slash_pos + 1 :]
+                                if (slash_pos != -1 and seg != "-")
+                                else None
                             )
-                            found_list, items_val = _resolve_json_pointer(
-                                dm, list_ptr, max_segments=max_ptr_segments
-                            )
-                            resolved_list_by_pair[tpl_pair] = (found_list, items_val)
-                            if found_list and isinstance(items_val, list):
-                                rest = ptr[len(list_ptr) + 1 :]
-                                seg = rest.split("/", 1)[0]
-                                if seg == "-":
-                                    target_idx = len(items_val) - 1 if items_val else None
-                                else:
-                                    idx_parsed = _parse_rfc6901_array_index(seg)
-                                    target_idx = (
-                                        idx_parsed
-                                        if idx_parsed is not None and idx_parsed < len(items_val)
-                                        else None
-                                    )
-                                if target_idx is not None:
+                            if item_sub_ptr is None or item_sub_ptr in {"", "/"}:
+                                for tpl_pair in exact_list_ptr.get(list_ptr, ()):
+                                    if tpl_pair in full_list_pair_set:
+                                        continue
+                                    tpl_root_id = tpl_pair[0]
                                     checked_target_idx_by_pair[tpl_pair] = target_idx
-                                    item = items_val[target_idx]
+                                    _tpl_nodes, rel_slots, has_nested_rel = (
+                                        _collect_template_tree_summary(sid_upd, tpl_root_id)
+                                    )
                                     if not has_nested_rel:
-                                        item_sub_ptr = (
-                                            "/" + rest.split("/", 1)[1]
-                                            if ("/" in rest and seg != "-")
-                                            else None
-                                        )
-                                        if item_sub_ptr is None or item_sub_ptr in {"", "/"}:
-                                            target_rel_slots = rel_slots
-                                        else:
-                                            surf_rel_idx = surface_tpl_rel_index_cache.setdefault(
-                                                sid_upd, {}
-                                            )
-                                            rel_idx_entry = surf_rel_idx.get(tpl_root_id)
-                                            if rel_idx_entry is None:
-                                                rel_exact: dict[
-                                                    str,
-                                                    list[
-                                                        tuple[
-                                                            str,
-                                                            str,
-                                                            Any,
-                                                            frozenset[str],
-                                                            frozenset[str],
-                                                            str,
-                                                            str,
-                                                        ]
-                                                    ],
-                                                ] = {}
-                                                rel_prefix: dict[str, _PrefixBucket] = {}
-                                                slots_by_rel: dict[
-                                                    frozenset[str],
-                                                    list[
-                                                        tuple[
-                                                            str,
-                                                            str,
-                                                            Any,
-                                                            frozenset[str],
-                                                            frozenset[str],
-                                                            str,
-                                                            str,
-                                                        ]
-                                                    ],
-                                                ] = {}
-                                                for rslot in rel_slots:
-                                                    if rslot[4]:
-                                                        slots_by_rel.setdefault(rslot[4], []).append(
-                                                            rslot
-                                                        )
-                                                rel_prefix_summary_cache: dict[
-                                                    frozenset[str], dict[str, int | None]
-                                                ] = {}
-                                                for rel_ptrs, group_slots in slots_by_rel.items():
-                                                    slash_rel_ptrs = frozenset(
-                                                        f"/{rp}" for rp in rel_ptrs
-                                                    )
-                                                    for rptr in slash_rel_ptrs:
-                                                        rel_exact.setdefault(rptr, []).extend(
-                                                            group_slots
-                                                        )
-                                                    r_anc_map = _summarize_abs_ptrs_prefixes(
-                                                        slash_rel_ptrs,
-                                                        max_ptr_segments,
-                                                        rel_prefix_summary_cache,
-                                                    )
-                                                    for ranc, rcidx in r_anc_map.items():
-                                                        rbucket = rel_prefix.get(ranc)
-                                                        if rbucket is None:
-                                                            rbucket = _PrefixBucket()
-                                                            rel_prefix[ranc] = rbucket
-                                                        for rslot in group_slots:
-                                                            rbucket.add(id(rslot), rslot, rcidx)
-                                                rel_idx_entry = (rel_exact, rel_prefix)
-                                                surf_rel_idx[tpl_root_id] = rel_idx_entry
-                                            rel_exact, rel_prefix = rel_idx_entry
-                                            target_rel_slots = []
-                                            seen_rel_ids: set[int] = set()
-                                            for rbucket_vals in (
-                                                rel_exact.get(item_sub_ptr, ()),
-                                                _lookup_prefix_bucket(
-                                                    rel_prefix, item_sub_ptr, popped_idx
-                                                ),
-                                                matched_abs_by_root.get(tpl_root_id, ()),
-                                            ):
-                                                for rslot in rbucket_vals:
-                                                    r_id = id(rslot)
-                                                    if r_id not in seen_rel_ids:
-                                                        seen_rel_ids.add(r_id)
-                                                        target_rel_slots.append(rslot)
-                                            if item_sub_ptr.find("/", 1) != -1:
-                                                for ranc in _pointer_ancestors(
-                                                    item_sub_ptr, max_segments=max_ptr_segments
-                                                ):
-                                                    if ranc == item_sub_ptr:
-                                                        continue
-                                                    for rslot in rel_exact.get(ranc, ()):
-                                                        r_id = id(rslot)
-                                                        if r_id not in seen_rel_ids:
-                                                            seen_rel_ids.add(r_id)
-                                                            target_rel_slots.append(rslot)
-                                        for slot in target_rel_slots:
+                                        for slot in rel_slots:
                                             if not _validate_single_url_slot(
                                                 sid_upd,
                                                 slot,
@@ -4519,6 +4623,226 @@ def validate_payload(
                                         ):
                                             if payload_budget_exceeded:
                                                 surf_cap_hit = True
+                                    if surf_cap_hit or payload_budget_exceeded:
+                                        break
+                            else:
+                                surf_rel_idx = surface_tpl_rel_index_cache.setdefault(sid_upd, {})
+                                rel_idx_entry = surf_rel_idx.get(list_ptr)
+                                if rel_idx_entry is None:
+                                    lp_rel_exact: dict[
+                                        str,
+                                        list[
+                                            tuple[
+                                                str,
+                                                tuple[
+                                                    str,
+                                                    str,
+                                                    Any,
+                                                    frozenset[str],
+                                                    frozenset[str],
+                                                    str,
+                                                    str,
+                                                ],
+                                            ]
+                                        ],
+                                    ] = {}
+                                    lp_rel_prefix: dict[str, _PrefixBucket] = {}
+                                    lp_nested_exact: dict[str, list[str]] = {}
+                                    lp_nested_prefix: dict[str, _PrefixBucket] = {}
+                                    rel_prefix_summary_cache: dict[
+                                        frozenset[str], dict[str, int | None]
+                                    ] = {}
+                                    for tpl_pair in exact_list_ptr.get(list_ptr, ()):
+                                        tpl_root_id = tpl_pair[0]
+                                        _tpl_nodes, rel_slots, has_nested_rel = (
+                                            _collect_template_tree_summary(sid_upd, tpl_root_id)
+                                        )
+                                        if not has_nested_rel:
+                                            direct_rel_slots = rel_slots
+                                            nested_rel_children: list[tuple[str, str]] = []
+                                        else:
+                                            (
+                                                _d_nodes,
+                                                direct_rel_slots,
+                                                nested_rel_children,
+                                            ) = _collect_template_scope(sid_upd, tpl_root_id)
+                                        if direct_rel_slots:
+                                            slots_by_rel: dict[
+                                                frozenset[str],
+                                                list[
+                                                    tuple[
+                                                        str,
+                                                        str,
+                                                        Any,
+                                                        frozenset[str],
+                                                        frozenset[str],
+                                                        str,
+                                                        str,
+                                                    ]
+                                                ],
+                                            ] = {}
+                                            for rslot in direct_rel_slots:
+                                                if rslot[4]:
+                                                    slots_by_rel.setdefault(rslot[4], []).append(
+                                                        rslot
+                                                    )
+                                            for rel_ptrs, group_slots in slots_by_rel.items():
+                                                slash_rel_ptrs = frozenset(
+                                                    f"/{rp}" for rp in rel_ptrs
+                                                )
+                                                tagged_slots = [
+                                                    (tpl_root_id, rs) for rs in group_slots
+                                                ]
+                                                for rptr in slash_rel_ptrs:
+                                                    lp_rel_exact.setdefault(rptr, []).extend(
+                                                        tagged_slots
+                                                    )
+                                                r_anc_map = _summarize_abs_ptrs_prefixes(
+                                                    slash_rel_ptrs,
+                                                    max_ptr_segments,
+                                                    rel_prefix_summary_cache,
+                                                )
+                                                for ranc, rcidx in r_anc_map.items():
+                                                    rbucket = lp_rel_prefix.get(ranc)
+                                                    if rbucket is None:
+                                                        rbucket = _PrefixBucket()
+                                                        lp_rel_prefix[ranc] = rbucket
+                                                    for rslot in group_slots:
+                                                        rbucket.add(
+                                                            (tpl_root_id, id(rslot)),
+                                                            (tpl_root_id, rslot),
+                                                            rcidx,
+                                                        )
+                                        if nested_rel_children:
+                                            seen_inner_slashes: set[str] = set()
+                                            for _inner_tpl_id, inner_list_ptr in nested_rel_children:
+                                                canon_inner = _canonicalize_json_pointer(
+                                                    inner_list_ptr, max_segments=max_ptr_segments
+                                                )
+                                                slash_inner = f"/{canon_inner}"
+                                                if slash_inner not in seen_inner_slashes:
+                                                    seen_inner_slashes.add(slash_inner)
+                                                    lp_nested_exact.setdefault(
+                                                        slash_inner, []
+                                                    ).append(tpl_root_id)
+                                                _index_pointer_prefixes(
+                                                    lp_nested_prefix,
+                                                    slash_inner,
+                                                    tpl_root_id,
+                                                    tpl_root_id,
+                                                    max_ptr_segments,
+                                                )
+                                    rel_idx_entry = (
+                                        lp_rel_exact,
+                                        lp_rel_prefix,
+                                        lp_nested_exact,
+                                        lp_nested_prefix,
+                                    )
+                                    surf_rel_idx[list_ptr] = rel_idx_entry
+
+                                (
+                                    lp_rel_exact,
+                                    lp_rel_prefix,
+                                    lp_nested_exact,
+                                    lp_nested_prefix,
+                                ) = rel_idx_entry
+                                item_sub_ancs: list[str] | tuple[str, ...] = ()
+                                if item_sub_ptr.find("/", 1) != -1:
+                                    item_sub_ancs = [
+                                        a
+                                        for a in _pointer_ancestors(
+                                            item_sub_ptr, max_segments=max_ptr_segments
+                                        )
+                                        if a != item_sub_ptr
+                                    ]
+
+                                matched_nested_roots: list[str] = []
+                                matched_nested_root_set: set[str] = set()
+                                if lp_nested_exact or lp_nested_prefix:
+                                    for nbucket in (
+                                        lp_nested_exact.get(item_sub_ptr, ()),
+                                        _lookup_prefix_bucket(
+                                            lp_nested_prefix, item_sub_ptr, popped_idx
+                                        ),
+                                    ):
+                                        for nrt in nbucket:
+                                            if nrt not in matched_nested_root_set:
+                                                matched_nested_root_set.add(nrt)
+                                                matched_nested_roots.append(nrt)
+                                    for ranc in item_sub_ancs:
+                                        for nrt in lp_nested_exact.get(ranc, ()):
+                                            if nrt not in matched_nested_root_set:
+                                                matched_nested_root_set.add(nrt)
+                                                matched_nested_roots.append(nrt)
+
+                                for nrt in matched_nested_roots:
+                                    tpl_pair = (nrt, list_ptr)
+                                    if tpl_pair in full_list_pair_set:
+                                        continue
+                                    checked_target_idx_by_pair[tpl_pair] = target_idx
+                                    if _validate_template_item_urls(
+                                        sid_upd,
+                                        nrt,
+                                        dm,
+                                        item,
+                                        target_idx,
+                                        tmp_errors,
+                                        tmp_warnings,
+                                        is_historical_snapshot=True,
+                                    ):
+                                        if payload_budget_exceeded:
+                                            surf_cap_hit = True
+                                            break
+                                if surf_cap_hit or payload_budget_exceeded:
+                                    break
+
+                                if lp_rel_exact or lp_rel_prefix:
+                                    target_rel_slots: list[
+                                        tuple[
+                                            str,
+                                            str,
+                                            Any,
+                                            frozenset[str],
+                                            frozenset[str],
+                                            str,
+                                            str,
+                                        ]
+                                    ] = []
+                                    seen_rel_ids: set[int] = set()
+                                    for rbucket_vals in (
+                                        lp_rel_exact.get(item_sub_ptr, ()),
+                                        _lookup_prefix_bucket(
+                                            lp_rel_prefix, item_sub_ptr, popped_idx
+                                        ),
+                                    ):
+                                        for rt_id_s, rslot in rbucket_vals:
+                                            if rt_id_s in matched_nested_root_set:
+                                                continue
+                                            r_id = id(rslot)
+                                            if r_id not in seen_rel_ids:
+                                                seen_rel_ids.add(r_id)
+                                                target_rel_slots.append(rslot)
+                                    for ranc in item_sub_ancs:
+                                        for rt_id_s, rslot in lp_rel_exact.get(ranc, ()):
+                                            if rt_id_s in matched_nested_root_set:
+                                                continue
+                                            r_id = id(rslot)
+                                            if r_id not in seen_rel_ids:
+                                                seen_rel_ids.add(r_id)
+                                                target_rel_slots.append(rslot)
+                                    for slot in target_rel_slots:
+                                        if not _validate_single_url_slot(
+                                            sid_upd,
+                                            slot,
+                                            dm,
+                                            tmp_errors,
+                                            tmp_warnings,
+                                            item_ctx=item,
+                                            item_idx=target_idx,
+                                            is_historical_snapshot=True,
+                                        ):
+                                            surf_cap_hit = True
+                                            break
                             if surf_cap_hit or payload_budget_exceeded:
                                 break
 
@@ -4531,34 +4855,44 @@ def validate_payload(
                             abs_slot_ids = (
                                 {id(s) for s in abs_overlap_slots} if has_nested_rel else None
                             )
+                            checked_abs_none = False
                             for tpl_pair in pairs_by_tpl_root.get(rt_id, ()):
                                 if tpl_pair in full_list_pair_set:
                                     continue
                                 tpl_root_id, list_ptr = tpl_pair
-                                cached_res = resolved_list_by_pair.get(tpl_pair)
+                                list_ptr_cost = max(1, list_ptr.count("/"))
+                                if not _charge_payload_url_evals(
+                                    list_ptr_cost, sid_upd, tmp_errors
+                                ):
+                                    surf_cap_hit = True
+                                    break
+                                cached_res = resolved_list_by_ptr.get(list_ptr)
                                 if cached_res is not None:
                                     found_list, items_val = cached_res
                                 else:
                                     found_list, items_val = _resolve_json_pointer(
                                         dm, list_ptr, max_segments=max_ptr_segments
                                     )
+                                    resolved_list_by_ptr[list_ptr] = (found_list, items_val)
                                 if not found_list or not isinstance(items_val, list):
                                     continue
-                                # Always run O(1) absolute check with item_ctx=None first
-                                for slot in abs_overlap_slots:
-                                    if not _validate_single_url_slot(
-                                        sid_upd,
-                                        slot,
-                                        dm,
-                                        tmp_errors,
-                                        tmp_warnings,
-                                        item_ctx=None,
-                                        is_historical_snapshot=True,
-                                    ):
-                                        surf_cap_hit = True
+                                # Run O(1) absolute check with item_ctx=None once per rt_id
+                                if not checked_abs_none:
+                                    checked_abs_none = True
+                                    for slot in abs_overlap_slots:
+                                        if not _validate_single_url_slot(
+                                            sid_upd,
+                                            slot,
+                                            dm,
+                                            tmp_errors,
+                                            tmp_warnings,
+                                            item_ctx=None,
+                                            is_historical_snapshot=True,
+                                        ):
+                                            surf_cap_hit = True
+                                            break
+                                    if surf_cap_hit or payload_budget_exceeded:
                                         break
-                                if surf_cap_hit or payload_budget_exceeded:
-                                    break
                                 checked_target_idx = checked_target_idx_by_pair.get(tpl_pair)
                                 budget = payload_tpl_abs_eval_count
                                 if not has_nested_rel:
@@ -4696,7 +5030,34 @@ def validate_payload(
                     else:
                         sc_fl: dict[str, Any] = {}
                         tc_fl: dict[str, bool] = {}
+                        root_scope_fl = _collect_template_scope(sid_to_flush, tpl_root_id)
+                        sc_fl[tpl_root_id] = root_scope_fl
+                        no_direct_fl = not root_scope_fl[1]
+                        simple_nested_fl = (
+                            root_scope_fl[2][0][1]
+                            if (
+                                no_direct_fl
+                                and len(root_scope_fl[2]) == 1
+                                and "/" not in root_scope_fl[2][0][1]
+                                and "~" not in root_scope_fl[2][0][1]
+                            )
+                            else None
+                        )
                         for item_idx, item in enumerate(items_val):
+                            if no_direct_fl:
+                                itype = type(item)
+                                skip_empty = itype is not dict and itype is not list
+                                if not skip_empty and itype is dict and simple_nested_fl is not None:
+                                    iv0 = item.get(simple_nested_fl)
+                                    skip_empty = type(iv0) is not list or not iv0
+                                if skip_empty:
+                                    nxt_evals = payload_url_slot_evals[0] + 1
+                                    if nxt_evals > max_surface_url_evals:
+                                        _charge_payload_url_evals(1, sid_to_flush, final_tpl_errors)
+                                        fl_cap_hit = True
+                                        break
+                                    payload_url_slot_evals[0] = nxt_evals
+                                    continue
                             if _validate_template_item_urls(
                                 sid_to_flush,
                                 tpl_root_id,

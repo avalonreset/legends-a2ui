@@ -4178,6 +4178,203 @@ class TestValidateAndNormalize(unittest.TestCase):
         info_after = _parse_format_string_template_cached.cache_info()
         self.assertEqual(info_after.currsize, 1)
 
+    def test_empty_root_key_pops_deep_template_budget_and_nested_relative_index(self) -> None:
+        """Empty-key array pops, deep template pointer budgeting, and nested relative indexing stay fast and fail closed."""
+        # 1a. Unshifted empty-key "//<idx>" array tail pops skip unrelated direct slots in O(log K)
+        tpl_ek = "https://a.co/" + "".join(f"${{/0/~0{j}}}" for j in range(64))
+        comps_ek = [{"id": "root", "component": "Column", "children": [f"v{k}" for k in range(270)]}] + [
+            {
+                "id": f"v{k}",
+                "component": "Video",
+                "url": {"@call": "formatString", "args": {"value": tpl_ek}},
+                "posterUrl": {"@call": "formatString", "args": {"value": tpl_ek}},
+            }
+            for k in range(270)
+        ]
+        msgs_ek = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_ek_fast",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_ek,
+                    "dataModel": {"": [0] * 1005},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_ek_fast", "path": f"//{1004 - i}", "value": None}}
+            for i in range(1000)
+        ]
+        t0 = time.perf_counter()
+        res_ek_fast = validate_payload(json.dumps(msgs_ek, separators=(",", ":")), version="1.0", strict=True)
+        self.assertTrue(res_ek_fast["ok"], res_ek_fast["errors"])
+        self.assertLess(time.perf_counter() - t0, 0.5)
+
+        # 1b. Shifted empty-key "//1" pop and ChildList "//0/items" pop STILL fail closed
+        shifted_ek_direct = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_ek_shift_dir",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [{"id": "root", "component": "Image", "url": {"@path": "//1"}}],
+                    "dataModel": {"": ["https://example.com/a.png", "https://example.com/b.png", "javascript:alert(1)"]},
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_ek_shift_dir", "path": "//0", "value": None}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_ek_shift_dir", "path": "//1", "value": "https://example.com/ok.png"}},
+        ]
+        res_ek_dir = validate_payload(json.dumps(shifted_ek_direct), version="1.0", strict=True)
+        self.assertFalse(res_ek_dir["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_ek_dir["errors"]})
+
+        shifted_ek_list = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_ek_shift_list",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "row_img", "path": "//0/items"}},
+                        {"id": "row_img", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {
+                        "": [
+                            {"items": [{"u": "https://example.com/a.png"}]},
+                            {"items": [{"u": "javascript:alert(1)"}]},
+                        ]
+                    },
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_ek_shift_list", "path": "//0", "value": None}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_ek_shift_list", "path": "//0/items/0/u", "value": "https://example.com/ok.png"}},
+        ]
+        res_ek_list = validate_payload(json.dumps(shifted_ek_list), version="1.0", strict=True)
+        self.assertFalse(res_ek_list["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_ek_list["errors"]})
+
+        # 2. Deep template list_ptr resolution storm in absolute-overlap step fails closed under eval budget
+        deep_pfx = "/" + "~0/" * 56
+        dm_deep: dict[str, object] = {}
+        cur_d: dict[str, object] = dm_deep
+        for _ in range(56):
+            nxt_d: dict[str, object] = {}
+            cur_d["~"] = nxt_d
+            cur_d = nxt_d
+        comps_deep = (
+            [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(498)]}]
+            + [{"id": f"l{k}", "component": "List", "children": {"componentId": "row", "path": f"{deep_pfx}a{k}"}} for k in range(498)]
+            + [{"id": "row", "component": "Image", "url": {"@call": "formatString", "args": {"value": "https://a.co/${/p}${u}"}}}]
+        )
+        msgs_deep = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_deep_tpl",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_deep,
+                    "dataModel": dm_deep,
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_deep_tpl", "path": "/p", "value": i}}
+            for i in range(500)
+        ]
+        t1 = time.perf_counter()
+        res_deep = validate_payload(json.dumps(msgs_deep, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_deep["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_deep["errors"]})
+        self.assertLess(time.perf_counter() - t1, 0.5)
+
+        # 3a. Empty/scalar items across 249 nested ChildLists charge eval budget and fail closed fast
+        comps_nested = (
+            [{"id": "root", "component": "Column", "children": [f"l{k}" for k in range(249)]}]
+            + [{"id": f"l{k}", "component": "List", "children": {"componentId": f"g{k}", "path": "/g"}} for k in range(249)]
+            + [{"id": f"g{k}", "component": "List", "children": {"componentId": "leaf", "path": "s"}} for k in range(249)]
+            + [{"id": "leaf", "component": "Image", "url": {"@path": "u"}}]
+        )
+        nested_scalar_payload = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "s_nest_scalar",
+                "catalogId": CANONICAL_V1_CATALOG_ID,
+                "components": comps_nested,
+                "dataModel": {"g": [0] * 20_000},
+            },
+        }
+        t2 = time.perf_counter()
+        res_nsc = validate_payload(json.dumps(nested_scalar_payload, separators=(",", ":")), version="1.0", strict=True)
+        self.assertFalse(res_nsc["ok"])
+        self.assertIn("MAX_TEMPLATE_EVALS_EXCEEDED", {e["code"] for e in res_nsc["errors"]})
+        self.assertLess(time.perf_counter() - t2, 0.5)
+
+        # 3b. Unrelated sibling updates (/g/0/z) across 249 nested ChildLists skip via outer relative index
+        nested_sibling_msgs = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_nest_sib",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": comps_nested,
+                    "dataModel": {"g": [{"s": [], "z": 0}]},
+                },
+            }
+        ] + [
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_nest_sib", "path": "/g/0/z", "value": i}}
+            for i in range(4_000)
+        ]
+        t3 = time.perf_counter()
+        res_nsib = validate_payload(json.dumps(nested_sibling_msgs, separators=(",", ":")), version="1.0", strict=True)
+        self.assertTrue(res_nsib["ok"], res_nsib["errors"])
+        self.assertLess(time.perf_counter() - t3, 0.5)
+
+        # 3c. Nested relative update (/g/0/s/0/u), nested pop (/g/0/s/0), and inner absolute overlap (/g/0/z) STILL fail closed
+        nested_leaf_upd = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_nest_leaf",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "grp", "path": "/g"}},
+                        {"id": "grp", "component": "List", "children": {"componentId": "leaf", "path": "s"}},
+                        {"id": "leaf", "component": "Image", "url": {"@path": "u"}},
+                    ],
+                    "dataModel": {"g": [{"s": [{"u": "https://example.com/ok.png"}]}]},
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_nest_leaf", "path": "/g/0/s/0/u", "value": "javascript:alert(1)"}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_nest_leaf", "path": "/g/0/s/0/u", "value": "https://example.com/clean.png"}},
+        ]
+        res_nlu = validate_payload(json.dumps(nested_leaf_upd), version="1.0", strict=True)
+        self.assertFalse(res_nlu["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_nlu["errors"]})
+
+        nested_abs_sib = [
+            {
+                "version": "1.0",
+                "createSurface": {
+                    "surfaceId": "s_nest_abs_sib",
+                    "catalogId": CANONICAL_V1_CATALOG_ID,
+                    "components": [
+                        {"id": "root", "component": "List", "children": {"componentId": "grp", "path": "/g"}},
+                        {"id": "grp", "component": "List", "children": {"componentId": "leaf", "path": "s"}},
+                        {
+                            "id": "leaf",
+                            "component": "Image",
+                            "url": {"@call": "formatString", "args": {"value": "/${/g/0/z}${u}"}},
+                        },
+                    ],
+                    "dataModel": {"g": [{"z": "safe", "s": [{"u": "/evil.example/x.png"}]}]},
+                },
+            },
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_nest_abs_sib", "path": "/g/0/z", "value": ""}},
+            {"version": "1.0", "updateDataModel": {"surfaceId": "s_nest_abs_sib", "path": "/g/0/z", "value": "safe"}},
+        ]
+        res_nas = validate_payload(json.dumps(nested_abs_sib), version="1.0", strict=True)
+        self.assertFalse(res_nas["ok"])
+        self.assertIn("UNSAFE_MEDIA_URL", {e["code"] for e in res_nas["errors"]})
+
 
 if __name__ == "__main__":
     unittest.main()
